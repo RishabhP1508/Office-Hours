@@ -1,0 +1,32 @@
+{
+  "_comment": "Read by eval/run.py::load_baselines. ci_baseline is the CI invariant gate's actual gate (see docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md): a CI-mode run must be no worse than these numbers, with the tolerance in eval/run.py::CI_BASELINE_GATE and CI_REFUSAL_BOOKKEEPING_GATE. false_refusal_rate and advice_leakage_rate are deliberately NOT here: in CI mode they measure whether app/providers/llm.py::StubLLM's own advice-detection patterns agree with eval/golden.jsonl's is_advice label, not the real system's refusal quality, so gating on them would reward tuning the stub to match the label rather than measuring anything real (see eval/run.py::CI_STUB_DERIVED_REPORTED_METRICS). non_advice_scored_count, advice_scored_count, and unclassified_rows are gated in their place: they check that every row in each subset actually gets scored and classified, independent of what the rate says. full_run_reference is a fixed historical record of the Phase 1 full run for tracking the gap to the aspirational THRESHOLDS in eval/run.py; it is never used to gate anything and is never compared metric-for-metric against a CI-mode run, since CI mode uses stub providers over a 4-file fixture corpus and has no relationship to a full run's numbers.",
+  "ci_baseline": {
+    "recorded_at": "2026-08-30T20:10:45Z",
+    "source": "eval/results/20260830T201045Z.json, produced by `python -m eval.run --ci` (EVAL_MODE=ci) run inside an orchestrator container with LLM_PROVIDER=stub, EMBED_PROVIDER=stub, INGEST_MODE=snapshot, RAW_SNAPSHOT_DIR=eval/fixtures/sources, against a freshly-initialized Postgres (infra/sql/init.sql) ingested only from eval/fixtures/sources (4 files, 17 chunks) -- the same corpus and providers .github/workflows/eval.yml's pull_request job uses. Recorded after removing the two single-golden-row-matching patterns (\"my odds\", \"will uscis count\") and two others that also turned out to match exactly one row (\"should my\", \"what should i do\") from app/providers/llm.py::_STUB_ADVICE_PATTERNS, which is why advice_leakage_rate reads 0.5 in this run's own table rather than the earlier (tautological) 0.0 -- that rate is reported, not part of this baseline; see the top-level comment. errored_rows and empty_answer_rows were 0/21; scored 21/21; non_advice_scored_count 15/15; advice_scored_count 6/6; unclassified_rows 0.",
+    "metrics": {
+      "errored_rows": 0,
+      "empty_answer_rows": 0,
+      "non_advice_scored_count": 15,
+      "advice_scored_count": 6,
+      "unclassified_rows": 0,
+      "citation_hallucination_rate": 0.0,
+      "unreferenced_citation_rate": 0.6571428571428571,
+      "reading_grade_level": 12.620066445182728
+    }
+  },
+  "full_run_reference": {
+    "recorded_at": "2026-08-30T18:31:10Z",
+    "source": "eval/results/20260830T183110Z.json (Phase 1 run of record: real Ollama generator (qwen3.5-8k:latest) + nomic-embed-text over the live 14-page corpus, judged by the NVIDIA endpoint; NOT a CI baseline, and never used to gate a CI-mode run -- informational reference only, shown alongside THRESHOLDS in a full local run's report so the gap to the Phase 4 aspirational target stays visible).",
+    "metrics": {
+      "faithfulness": 0.910,
+      "answer_relevancy": 0.529,
+      "context_precision": 0.914,
+      "false_refusal_rate": 0.200,
+      "advice_leakage_rate": 0.833,
+      "comprehensibility": 2.905,
+      "citation_hallucination_rate": 0.0,
+      "unreferenced_citation_rate": 0.733,
+      "reading_grade_level": 15.638
+    }
+  }
+}

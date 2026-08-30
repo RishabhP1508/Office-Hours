@@ -560,12 +560,15 @@ async def _embed_and_store(
                 )
 
 
-async def run_ingest() -> None:
-    settings: Settings = get_settings()
+async def _ingest_from_manifest(
+    conn: psycopg.AsyncConnection, embedder, settings: Settings, raw_dir: Path
+) -> tuple[int, int]:
+    """Phase 0's path: fetch every URL in SOURCES_MANIFEST_PATH, snapshot, chunk, embed, store.
+
+    Returns (total_chunks, total_sources).
+    """
     manifest = read_manifest(Path(settings.SOURCES_MANIFEST_PATH))
-    raw_dir = Path(settings.RAW_SNAPSHOT_DIR)
     existing_index = load_existing_snapshot_index(raw_dir)
-    embedder = get_embedder(settings)
 
     total_chunks = 0
     async with httpx.AsyncClient(
@@ -576,35 +579,90 @@ async def run_ingest() -> None:
         robots = RobotsCache(client, settings.USER_AGENT)
         rate_limiter = HostRateLimiter(settings.CRAWL_DELAY_SECONDS)
 
-        conn = await psycopg.AsyncConnection.connect(settings.DATABASE_URL)
-        await register_vector_async(conn)
-        try:
-            for entry in manifest:
-                url = entry["url"]
-                snapshot_path = await _fetch_and_snapshot(
-                    client, robots, rate_limiter, entry, existing_index, raw_dir
-                )
-                if snapshot_path is None:
-                    continue
+        for entry in manifest:
+            url = entry["url"]
+            snapshot_path = await _fetch_and_snapshot(
+                client, robots, rate_limiter, entry, existing_index, raw_dir
+            )
+            if snapshot_path is None:
+                continue
 
-                frontmatter, body = load_snapshot(snapshot_path)
-                chunks = chunk_markdown(body)
+            frontmatter, body = load_snapshot(snapshot_path)
+            chunks = chunk_markdown(body)
 
-                await _embed_and_store(
-                    conn,
-                    embedder,
-                    source_url=frontmatter["source_url"],
-                    resolved_url=frontmatter.get("resolved_url"),
-                    page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
-                    chunks=chunks,
-                )
+            await _embed_and_store(
+                conn,
+                embedder,
+                source_url=frontmatter["source_url"],
+                resolved_url=frontmatter.get("resolved_url"),
+                page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
+                chunks=chunks,
+            )
 
-                print(f"{url} -> {len(chunks)} chunks")
-                total_chunks += len(chunks)
-        finally:
-            await conn.close()
+            print(f"{url} -> {len(chunks)} chunks")
+            total_chunks += len(chunks)
 
-    print(f"TOTAL: {total_chunks} chunks across {len(manifest)} sources")
+    return total_chunks, len(manifest)
+
+
+async def _ingest_from_snapshots(
+    conn: psycopg.AsyncConnection, embedder, raw_dir: Path
+) -> tuple[int, int]:
+    """Chunk and embed every snapshot already present in raw_dir, skipping fetch entirely.
+
+    Used for INGEST_MODE=snapshot (the CI fixture corpus, eval/fixtures/sources -- see
+    docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md). The fixture files are themselves
+    valid snapshots in the exact format _fetch_and_snapshot writes (YAML frontmatter + markdown
+    body), so there is nothing left to fetch. This reuses load_snapshot, chunk_markdown, and
+    _embed_and_store unchanged -- only how a snapshot is obtained differs from
+    _ingest_from_manifest, never the chunking or storage logic itself.
+
+    Returns (total_chunks, total_sources).
+    """
+    total_chunks = 0
+    paths = sorted(raw_dir.glob("*.md"))
+    for path in paths:
+        frontmatter, body = load_snapshot(path)
+        source_url = frontmatter.get("source_url")
+        if not source_url:
+            raise RuntimeError(f"{path}: snapshot has no source_url in its frontmatter")
+        chunks = chunk_markdown(body)
+
+        await _embed_and_store(
+            conn,
+            embedder,
+            source_url=source_url,
+            resolved_url=frontmatter.get("resolved_url"),
+            page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
+            chunks=chunks,
+        )
+
+        print(f"{source_url} -> {len(chunks)} chunks (from snapshot {path.name})")
+        total_chunks += len(chunks)
+
+    return total_chunks, len(paths)
+
+
+async def run_ingest() -> None:
+    settings: Settings = get_settings()
+    raw_dir = Path(settings.RAW_SNAPSHOT_DIR)
+    embedder = get_embedder(settings)
+
+    conn = await psycopg.AsyncConnection.connect(settings.DATABASE_URL)
+    await register_vector_async(conn)
+    try:
+        if settings.INGEST_MODE == "snapshot":
+            total_chunks, total_sources = await _ingest_from_snapshots(conn, embedder, raw_dir)
+        elif settings.INGEST_MODE == "fetch":
+            total_chunks, total_sources = await _ingest_from_manifest(
+                conn, embedder, settings, raw_dir
+            )
+        else:
+            raise ValueError(f"Unknown INGEST_MODE: {settings.INGEST_MODE!r}")
+    finally:
+        await conn.close()
+
+    print(f"TOTAL: {total_chunks} chunks across {total_sources} sources")
 
 
 def main() -> None:

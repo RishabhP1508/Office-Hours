@@ -100,7 +100,66 @@ A run takes a while, mostly because of two things outside this script's control:
 can take several minutes per question when it produces a long reasoning trace before answering, and
 the judge is rate-limited (see below). Expect a full 21-row run to run well past ten minutes.
 
-### Thresholds
+Everything from here on describes this default, full mode. CI mode (below) is a different, faster,
+narrower run.
+
+### CI mode
+
+`EVAL_MODE=ci` (or `python -m eval.run --ci`) runs a separate, narrower gate built for
+`.github/workflows/eval.yml`'s `pull_request` job, which gets no repository secret and no GPU. It
+targets an orchestrator running `LLM_PROVIDER=stub` and `EMBED_PROVIDER=stub`
+(`app/providers/llm.py::StubLLM`, `app/providers/embeddings.py::StubEmbedder` -- deterministic,
+network-free stand-ins, never used outside CI) over the small fixture corpus at
+`eval/fixtures/sources/`, ingested with `INGEST_MODE=snapshot` instead of the live manifest.
+
+CI mode computes, fully programmatically, with no model call at all: `citation_hallucination_rate`,
+`unreferenced_citation_rate`, `errored_rows`, `empty_answer_rows`, every subset breakdown,
+`reading_grade_level` (textstat, local), and `false_refusal_rate`/`advice_leakage_rate` using a
+regex-based approximation of the judge's classification (`eval/run.py::CI_REFUSAL_PATTERNS` --
+see that constant's own comment for what it approximates and why, and Phase 4's plan to replace it
+with a structured flag from the pipeline itself). It skips `comprehensibility`, `faithfulness`,
+`answer_relevancy`, and `context_precision` entirely -- they need the hosted judge or RAGAS, neither
+of which a `pull_request` job can reach -- and prints them as `SKIPPED (CI mode)`, with a banner at
+the top of the run stating plainly that no LLM-judged metric ran and a green result is not a passing
+quality eval.
+
+`false_refusal_rate` and `advice_leakage_rate` are printed as `REPORTED (stub-derived)`, never
+gated: in CI mode both are computed from `app/providers/llm.py::StubLLM`'s own advice-detection
+patterns, so the rate measures whether those patterns agree with `eval/golden.jsonl`'s `is_advice`
+label, not whether the real system refuses correctly. Gating on that number would just reward
+tuning the stub's patterns to match the label more tightly -- the same "tune the check until it
+passes" problem this project forbids, aimed at a stub instead of the real system. What IS gated in
+their place is the refusal-classification *bookkeeping*: that all 15 non-advice rows and all 6
+advice rows actually get scored and classified (`non_advice_scored_count`, `advice_scored_count`),
+and that no scored row's classification comes back as anything other than `REFUSAL` or `ANSWER`
+(`unclassified_rows`). That catches a real regression in the plumbing without pretending to measure
+refusal quality.
+
+CI mode's gate is `eval/baselines.json`'s `ci_baseline`, not `THRESHOLDS`: the current run must be
+no worse than the last CI-mode run a human accepted, within the small tolerance in
+`eval/run.py::CI_BASELINE_GATE` (and, for the bookkeeping checks above, `CI_REFUSAL_BOOKKEEPING_
+GATE`). `THRESHOLDS` stays the fixed Phase 4 target that only a full run is measured against; see
+`docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md` for why these are two separate gates. A
+full run additionally prints its own numbers against `eval/baselines.json`'s `full_run_reference`
+(the Phase 1 run of record) purely for tracking the gap over time -- informational only, never
+gating a full run's exit code.
+
+Installing just enough to run CI mode (no ragas, no langchain -- see the module docstrings in
+`eval/metrics.py` and `eval/run.py` for why those imports are lazy and never triggered in CI mode):
+
+```
+pip install -e "services/orchestrator[dev,eval-ci]"
+```
+
+`LLM_PROVIDER=stub`/`EMBED_PROVIDER=stub` have to be set on the **orchestrator process itself**
+(whatever starts `uvicorn app.main:app`), not on the `eval.run` invocation. `eval/run.py` only ever
+talks to the orchestrator over HTTP; it has no way to change which provider an already-running
+orchestrator uses. Reproducing CI mode against a local `docker compose` stack means recreating the
+`orchestrator` service with those two variables set (for example,
+`LLM_PROVIDER=stub EMBED_PROVIDER=stub docker compose up -d --force-recreate orchestrator`), not
+just exporting them for the eval command.
+
+### Thresholds (full mode)
 
 These are fixed. Nothing in this codebase edits one of these numbers to make a run pass; a run that
 fails one is telling you something true about the system, and the fix belongs in retrieval, the

@@ -51,6 +51,20 @@ eval = [
     "textstat==0.7.13",
     "datasets==5.0.1",
 ]
+# The CI invariant gate's dependency set (.github/workflows/eval.yml, `pull_request` job): just
+# enough of the `eval` extra to run `python -m eval.run --ci` (EVAL_MODE=ci). openai is needed only
+# because eval/judge.py imports it at module level even though CI mode never calls the judge (the
+# NVIDIA judge client itself is never constructed in CI mode); textstat is needed for
+# reading_grade_level, which CI mode does compute. Neither ragas, langchain, langchain-community,
+# langchain-openai, nor datasets are installed for this job: eval/metrics.py imports all of those
+# lazily, inside the functions that run RAGAS, precisely so CI installs none of them (see
+# docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md -- this is the whole reason CI install
+# time stays fast). A full local eval run still installs the `eval` extra above, a superset of this
+# one with the same pins.
+eval-ci = [
+    "openai==3.6.0",
+    "textstat==0.7.13",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -74,5 +88,6 @@ target-version = ["py312"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-    "live_stack: requires the running docker compose stack (postgres + orchestrator) and an ingested corpus",
+    "live_stack: requires a live orchestrator (docker compose or a bare `uvicorn app.main:app`) reachable over HTTP, with a corpus already ingested",
+    "full_corpus: requires data/sources/raw/ populated from the real 14-source manifest (data/sources/sources.yaml) via `python -m app.ingest` (INGEST_MODE=fetch); not satisfied by the small eval/fixtures/sources/ corpus the CI invariant gate ingests",
 ]

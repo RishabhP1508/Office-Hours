@@ -1,8 +1,8 @@
-"""Chunking tests against the real corpus snapshots in data/sources/raw/.
+"""Chunking tests against the corpus snapshots in RAW_SNAPSHOT_DIR.
 
-No mocks: these tests load the actual snapshot files (written by `python -m app.ingest`) and run the
-real chunker against them, per ARCHITECTURE.md's rule that the chunker's input is always a snapshot
-file on disk.
+No mocks: these tests load actual snapshot files (written by `python -m app.ingest`, or committed
+directly as fixtures) and run the real chunker against them, per ARCHITECTURE.md's rule that the
+chunker's input is always a snapshot file on disk.
 
 Snapshots are located by source_url (read from each file's own frontmatter), never by filename.
 ingest.py reuses an existing snapshot's filename when one already exists, which is why filenames on
@@ -11,6 +11,26 @@ and friends). data/sources/raw/ is gitignored, so on a fresh clone it starts emp
 mints its own filenames from the URL instead. A test keyed on a filename stem would only pass by
 coincidence of what this machine's directory already contained; keying on source_url checks the
 same identity ingest.py itself uses to decide whether a snapshot already exists for a URL.
+
+This module runs against WHICHEVER directory RAW_SNAPSHOT_DIR names -- the real 14-source corpus
+(data/sources/raw/, populated locally by `python -m app.ingest`) or the small, committed CI fixture
+corpus (eval/fixtures/sources/, see .github/workflows/eval.yml). Most tests here check an invariant
+of the chunker itself (every snapshot yields more than one chunk, every chunk has a non-empty
+heading and a valid level, pre-heading content is captured, the fixed-admission FAQ's inverted
+h2/h3 nesting parents correctly) and hold regardless of which corpus is loaded, so they run
+unconditionally in both environments -- this is what makes a PR that breaks the chunker fail CI,
+not just a local run.
+
+A few assertions are genuinely full-corpus-only: an exact count of 14 snapshots matching
+data/sources/sources.yaml, and the h4-only-page check parametrized over four specific real USCIS
+URLs the small fixture corpus does not carry all of. Those are marked `@pytest.mark.full_corpus`
+and deselected by the CI job's `pytest -m "not full_corpus"`; a plain `pytest -v` (the local,
+full-stack command) still collects and enforces them exactly as before. The marker is only ever
+used to deselect a check whose stated precondition (the real corpus) genuinely is not met; it is
+never used to weaken or skip an assertion that could run in CI, and no assertion in this file was
+loosened to make this split possible -- the fixed-admission FAQ's parenting invariant, in
+particular, is checked in CI too, against headings the fixture corpus actually carries (see
+test_fixed_admission_faq_transition_and_aud_parenting below), not skipped.
 """
 
 import re
@@ -27,7 +47,10 @@ SOURCES_MANIFEST_PATH = Path(get_settings().SOURCES_MANIFEST_PATH)
 
 # The four pages that carry their real section boundaries in h4 with no h2 at all. Chunking on h2
 # alone would collapse each of these into a single chunk. Identified by manifest URL (see module
-# docstring for why not by filename).
+# docstring for why not by filename). Only one of these four (h-1b-electronic-registration-process)
+# is in the CI fixture corpus; the whole parametrized test stays full_corpus-marked rather than
+# splitting out that one case, since "does every one of the four real h4-only pages behave" is the
+# actual invariant this test protects.
 H4_ONLY_PAGE_URLS = (
     "https://www.uscis.gov/working-in-the-united-states/temporary-workers/"
     "h-1b-specialty-occupations/extension-of-post-completion-optional-practical-training-opt-and-"
@@ -90,6 +113,7 @@ def snapshot_index() -> dict[str, tuple[Path, dict, str]]:
     return _build_snapshot_index()
 
 
+@pytest.mark.full_corpus
 def test_fourteen_snapshots_present(snapshot_paths, snapshot_index):
     assert len(snapshot_paths) == 14, (
         f"Expected 14 snapshots in {RAW_DIR}, found {len(snapshot_paths)}: "
@@ -116,6 +140,7 @@ def test_every_snapshot_produces_more_than_one_chunk(snapshot_paths):
         )
 
 
+@pytest.mark.full_corpus
 @pytest.mark.parametrize("url", H4_ONLY_PAGE_URLS, ids=lambda u: u.rsplit("/", 1)[-1])
 def test_h4_only_pages_produce_at_least_four_chunks(url, snapshot_index):
     assert url in snapshot_index, f"No snapshot found for source_url {url!r} in {RAW_DIR}"
@@ -149,11 +174,17 @@ def _chunk_by_heading(chunks: list[dict], heading: str) -> dict:
     return matches[0]
 
 
+@pytest.mark.full_corpus
 def test_fixed_admission_faq_parenting_inverts_correctly(snapshot_index):
     """The FAQ's questions are h2 while the group labels holding them are h3, sitting under empty h2
     super-labels. A naive level-number stack pops the h3 group the moment the next h2 question
     arrives and mis-parents every answer on the page; parenting must come from document order and
     empty-body headings instead.
+
+    Full-corpus-only: "Departure Period for F Students" is one of the group labels the CI fixture
+    corpus trims away to keep its size small (see eval/fixtures/sources/). The invariant itself is
+    also checked in CI, against headings the fixture does carry -- see
+    test_fixed_admission_faq_transition_and_aud_parenting below.
     """
     assert (
         FIXED_ADMISSION_FAQ_URL in snapshot_index
@@ -175,9 +206,38 @@ def test_fixed_admission_faq_parenting_inverts_correctly(snapshot_index):
     assert aud["parent"] == "Understanding the Admit Until Date (AUD)"
 
 
+def test_fixed_admission_faq_transition_and_aud_parenting(snapshot_index):
+    """Fixture-corpus-compatible companion to test_fixed_admission_faq_parenting_inverts_correctly
+    above: the same document-order, empty-heading parenting invariant, checked against two headings
+    present verbatim in BOTH the full corpus (data/sources/raw/) and the small CI fixture corpus
+    (eval/fixtures/sources/), so this one test runs -- and can actually catch a chunker regression
+    -- in CI, not just locally. Nothing here is a weaker version of the assertion above; both
+    headings and both expected parents are exactly what the full-corpus test also expects of them.
+    """
+    assert (
+        FIXED_ADMISSION_FAQ_URL in snapshot_index
+    ), f"No snapshot found for source_url {FIXED_ADMISSION_FAQ_URL!r} in {RAW_DIR}"
+    _, _, body = snapshot_index[FIXED_ADMISSION_FAQ_URL]
+    chunks = chunk_markdown(body)
+
+    transition = _chunk_by_heading(
+        chunks,
+        "If I am a current student admitted under duration of status, do I need to apply for an "
+        "extension of stay?",
+    )
+    assert transition["parent"] == "Transition Period"
+
+    aud = _chunk_by_heading(chunks, "What does the AUD mean?")
+    assert aud["parent"] == "Understanding the Admit Until Date (AUD)"
+
+
 def test_h1b_electronic_registration_preheading_table_is_captured(snapshot_index):
-    """The H-1B electronic registration page has ~65 lines and a 6-row historical table above its
-    first heading. That content must land in a chunk, attributed to the page title, never dropped.
+    """The H-1B electronic registration page has substantive content, including a historical
+    registration/selection data table, above its first real heading. That content must land in a
+    chunk, attributed to the page title, never dropped. Runs against both the real corpus (the
+    full ~65-line pre-heading block) and the CI fixture corpus (a trimmed version that still keeps
+    the FY2021 and FY2026 total-registration figures and the same page title), since the fixture
+    was built to preserve exactly this invariant, not to skip checking it.
     """
     assert (
         H1B_ELECTRONIC_REGISTRATION_URL in snapshot_index

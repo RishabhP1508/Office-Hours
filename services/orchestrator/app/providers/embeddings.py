@@ -1,10 +1,14 @@
 """Embedding provider interface.
 
-Two implementations behind one interface: local Ollama for dev, a hosted API for production. The
-model name always comes from Settings.EMBED_MODEL (app.config), never hardcoded here, so ingestion
-and query can never drift onto two different embedding spaces.
+Three implementations behind one interface: local Ollama for dev, a hosted API for production, and
+a deterministic stub for the CI invariant gate (see eval/run.py's EVAL_MODE=ci / --ci and
+docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md). The model name always comes from
+Settings.EMBED_MODEL (app.config) for the real providers, never hardcoded here, so ingestion and
+query can never drift onto two different embedding spaces.
 """
 
+import hashlib
+import math
 from abc import ABC, abstractmethod
 
 import httpx
@@ -58,6 +62,42 @@ class OllamaEmbedder(Embedder):
         return embeddings
 
 
+class StubEmbedder(Embedder):
+    """Deterministic, network-free stand-in for a real embedder, selected by EMBED_PROVIDER=stub.
+
+    Same text always gives the same vector: each dimension is derived from repeated SHA-256
+    hashing of the text (no randomness, no clock, no network call), then the vector is
+    L2-normalized. This is a hash, not a semantic embedding -- it carries no notion of which texts
+    are "similar", so retrieval results under this provider have no relationship to meaning. That
+    is fine for the CI invariant gate (see eval/run.py's EVAL_MODE=ci / --ci): CI never measures
+    answer quality, only that retrieval, citation mapping, and error handling behave correctly for
+    whatever gets retrieved.
+    """
+
+    def __init__(self, dim: int):
+        self._dim = dim
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed_one(text) for text in texts]
+
+    def _embed_one(self, text: str) -> list[float]:
+        seed = text.encode("utf-8")
+        values: list[float] = []
+        counter = 0
+        while len(values) < self._dim:
+            digest = hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+            for offset in range(0, len(digest), 8):
+                if len(values) >= self._dim:
+                    break
+                chunk = digest[offset : offset + 8]
+                as_unsigned = int.from_bytes(chunk, "big")
+                # Map a uniform 64-bit unsigned int onto [-1, 1].
+                values.append((as_unsigned / float(2**64 - 1)) * 2 - 1)
+            counter += 1
+        norm = math.sqrt(sum(v * v for v in values)) or 1.0
+        return [v / norm for v in values]
+
+
 class HostedEmbedder(Embedder):
     """Seam for a hosted embedding API in production. Not wired up in Phase 0."""
 
@@ -81,4 +121,6 @@ def get_embedder(settings: Settings) -> Embedder:
         )
     if settings.EMBED_PROVIDER == "hosted":
         return HostedEmbedder(model=settings.EMBED_MODEL)
+    if settings.EMBED_PROVIDER == "stub":
+        return StubEmbedder(dim=settings.EMBED_DIM)
     raise ValueError(f"Unknown EMBED_PROVIDER: {settings.EMBED_PROVIDER!r}")

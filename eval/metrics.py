@@ -71,19 +71,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 import textstat
-from langchain_core.embeddings import Embeddings
-from langchain_openai import ChatOpenAI
-from ragas import EvaluationDataset, SingleTurnSample, evaluate
-from ragas.embeddings import LangchainEmbeddingsWrapper
-from ragas.llms import LangchainLLMWrapper
-from ragas.metrics import answer_relevancy, context_precision, faithfulness
-from ragas.run_config import RunConfig
 
 from app.config import Settings
 from app.providers.embeddings import OllamaEmbedder
 from eval.judge import RETRYABLE_JUDGE_ERRORS, SHARED_RATE_LIMITER, validate_judge_settings
+
+# ragas, langchain-core, and langchain-openai are imported lazily, inside the functions that
+# actually run RAGAS (build_ragas_llm, build_ragas_embeddings, run_ragas_metrics), NOT at module
+# level. This is deliberate: importing this module (and eval.run, which imports
+# `reading_grade_level` from it) must never require ragas to be installed at all. The CI invariant
+# gate (EVAL_MODE=ci / `python -m eval.run --ci`, see eval/run.py and
+# docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md) never calls any of those three
+# functions, and installs a dependency set (services/orchestrator/pyproject.toml's `eval-ci` extra)
+# that does not include ragas, langchain, langchain-community, or langchain-openai at all -- both
+# for CI install speed and so a missing ragas install can never silently break a CI run that was
+# never supposed to touch it. `TYPE_CHECKING` imports below exist only for type checkers; they are
+# never executed at runtime.
+if TYPE_CHECKING:
+    from ragas.embeddings import LangchainEmbeddingsWrapper
+    from ragas.llms import LangchainLLMWrapper
+
 
 # The metrics RAGAS scores, and the exact order they are submitted to evaluate() in. Job numbering
 # inside ragas.evaluate() is `len(RAGAS_METRICS) * local_row_index + metric_index_in_this_list` (see
@@ -92,7 +102,14 @@ from eval.judge import RETRYABLE_JUDGE_ERRORS, SHARED_RATE_LIMITER, validate_jud
 # _RagasJobFailureCollector's job numbers get decoded back into (local_row_index, metric) pairs
 # below. `local_row_index` is this call's own row position, not the golden-set row index -- see the
 # module docstring above for why those two differ and how run_ragas_metrics translates between them.
-RAGAS_METRICS = [faithfulness, answer_relevancy, context_precision]
+#
+# Built lazily by _ragas_metrics_list() (imports ragas.metrics on first call) rather than at import
+# time, for the same reason as build_ragas_llm/build_ragas_embeddings above.
+def _ragas_metrics_list() -> list:
+    from ragas.metrics import answer_relevancy, context_precision, faithfulness
+
+    return [faithfulness, answer_relevancy, context_precision]
+
 
 # RAGAS concurrency. The outbound rate is already capped by SHARED_RATE_LIMITER regardless of this
 # number; max_workers=1 additionally guarantees at most one request in flight at a time, so a slow
@@ -143,29 +160,6 @@ class _RagasJobFailureCollector(logging.Handler):
             self.failures.append((int(counter), str(exec_name), str(exec_message)))
 
 
-class _RagasOllamaEmbeddings(Embeddings):
-    """Adapts app.providers.embeddings.OllamaEmbedder (async) to the langchain Embeddings interface
-    RAGAS's LangchainEmbeddingsWrapper expects (sync embed_query/embed_documents plus async
-    aembed_query/aembed_documents). This is the embedding model used for answer_relevancy only; it
-    is never the generator and never the judge, so it carries no self-preference risk.
-    """
-
-    def __init__(self, embedder: OllamaEmbedder):
-        self._embedder = embedder
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return asyncio.run(self._embedder.embed(texts))
-
-    def embed_query(self, text: str) -> list[float]:
-        return asyncio.run(self._embedder.embed([text]))[0]
-
-    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
-        return await self._embedder.embed(texts)
-
-    async def aembed_query(self, text: str) -> list[float]:
-        return (await self._embedder.embed([text]))[0]
-
-
 def build_ragas_llm(settings: Settings) -> LangchainLLMWrapper:
     """The judge LLM RAGAS uses for faithfulness/answer_relevancy/context_precision.
 
@@ -181,7 +175,13 @@ def build_ragas_llm(settings: Settings) -> LangchainLLMWrapper:
     crash the entire run with an unrelated pydantic ValidationError instead of a clean retry.
     Constraining the model to valid JSON syntax at the API level, the same way eval/judge.py already
     does for its own two judged tasks, avoids ever entering that fragile path.
+
+    Imports ragas.llms and langchain_openai lazily (see module docstring): this function is never
+    called in CI mode.
     """
+    from langchain_openai import ChatOpenAI
+    from ragas.llms import LangchainLLMWrapper
+
     validate_judge_settings(settings)
     chat = ChatOpenAI(
         base_url=settings.JUDGE_BASE_URL,
@@ -196,6 +196,35 @@ def build_ragas_llm(settings: Settings) -> LangchainLLMWrapper:
 
 
 def build_ragas_embeddings(settings: Settings) -> LangchainEmbeddingsWrapper:
+    """Imports ragas.embeddings and langchain_core lazily (see module docstring): this function is
+    never called in CI mode. `_RagasOllamaEmbeddings` is defined here, not at module level, for the
+    same reason -- its base class comes from langchain_core.
+    """
+    from langchain_core.embeddings import Embeddings
+    from ragas.embeddings import LangchainEmbeddingsWrapper
+
+    class _RagasOllamaEmbeddings(Embeddings):
+        """Adapts app.providers.embeddings.OllamaEmbedder (async) to the langchain Embeddings
+        interface RAGAS's LangchainEmbeddingsWrapper expects (sync embed_query/embed_documents plus
+        async aembed_query/aembed_documents). This is the embedding model used for answer_relevancy
+        only; it is never the generator and never the judge, so it carries no self-preference risk.
+        """
+
+        def __init__(self, embedder: OllamaEmbedder):
+            self._embedder = embedder
+
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            return asyncio.run(self._embedder.embed(texts))
+
+        def embed_query(self, text: str) -> list[float]:
+            return asyncio.run(self._embedder.embed([text]))[0]
+
+        async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+            return await self._embedder.embed(texts)
+
+        async def aembed_query(self, text: str) -> list[float]:
+            return (await self._embedder.embed([text]))[0]
+
     embedder = OllamaEmbedder(base_url=settings.OLLAMA_BASE_URL, model=settings.EMBED_MODEL)
     return LangchainEmbeddingsWrapper(_RagasOllamaEmbeddings(embedder))
 
@@ -227,7 +256,14 @@ def run_ragas_metrics(rows: list[dict], *, settings: Settings) -> tuple[list[dic
     or other transient failure on one row/metric never aborts the batch (see module docstring);
     this list is how that failure is still surfaced by name instead of silently vanishing into an
     indistinguishable NaN.
+
+    Imports ragas itself lazily (see module docstring): this function is never called in CI mode.
     """
+    from ragas import EvaluationDataset, SingleTurnSample, evaluate
+    from ragas.run_config import RunConfig
+
+    ragas_metrics = _ragas_metrics_list()
+
     samples = [
         SingleTurnSample(
             user_input=row["question"],
@@ -252,7 +288,7 @@ def run_ragas_metrics(rows: list[dict], *, settings: Settings) -> tuple[list[dic
     try:
         result = evaluate(
             dataset=dataset,
-            metrics=RAGAS_METRICS,
+            metrics=ragas_metrics,
             llm=build_ragas_llm(settings),
             embeddings=build_ragas_embeddings(settings),
             run_config=run_config,
@@ -266,7 +302,7 @@ def run_ragas_metrics(rows: list[dict], *, settings: Settings) -> tuple[list[dic
     finally:
         ragas_executor_logger.removeHandler(failure_collector)
 
-    num_metrics = len(RAGAS_METRICS)
+    num_metrics = len(ragas_metrics)
     # Keyed on local_row_index (this call's own row position), because it is cross-checked below
     # against `enumerate(records)`, which iterates in that same local order. This is deliberately
     # NOT the golden-set index -- see the module docstring and run_ragas_metrics' own docstring.
@@ -274,7 +310,7 @@ def run_ragas_metrics(rows: list[dict], *, settings: Settings) -> tuple[list[dic
     row_failures: list[dict] = []
     for counter, exec_name, exec_message in failure_collector.failures:
         local_row_index = counter // num_metrics
-        metric_name = RAGAS_METRICS[counter % num_metrics].name
+        metric_name = ragas_metrics[counter % num_metrics].name
         error = f"{exec_name}: {exec_message}"
         row_metric_failures[(local_row_index, metric_name)] = error
         row = rows[local_row_index] if local_row_index < len(rows) else None

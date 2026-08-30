@@ -90,6 +90,14 @@ class Settings(BaseSettings):
     SOURCES_MANIFEST_PATH: str = "/app/data/sources/sources.yaml"
     RAW_SNAPSHOT_DIR: str = "/app/data/sources/raw"
 
+    # Ingestion mode. "fetch" (default) reads SOURCES_MANIFEST_PATH and fetches each URL over
+    # HTTP, as Phase 0 always has. "snapshot" skips the manifest and the network entirely: it
+    # treats every *.md file already in RAW_SNAPSHOT_DIR as a snapshot (frontmatter + body, the
+    # exact format _fetch_and_snapshot writes) and chunks/embeds each one directly. This is what
+    # lets the CI eval gate ingest eval/fixtures/sources/ -- a small, committed corpus -- without
+    # fetching any live URL (see docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md).
+    INGEST_MODE: str = "fetch"
+
 
 @lru_cache
 def get_settings() -> Settings:
