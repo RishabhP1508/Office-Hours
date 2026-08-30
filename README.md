@@ -80,6 +80,7 @@ never commit it.
 | `EMBED_PROVIDER`, `EMBED_MODEL`, `EMBED_DIM` | Which embedder to use. Ingestion and query always read the same `EMBED_MODEL`, so the corpus and a live query can never land in two different embedding spaces. |
 | `LLM_PROVIDER`, `LLM_MODEL` | Which LLM to use to generate answers. |
 | `RETRIEVAL_TOP_K` | How many chunks to retrieve per query. |
+| `RRF_K`, `HYBRID_CANDIDATE_POOL` | Reciprocal Rank Fusion tuning for hybrid retrieval: `RRF_K` is the rank-fusion constant, `HYBRID_CANDIDATE_POOL` is how deep each arm (semantic, keyword) looks before fusion. Neither changes how many chunks the generator sees; that's still `RETRIEVAL_TOP_K`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | Where traces go and what service name they're tagged with. |
 | `GRAFANA_HOST_PORT` | Host port Grafana is published on, default 3000. Override it if something else on your machine already holds that port. |
 | `CRAWL_DELAY_SECONDS`, `USER_AGENT` | How politely `ingest.py` crawls the source pages. |
@@ -87,12 +88,14 @@ never commit it.
 
 ## How retrieval works right now
 
-Postgres with the pgvector extension holds every chunk and its embedding in one `documents` table.
-A query is embedded with the same model used at ingest time, and Postgres does a sequential cosine
-scan (`ORDER BY embedding <=> $1 LIMIT k`) to find the closest chunks. There's no index yet: at a few
-hundred rows, sequential scan is fast, and it gives an exact answer to measure retrieval quality
-against before an approximate index (HNSW, arriving in Phase 3) could introduce recall loss no one
-would notice yet.
+Postgres with the pgvector extension holds every chunk, its embedding, and a generated `tsvector`
+column in one `documents` table. A query runs two searches at once: a semantic arm over an HNSW
+index (`embedding <=> $1`, cosine distance) and a keyword arm over a GIN index (`ts_rank_cd` against
+the tsvector). Each arm ranks its own top candidates, and the two rank lists are fused with
+Reciprocal Rank Fusion in a single SQL query, so a chunk that only one arm finds (an exact term like
+"I-983" that means nothing to the embedding, or a paraphrase that shares no words with the source
+text) still has a path into the answer. `docs/adr/0001-rrf-vs-weighted-blend.md` covers why ranks are
+fused instead of raw scores.
 
 Chunking happens by section (h2 through h4 headings), never by a fixed character count, so a
 citation always points at a whole rule instead of a fragment. Some of these government pages nest

@@ -1,7 +1,8 @@
 """The query pipeline.
 
-Phase 0: embed -> retrieve -> generate -> build citations. This is deliberately the whole pipeline
-for now. The seams for the guardrail stages arrive in later phases and are marked below:
+embed -> retrieve (hybrid RRF, Phase 3 -- see app/db.py::hybrid_search) -> generate -> build
+citations. This is deliberately the whole pipeline for now. The seams for the guardrail stages
+arrive in later phases and are marked below:
 
     classify -> clarify -> retrieve -> generate -> verify -> freshness
 
@@ -16,7 +17,7 @@ from opentelemetry.trace import Status, StatusCode
 from psycopg_pool import AsyncConnectionPool
 
 from app.config import Settings
-from app.db import RetrievedChunk, search
+from app.db import RetrievedChunk, hybrid_search
 from app.prompts import SYSTEM_PROMPT, build_user_prompt
 from app.providers.embeddings import Embedder
 from app.providers.llm import LLM
@@ -51,9 +52,31 @@ async def answer_question(
 
     with tracer.start_as_current_span("retrieve") as retrieve_span:
         retrieve_span.set_attribute("top_k", settings.RETRIEVAL_TOP_K)
+        retrieve_span.set_attribute("retrieval_mode", "hybrid_rrf")
+        retrieve_span.set_attribute("rrf_k", settings.RRF_K)
+        retrieve_span.set_attribute("candidate_pool", settings.HYBRID_CANDIDATE_POOL)
         [query_embedding] = await embedder.embed([question])
-        chunks = await search(pool, query_embedding, settings.RETRIEVAL_TOP_K)
+        chunks = await hybrid_search(
+            pool,
+            query_embedding,
+            question,
+            settings.RETRIEVAL_TOP_K,
+            rrf_k=settings.RRF_K,
+            candidate_pool=settings.HYBRID_CANDIDATE_POOL,
+        )
         retrieve_span.set_attribute("result_count", len(chunks))
+        retrieve_span.set_attribute(
+            "semantic_only_hits",
+            sum(1 for c in chunks if c.semantic_rank is not None and c.keyword_rank is None),
+        )
+        retrieve_span.set_attribute(
+            "keyword_only_hits",
+            sum(1 for c in chunks if c.keyword_rank is not None and c.semantic_rank is None),
+        )
+        retrieve_span.set_attribute(
+            "both_arms_hits",
+            sum(1 for c in chunks if c.semantic_rank is not None and c.keyword_rank is not None),
+        )
 
     context = [
         {

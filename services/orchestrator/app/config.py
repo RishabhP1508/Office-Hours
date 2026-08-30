@@ -53,6 +53,18 @@ class Settings(BaseSettings):
     # Retrieval
     RETRIEVAL_TOP_K: int = 5
 
+    # Hybrid RRF (Phase 3). RRF_K is the constant k in 1 / (k + rank) from the original
+    # Cormack/Clarke/Buettcher RRF paper; 60 is that paper's own constant, not tuned against this
+    # corpus or the golden set (see docs/adr/0001-rrf-vs-weighted-blend.md).
+    RRF_K: int = 60
+
+    # HYBRID_CANDIDATE_POOL is how deep each arm (semantic, keyword) looks before ranks are fused,
+    # 4x RETRIEVAL_TOP_K. It changes how many candidates each arm contributes to the fusion, NOT
+    # how many chunks the generator sees -- that stays RETRIEVAL_TOP_K, which must not change in
+    # Phase 3: the Phase 1 semantic-only baseline (eval/results/20260830T183110Z.json) is compared
+    # against without being re-run, and changing top_k would invalidate that comparison.
+    HYBRID_CANDIDATE_POOL: int = 20
+
     # Eval judge (Phase 1). Hosted NVIDIA endpoint, a different model family than the generator,
     # so a self-preference bias never creeps into the eval gate (see ARCHITECTURE.md, "The eval
     # judge is a hosted model from a different family than the generator"). JUDGE_API_KEY has no
