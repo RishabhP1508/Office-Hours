@@ -1,0 +1,43 @@
+sources:
+  - url: https://www.uscis.gov/working-in-the-united-states/students-and-exchange-visitors/optional-practical-training-opt-for-f-1-students
+    title: OPT for F-1 Students
+    topic: opt
+  - url: https://www.uscis.gov/working-in-the-united-states/students-and-exchange-visitors/optional-practical-training-extension-for-stem-students-stem-opt
+    title: STEM OPT Extension
+    topic: stem_opt
+  - url: https://studyinthestates.dhs.gov/sevis-help-hub/student-records/fm-student-employment/f-1-optional-practical-training-opt
+    title: F-1 OPT (Study in the States)
+    topic: opt
+  - url: https://www.uscis.gov/working-in-the-united-states/h-1b-specialty-occupations
+    title: H-1B Specialty Occupations
+    topic: h1b
+  - url: https://www.uscis.gov/working-in-the-united-states/temporary-workers/h-1b-specialty-occupations/h-1b-cap-season
+    title: H-1B Cap Season
+    topic: h1b
+  - url: https://www.uscis.gov/working-in-the-united-states/temporary-workers/h-1b-specialty-occupations/h-1b-electronic-registration-process
+    title: H-1B Electronic Registration Process
+    topic: h1b
+  - url: https://www.uscis.gov/working-in-the-united-states/temporary-workers/h-1b-specialty-occupations/extension-of-post-completion-optional-practical-training-opt-and-f-1-status-for-eligible-students
+    title: Cap-Gap Extension of OPT and F-1 Status
+    topic: cap_gap
+  - url: https://studyinthestates.dhs.gov/students/complete/h-1b-status-and-the-cap-gap-extension
+    title: H-1B Status and the Cap-Gap Extension (Study in the States)
+    topic: cap_gap
+  - url: https://studyinthestates.dhs.gov/students/maintaining-status
+    title: Maintaining Status (Study in the States)
+    topic: f1_status
+  - url: https://studyinthestates.dhs.gov/students/study/full-course-of-study
+    title: Full Course of Study (Study in the States)
+    topic: f1_status
+  - url: https://studyinthestates.dhs.gov/students/study/traveling-as-an-international-student
+    title: Traveling as an International Student (Study in the States)
+    topic: travel
+  - url: https://www.ice.gov/sevis/travel
+    title: SEVP Travel FAQ (ICE)
+    topic: travel
+  - url: https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-procedure-faq
+    title: Fixed Time Period of Admission Final Rule FAQ
+    topic: fixed_admission
+  - url: https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-procedure-quick
+    title: Fixed Time Period of Admission Final Rule Quick Facts
+    topic: fixed_admission

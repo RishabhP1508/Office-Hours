@@ -1,0 +1,78 @@
+[project]
+name = "office-hours-orchestrator"
+version = "0.1.0"
+description = "Office Hours orchestrator: retrieval, generation, and the RAG pipeline."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "psycopg[binary,pool]>=3.2",
+    "pgvector>=0.3.6",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.3",
+    "markdownify>=0.13",
+    "pyyaml>=6.0",
+    "python-dateutil>=2.9",
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+    "black>=24.10",
+]
+# Phase 1 eval harness (eval/run.py, judge.py, metrics.py). This puts eval-only dependencies in the
+# service image (see Dockerfile: `pip install -e ".[dev,eval]"`); noted in docs/reports/phase-1.md.
+#
+# ragas 0.4.x (the current PyPI default) eagerly imports `langchain_community.chat_models.vertexai`
+# at import time, a module recent langchain-community releases (0.4.x) no longer ship -- it moved to
+# a standalone `langchain-google-vertexai` package. That import fails before ragas.evaluate() is ever
+# called. ragas 0.2.15 is the last line before that split and uses the LangchainLLMWrapper /
+# LangchainEmbeddingsWrapper interface this project's judge and metrics are built on, so it is
+# pinned exactly, together with a langchain-community version old enough to still carry the vertexai
+# submodule ragas imports (but not so old it drags in an incompatible langchain-core). All five
+# pins below were verified together in a clean virtualenv (no other langchain packages pre-installed)
+# to resolve to exactly these versions with no dependency conflicts.
+eval = [
+    "ragas==0.2.15",
+    "langchain==1.3.18",
+    "langchain-core==1.6.1",
+    "langchain-community==0.3.31",
+    "langchain-openai==1.6.0",
+    "openai==3.6.0",
+    "textstat==0.7.13",
+    "datasets==5.0.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "live_stack: requires the running docker compose stack (postgres + orchestrator) and an ingested corpus",
+]
