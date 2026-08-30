@@ -163,7 +163,7 @@ Reciprocal Rank Fusion over a pgvector ranking and a `tsvector` ranking, in a si
 Why: these questions mix meaning ("can I work while my extension is pending") with exact tokens
 ("I-765", "cap-gap", "24-month"). Vector search alone misses the tokens. RRF combines ranks rather than
 scores, so it needs no score normalization between two systems whose scores are not comparable. One CTE
-keeps it a single round trip. Recorded in `docs/adr/0001-rrf-vs-weighted-blend.md` when Phase 3 lands.
+keeps it a single round trip. Recorded in `docs/adr/0001-rrf-vs-weighted-blend.md`.
 
 ## Models and providers
 
