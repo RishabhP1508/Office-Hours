@@ -1,0 +1,150 @@
+name: Eval gate
+
+# Two separate jobs, gated by two separate triggers, on purpose (see
+# docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md):
+#
+# - `pull_request` runs ci-invariant-gate: deterministic stub providers over the small, committed
+#   fixture corpus (eval/fixtures/sources). No repository secret, no GPU, no hosted judge, no
+#   RAGAS. It checks retrieval, citation mapping, refusal bookkeeping, and error handling -- never
+#   answer quality -- and is gated against eval/baselines.json's "ci_baseline" (no worse than the
+#   last accepted CI-mode run), never against eval/run.py's THRESHOLDS.
+#
+# - `workflow_dispatch` runs full-eval: the real quality eval, against an already-running
+#   orchestrator instance the person triggering the workflow points it at, judged by the hosted
+#   NVIDIA endpoint and scored by RAGAS. This is deliberate and manual because it costs a real API
+#   key and a real judge/RAGAS bill, and a full run takes on the order of an hour.
+"on":
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      orchestrator_url:
+        description: >-
+          Base URL of an already-running orchestrator to evaluate (e.g. http://localhost:8000
+          via a self-hosted runner, or a reachable dev/staging URL). This job does not start an
+          orchestrator itself.
+        required: true
+      judge_model:
+        description: "Judge model to request (must stay a different family than the generator)"
+        required: false
+        default: "nvidia/nemotron-3.5-lightning-30b-a3b"
+
+jobs:
+  ci-invariant-gate:
+    name: CI invariant gate (fixture corpus, stub providers)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: officehours
+          POSTGRES_PASSWORD: officehours
+          POSTGRES_DB: officehours
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U officehours -d officehours"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://officehours:officehours@localhost:5432/officehours
+      # LLM_PROVIDER/EMBED_PROVIDER/LLM_MODEL set explicitly, never left to their ollama defaults:
+      # this job has no GPU and no Ollama to fall back to, and a silent fallback here would either
+      # hang or fail in a way that looks unrelated to the real cause.
+      LLM_PROVIDER: stub
+      EMBED_PROVIDER: stub
+      LLM_MODEL: qwen3.5-8k:latest
+      EMBED_MODEL: nomic-embed-text
+      EMBED_DIM: "768"
+      RETRIEVAL_TOP_K: "5"
+      # Ingest the small, committed fixture corpus instead of the live 14-source manifest -- no
+      # network fetch of a government page from this job, ever (see app/config.py::INGEST_MODE).
+      INGEST_MODE: snapshot
+      RAW_SNAPSHOT_DIR: ${{ github.workspace }}/eval/fixtures/sources
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
+      OTEL_SERVICE_NAME: office-hours-orchestrator-ci
+      ORCHESTRATOR_URL: http://localhost:8000
+      EVAL_MODE: ci
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/orchestrator/pyproject.toml
+
+      - name: Install orchestrator dependencies (CI's lightweight set -- no ragas/langchain/datasets)
+        run: pip install -e "./services/orchestrator[dev,eval-ci]"
+
+      - name: Apply infra/sql/init.sql
+        run: |
+          python -c "
+          import psycopg
+          conn = psycopg.connect('${{ env.DATABASE_URL }}', autocommit=True)
+          conn.execute(open('infra/sql/init.sql').read())
+          print('applied infra/sql/init.sql')
+          "
+
+      - name: Ingest the fixture corpus (eval/fixtures/sources, no live fetch)
+        run: python -m app.ingest
+
+      - name: Start the orchestrator and wait for /health
+        run: |
+          nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir services/orchestrator \
+            > orchestrator.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health > /dev/null; then
+              echo "orchestrator is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "orchestrator never became healthy; log follows"
+          cat orchestrator.log
+          exit 1
+
+      - name: Run the CI invariant gate (python -m eval.run --ci)
+        run: python -m eval.run --ci
+
+      - name: Run pytest (excludes tests that need the real 14-source corpus)
+        working-directory: services/orchestrator
+        run: pytest -m "not full_corpus" -v
+
+      - name: Upload orchestrator log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-log
+          path: orchestrator.log
+          if-no-files-found: ignore
+
+  full-eval:
+    name: Full eval (real providers, judged and scored by RAGAS)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      ORCHESTRATOR_URL: ${{ github.event.inputs.orchestrator_url }}
+      JUDGE_PROVIDER: nvidia
+      JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+      JUDGE_API_KEY: ${{ secrets.JUDGE_API_KEY }}
+      JUDGE_MODEL: ${{ github.event.inputs.judge_model }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/orchestrator/pyproject.toml
+
+      - name: Install orchestrator + eval dependencies (full set, including ragas)
+        run: pip install -e "./services/orchestrator[dev,eval]"
+
+      - name: Run the full eval against ${{ github.event.inputs.orchestrator_url }}
+        run: python -m eval.run

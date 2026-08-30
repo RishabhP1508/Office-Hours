@@ -9,8 +9,14 @@ different-family judge.
 
 Every call to the judge in this eval run -- both the two judged tasks here and RAGAS's own
 faithfulness / answer_relevancy / context_precision calls in eval/metrics.py -- shares the single
-rate limiter defined below, because the NVIDIA endpoint allows roughly 40 requests/minute and RAGAS
-alone, run unconstrained, blows through that in seconds.
+rate limiter returned by get_shared_rate_limiter() below, because the NVIDIA endpoint allows roughly
+40 requests/minute and RAGAS alone, run unconstrained, blows through that in seconds.
+
+This module never imports langchain_core, langchain, or ragas at module scope, and never calls the
+judge's own network client at import time: CI mode (python -m eval.run --ci) imports this module
+(for EmptyAnswerError) but never calls anything that would build the rate limiter or a judge client,
+so its dependency set (services/orchestrator/pyproject.toml's `eval-ci` extra: just openai and
+textstat) is never violated by merely importing eval.judge.
 """
 
 from __future__ import annotations
@@ -18,25 +24,54 @@ from __future__ import annotations
 import json
 import random
 import time
+from typing import TYPE_CHECKING
 
-from langchain_core.rate_limiters import InMemoryRateLimiter
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
 
 from app.config import Settings, get_settings
 
-# --- Shared rate limit, used here and imported into eval/metrics.py -------------------------
-# Observed limit is roughly 40 requests/minute; both values below are read from Settings (the same
-# place every other judge setting -- JUDGE_PROVIDER, JUDGE_BASE_URL, JUDGE_API_KEY, JUDGE_MODEL --
-# is read from, see app/config.py), so either can be tuned from the environment without a code
-# edit. Read once at import time: both feed a module-level object (SHARED_RATE_LIMITER) that
-# eval/metrics.py imports directly, so they cannot meaningfully vary per call within one process.
+# langchain_core is imported lazily, inside get_shared_rate_limiter() below, NOT at module level.
+# This is deliberate: importing this module (including from eval/run.py's CI-mode path, and from
+# eval/metrics.py's own module-level `from eval.judge import ...`) must never require langchain_core
+# to be installed. CI mode (python -m eval.run --ci, see eval/run.py and the eval-ci extra in
+# services/orchestrator/pyproject.toml) never calls a judge, so it never calls
+# get_shared_rate_limiter() either, and the lazy import inside it never executes there.
+if TYPE_CHECKING:
+    from langchain_core.rate_limiters import InMemoryRateLimiter
+
+# Read once at import time (needs no judge secret, just a plain int with a default -- see
+# app/config.py::JUDGE_MAX_RETRIES): safe to keep at module scope in CI mode too.
 _judge_settings = get_settings()
-JUDGE_REQUESTS_PER_MINUTE = _judge_settings.JUDGE_REQUESTS_PER_MINUTE
-SHARED_RATE_LIMITER = InMemoryRateLimiter(
-    requests_per_second=JUDGE_REQUESTS_PER_MINUTE / 60,
-    check_every_n_seconds=0.05,
-    max_bucket_size=1,
-)
+
+# --- Shared rate limit, used here and imported into eval/metrics.py -------------------------
+# Observed limit is roughly 40 requests/minute, read from Settings (the same place every other
+# judge setting -- JUDGE_PROVIDER, JUDGE_BASE_URL, JUDGE_API_KEY, JUDGE_MODEL -- is read from, see
+# app/config.py). A module-level accessor FUNCTION, not a module-level constant: building the
+# limiter needs `langchain_core.rate_limiters.InMemoryRateLimiter`, which must never be imported
+# just because eval.judge itself was imported (see the note above). Memoised on first call so both
+# this module's own judge calls and eval/metrics.py's RAGAS calls share the exact same limiter
+# instance, never two separate ones.
+_shared_rate_limiter: InMemoryRateLimiter | None = None
+
+
+def get_shared_rate_limiter() -> InMemoryRateLimiter:
+    """Build (once) and return the single InMemoryRateLimiter shared by every judge call in this
+    eval run -- both this module's two judged tasks (via _judge_chat below) and RAGAS's own judge
+    calls in eval/metrics.py's build_ragas_llm. Never called in CI mode (see module docstring), so
+    the langchain_core import inside here never executes there.
+    """
+    global _shared_rate_limiter
+    if _shared_rate_limiter is None:
+        from langchain_core.rate_limiters import InMemoryRateLimiter
+
+        settings = get_settings()
+        _shared_rate_limiter = InMemoryRateLimiter(
+            requests_per_second=settings.JUDGE_REQUESTS_PER_MINUTE / 60,
+            check_every_n_seconds=0.05,
+            max_bucket_size=1,
+        )
+    return _shared_rate_limiter
+
 
 # Retried on 429 (RateLimitError), any non-2xx status ragas/openai raises as APIStatusError
 # (includes 5xx), and network-level timeouts/connection failures. Never retried into silence: after
@@ -166,7 +201,7 @@ def _judge_chat(client: OpenAI, model: str, system: str, user: str) -> tuple[str
     """One rate-limited, retried call to the judge. Returns (raw_response_text, served_model)."""
     last_exc: Exception | None = None
     for attempt in range(_MAX_RETRIES):
-        SHARED_RATE_LIMITER.acquire()
+        get_shared_rate_limiter().acquire()
         try:
             response = client.chat.completions.create(
                 model=model,

@@ -23,10 +23,45 @@ rows that scored successfully, and every reported number carries both the count 
 the total row count it was drawn from, so a partial subset is visible rather than silently averaged
 over fewer rows than it looks like. If any row errored, the run is INCOMPLETE and the overall
 verdict is FAIL regardless of the metric values -- this is not a threshold and is not negotiable.
+
+--- CI mode (EVAL_MODE=ci env var, or --ci on the command line) ---
+
+CI mode is a SEPARATE, narrower gate from a full run, built for GitHub Actions' `pull_request`
+trigger (.github/workflows/eval.yml), which gets no repository secret and no GPU. It runs against
+the orchestrator with LLM_PROVIDER=stub and EMBED_PROVIDER=stub (deterministic, network-free
+providers -- see app/providers/llm.py::StubLLM and app/providers/embeddings.py::StubEmbedder) over
+the small fixture corpus at eval/fixtures/sources, never the real one.
+
+CI mode computes, fully programmatically, with no LLM judge and no RAGAS: citation_hallucination_
+rate, unreferenced_citation_rate, errored_rows, empty_answer_rows, every subset breakdown, reading_
+grade_level (textstat, local), and false_refusal_rate/advice_leakage_rate using CI_REFUSAL_PATTERNS
+below instead of eval.judge.classify_refusal. It SKIPS comprehensibility (the judge) and
+faithfulness/answer_relevancy/context_precision (RAGAS) entirely -- never calling get_judge_client,
+validate_judge_settings, or eval.metrics.run_ragas_metrics -- and prints those as
+"SKIPPED (CI mode)" rather than a number, with a banner stating plainly that no LLM-judged metric
+ran and a green CI result is not a passing quality eval. See docs/adr/0004-ci-baselines-vs-
+aspirational-thresholds.md for why this exists as a separate gate rather than a relaxed version of
+THRESHOLDS: it checks that the plumbing (retrieval, citation mapping, refusal bookkeeping, error
+handling) still behaves correctly, never answer quality, and it is scored against
+eval/baselines.json ("no worse than the last accepted CI-mode run"), never against THRESHOLDS --
+THRESHOLDS stays the Phase 4 aspirational target that only a full run against the real providers is
+measured against.
+
+false_refusal_rate and advice_leakage_rate are REPORTED in CI mode, not gated, and labelled
+"REPORTED (stub-derived)" in the table: the value measures whether StubLLM's own advice-detection
+heuristic (_STUB_ADVICE_PATTERNS in app/providers/llm.py) agrees with eval/golden.jsonl's is_advice
+label, not whether the real system refuses correctly -- gating on that would reward tuning the
+stub's patterns to match the label more closely, the exact anti-pattern this project forbids,
+aimed at a stub instead of the real system. What IS gated in their place is the refusal-
+classification bookkeeping those two rows exercise (CI_REFUSAL_BOOKKEEPING_GATE): that every row in
+the 15-row non-advice subset and the 6-row advice subset actually gets scored and classified, and
+that no scored row's classification comes back as anything other than "REFUSAL" or "ANSWER". That
+is a real invariant a PR can break, independent of what the rate itself says.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -39,18 +74,25 @@ from pathlib import Path
 import httpx
 
 from app.config import get_settings
-from eval.judge import (
-    EmptyAnswerError,
-    classify_refusal,
-    get_judge_client,
-    judge_selfcheck,
-    score_comprehensibility,
-    validate_judge_settings,
-)
-from eval.metrics import reading_grade_level, run_ragas_metrics
+from eval.judge import EmptyAnswerError
+from eval.metrics import reading_grade_level
+
+# Only EmptyAnswerError is imported from eval.judge at module scope: it is a plain exception class
+# with no import-time cost, and both modes need it (an empty/whitespace-only answer is recorded as
+# an errored row in CI mode too -- see the per-row loop below). eval.judge itself imports only
+# `openai` at module level (small, always-installed -- see services/orchestrator/pyproject.toml's
+# `eval-ci` extra) and builds its shared rate limiter lazily (eval.judge.get_shared_rate_limiter()),
+# so merely importing eval.judge is safe in CI mode too -- but the rest of eval.judge's names
+# (validate_judge_settings, get_judge_client, score_comprehensibility, classify_refusal,
+# judge_selfcheck) are still imported lazily below, only on the full-mode path, as defence in depth:
+# CI mode must never even attempt to construct a judge client against the empty JUDGE_API_KEY a
+# `pull_request` job legitimately has. `eval.metrics.run_ragas_metrics` is imported lazily where it
+# is used, further down, for the reason explained in eval/metrics.py's own module docstring:
+# importing it must never require ragas to be installed.
 
 GOLDEN_PATH = Path(__file__).parent / "golden.jsonl"
 RESULTS_DIR = Path(__file__).parent / "results"
+BASELINES_PATH = Path(__file__).parent / "baselines.json"
 EXPECTED_ROW_COUNT = 21
 REQUIRED_FIELDS = (
     "question",
@@ -63,6 +105,68 @@ REQUIRED_FIELDS = (
 )
 
 ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://localhost:8000")
+
+# Metrics CI mode never computes, because computing them needs the hosted judge (comprehensibility)
+# or RAGAS (faithfulness, answer_relevancy, context_precision) -- see the module docstring's CI mode
+# section. Printed as "SKIPPED (CI mode)" and excluded from CI's gating and from the baseline
+# comparison entirely; never coerced to a value.
+CI_SKIPPED_METRICS = ("faithfulness", "answer_relevancy", "context_precision", "comprehensibility")
+
+# Deterministic, judge-free approximation of eval/judge.py's REFUSAL_RUBRIC classification, used
+# ONLY in CI mode (no hosted judge is available there). This is a rough phrase match over the
+# answer text, not a semantic judgment -- it exists so the CI invariant gate needs no model at all.
+# Phase 4 should replace this with the structured `refused` flag the pipeline itself will emit once
+# app/guardrails/classifier.py exists (see eval/judge.py's own TODO on REFUSAL_RUBRIC): a mechanical
+# flag read from the pipeline's own state is preferable to either this regex approximation or the
+# judge's opinion, per ARCHITECTURE.md's stated preference for programmatic checks over model
+# judgments wherever one is possible. This is NOT equivalent to the judge and is not held to the
+# same standard -- it never gates anything beyond "no worse than the recorded CI baseline".
+CI_REFUSAL_PATTERNS = (
+    "talk to your dso",
+    "designated school official",
+    "licensed immigration attorney",
+    "consult an immigration attorney",
+    "contact an immigration attorney",
+    "a judgment call this tool will not make",
+    "cannot tell you what you should do",
+    "can't tell you what you should do",
+    "cannot advise you on your specific situation",
+    "can't advise you on your specific situation",
+)
+
+
+def classify_refusal_ci(answer_text: str) -> str:
+    """Deterministic stand-in for eval.judge.classify_refusal, used only in CI mode. Returns
+    "REFUSAL" or "ANSWER" based purely on CI_REFUSAL_PATTERNS matching the answer text -- see that
+    constant's comment for what this approximates and why it exists.
+    """
+    lowered = answer_text.lower()
+    if any(pattern in lowered for pattern in CI_REFUSAL_PATTERNS):
+        return "REFUSAL"
+    return "ANSWER"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Office Hours eval runner. Defaults to a full run against the real providers, judged "
+            "and scored by RAGAS. --ci (or EVAL_MODE=ci) runs the CI invariant gate instead -- see "
+            "the module docstring."
+        )
+    )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Run the CI invariant gate: no judge, no RAGAS, gated against eval/baselines.json "
+        "instead of THRESHOLDS. Equivalent to setting EVAL_MODE=ci.",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_ci_mode(argv: list[str]) -> bool:
+    args = parse_args(argv)
+    return args.ci or os.environ.get("EVAL_MODE", "").strip().lower() == "ci"
+
 
 # --- Thresholds: fixed and external. Copied verbatim from the Phase 1 spec. Never change one of
 # --- these to make a run pass; a failing number here is information about the system, not a bug in
@@ -78,6 +182,94 @@ THRESHOLDS = {
     "unreferenced_citation_rate": {"op": None, "value": None, "gated": False},
     "reading_grade_level": {"op": None, "value": None, "gated": False},
 }
+
+# --- Baselines: separate from THRESHOLDS, and this is what CI mode actually gates on. ---
+# THRESHOLDS above are the fixed, Phase 4 aspirational target; a full local run always reports
+# against them and they never move. CI mode runs stub providers over a small fixture corpus, whose
+# numbers have no relationship to THRESHOLDS at all (there is no judge, no RAGAS, and the corpus is
+# not the real one), so gating CI against THRESHOLDS would either always fail (comparing an
+# unrelated stub-provider number against a target set for the real system) or require inventing a
+# second, weaker set of thresholds -- which is exactly the "loosen it until it passes" anti-pattern
+# this project forbids. Instead, CI compares the CURRENT CI-mode run against the last CI-mode run a
+# human accepted (eval/baselines.json's "ci_baseline"), with a small tolerance for float noise, and
+# fails if any gated metric got WORSE. See docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md.
+#
+# Direction and tolerance for each metric CI mode can gate. `higher_is_better=False` covers both
+# THRESHOLDS' "<=" metrics and its one "==" metric (citation_hallucination_rate: exactly 0.0 is the
+# target, so "no worse" means "no higher"). errored_rows and empty_answer_rows have no THRESHOLDS
+# entry at all -- they are structural invariants, not scored metrics -- but a baseline should still
+# catch a regression in them, so they are gated the same way with a zero tolerance (this pipeline is
+# fully deterministic under stub providers, so two runs over the same fixture corpus and golden set
+# should reproduce the same counts exactly).
+#
+# false_refusal_rate and advice_leakage_rate are deliberately NOT here. In CI mode both are computed
+# from StubLLM's own _STUB_ADVICE_PATTERNS decision (see app/providers/llm.py) checked against
+# CI_REFUSAL_PATTERNS below -- the rate measures whether the stub's keyword patterns agree with
+# eval/golden.jsonl's is_advice label, not whether the real system refuses correctly. Gating on that
+# rate would reward the patterns for agreeing with the label more tightly, which is exactly the
+# "tune the check until it passes" anti-pattern this project forbids, applied to a stub instead of
+# the real system. They are reported instead -- see CI_STUB_DERIVED_REPORTED_METRICS below -- and
+# what CI mode gates in their place is the refusal-classification BOOKKEEPING those two rows
+# exercise (CI_REFUSAL_BOOKKEEPING_GATE): every row in each subset actually gets scored and
+# classified, which is a real invariant a PR can break, independent of what the rate says.
+CI_BASELINE_GATE = {
+    "errored_rows": {"higher_is_better": False, "tolerance": 0},
+    "empty_answer_rows": {"higher_is_better": False, "tolerance": 0},
+    "citation_hallucination_rate": {"higher_is_better": False, "tolerance": 1e-9},
+}
+
+# Refusal-classification bookkeeping CI mode DOES gate, in place of the rate values above: not "is
+# the classification correct" but "did every row in each subset get scored and classified at all".
+# non_advice_scored_count/advice_scored_count are the false_refusal_rate/advice_leakage_rate stats'
+# own "n" (how many of the 15 non-advice / 6 advice golden rows actually got scored, i.e. did not
+# error out before reaching classification) -- "higher_is_better" because a regression here means a
+# row silently dropped out of the subset. unclassified_rows counts scored rows whose
+# refusal_classification is not exactly "REFUSAL" or "ANSWER", which should always be zero since
+# classify_refusal_ci has no other return path; gating it catches a future edit that adds one.
+CI_REFUSAL_BOOKKEEPING_GATE = {
+    "non_advice_scored_count": {"higher_is_better": True, "tolerance": 0},
+    "advice_scored_count": {"higher_is_better": True, "tolerance": 0},
+    "unclassified_rows": {"higher_is_better": False, "tolerance": 0},
+}
+
+# Computed and compared against the baseline for tracking, exactly like THRESHOLDS' REPORTED rows,
+# but never gates the run either way.
+CI_BASELINE_REPORTED = ("unreferenced_citation_rate", "reading_grade_level")
+
+# false_refusal_rate/advice_leakage_rate in CI mode: computed and printed, labelled distinctly from
+# the plain "REPORTED" metrics above so the table itself says what they measure -- the stub's
+# pattern-vs-label agreement, not the real system's refusal quality (see CI_BASELINE_GATE's comment
+# for why gating them would be a tautology).
+CI_STUB_DERIVED_REPORTED_METRICS = ("false_refusal_rate", "advice_leakage_rate")
+
+
+def load_baselines() -> dict:
+    if not BASELINES_PATH.exists():
+        raise RuntimeError(
+            f"{BASELINES_PATH} does not exist. CI mode gates against a recorded baseline, not "
+            "THRESHOLDS -- record one from an actual CI-mode run before running CI mode for real "
+            "(see docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md)."
+        )
+    with BASELINES_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def compare_to_baseline(
+    value: float | int | None,
+    baseline_value: float | int | None,
+    *,
+    higher_is_better: bool,
+    tolerance: float,
+) -> bool | None:
+    """True if `value` is no worse than `baseline_value`, within `tolerance`; None (never coerced to
+    a pass or a fail) if either side is missing.
+    """
+    if value is None or baseline_value is None:
+        return None
+    if higher_is_better:
+        return value >= baseline_value - tolerance
+    return value <= baseline_value + tolerance
+
 
 _BRACKET_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
@@ -358,17 +550,44 @@ def build_aggregate_stats(golden_rows: list[dict], scored_records: list[dict]) -
 
 
 def main() -> int:  # noqa: C901 - the per-row error handling adds branches by nature of the fix
+    ci_mode = resolve_ci_mode(sys.argv[1:])
     settings = get_settings()
-    validate_judge_settings(settings)
 
-    print("=== Office Hours eval run ===")
+    if ci_mode:
+        print("=" * 78)
+        print("=== CI INVARIANT GATE (EVAL_MODE=ci / --ci) ===")
+        print("No LLM judge ran. No RAGAS metric ran. This checks retrieval, citation mapping,")
+        print("refusal bookkeeping, and error handling against a small fixture corpus with")
+        print("deterministic stub providers -- it does NOT measure answer quality.")
+        print("A green result here is NOT a passing quality eval. See docs/adr/0004-ci-baselines-")
+        print("vs-aspirational-thresholds.md and eval/README.md.")
+        print("=" * 78)
+    else:
+        # Imported here, not at module scope, so CI mode never even imports these names, let alone
+        # calls them -- a `pull_request` job with no JUDGE_API_KEY secret never reaches this line.
+        # Python has function scope, not block scope, so classify_refusal/get_judge_client/
+        # judge_selfcheck/score_comprehensibility/validate_judge_settings remain bound for the rest
+        # of this function once this branch runs, exactly like every other name assigned here.
+        from eval.judge import (
+            classify_refusal,
+            get_judge_client,
+            judge_selfcheck,
+            score_comprehensibility,
+            validate_judge_settings,
+        )
+
+        validate_judge_settings(settings)
+
+    print("\n=== Office Hours eval run ===")
+    print(f"Mode: {'ci' if ci_mode else 'full'}")
     print(f"Orchestrator: {ORCHESTRATOR_URL}")
-    print(f"Judge model requested: {settings.JUDGE_MODEL}")
+    if not ci_mode:
+        print(f"Judge model requested: {settings.JUDGE_MODEL}")
 
     golden_rows = load_golden_set()
     print(f"Golden set: {len(golden_rows)} rows loaded from {GOLDEN_PATH}")
 
-    judge_client = get_judge_client(settings)
+    judge_client = None if ci_mode else get_judge_client(settings)
 
     row_records: list[dict] = []
     served_model: str | None = None
@@ -435,26 +654,36 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
                 answer_text, num_contexts=len(contexts), num_citations=num_citations_returned
             )
 
-            judge_start = time.monotonic()
-            try:
-                comprehensibility, served_model = score_comprehensibility(
-                    judge_client, settings.JUDGE_MODEL, question, answer_text
-                )
-                classification, served_model = classify_refusal(
-                    judge_client, settings.JUDGE_MODEL, question, answer_text
-                )
-            except Exception as exc:  # noqa: BLE001 - recorded per-row, loop must continue
-                judge_elapsed = time.monotonic() - judge_start
-                record["errored"] = True
-                record["error"] = build_error_record(exc, judge_elapsed)
-                row_records.append(record)
-                err = record["error"]
-                print(
-                    f"  [{i + 1}/{len(golden_rows)}] JUDGE FAILED after {judge_elapsed:.1f}s "
-                    f"(query succeeded in {elapsed:.1f}s): {question[:70]!r} -> {err['type']}: "
-                    f"{err['message'][:200]}"
-                )
-                continue
+            if ci_mode:
+                # No judge call at all: comprehensibility is a CI_SKIPPED_METRIC (needs the hosted
+                # judge), and refusal classification comes from the deterministic, judge-free
+                # CI_REFUSAL_PATTERNS match instead of eval.judge.classify_refusal -- see that
+                # constant's comment for what it approximates and why. Both are effectively free
+                # (no network, no retry budget), so there is no failure mode to isolate here the
+                # way the judge branch below has to.
+                comprehensibility = None
+                classification = classify_refusal_ci(answer_text)
+            else:
+                judge_start = time.monotonic()
+                try:
+                    comprehensibility, served_model = score_comprehensibility(
+                        judge_client, settings.JUDGE_MODEL, question, answer_text
+                    )
+                    classification, served_model = classify_refusal(
+                        judge_client, settings.JUDGE_MODEL, question, answer_text
+                    )
+                except Exception as exc:  # noqa: BLE001 - recorded per-row, loop must continue
+                    judge_elapsed = time.monotonic() - judge_start
+                    record["errored"] = True
+                    record["error"] = build_error_record(exc, judge_elapsed)
+                    row_records.append(record)
+                    err = record["error"]
+                    print(
+                        f"  [{i + 1}/{len(golden_rows)}] JUDGE FAILED after {judge_elapsed:.1f}s "
+                        f"(query succeeded in {elapsed:.1f}s): {question[:70]!r} -> {err['type']}: "
+                        f"{err['message'][:200]}"
+                    )
+                    continue
 
             record.update(
                 {
@@ -469,12 +698,16 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
                 }
             )
             row_records.append(record)
+            step_label = "queried (CI mode, no judge)" if ci_mode else "queried + judged"
             print(
-                f"  [{i + 1}/{len(golden_rows)}] queried + judged in {elapsed:.1f}s: "
+                f"  [{i + 1}/{len(golden_rows)}] {step_label} in {elapsed:.1f}s: "
                 f"{question[:70]!r}"
             )
 
-    print(f"\nJudge model served (from the API's own response): {served_model}")
+    if ci_mode:
+        print("\nJudge model served: n/a (CI mode, no judge call is made).")
+    else:
+        print(f"\nJudge model served (from the API's own response): {served_model}")
 
     errored_records = [r for r in row_records if r["errored"]]
     scored_records = [r for r in row_records if not r["errored"]]
@@ -487,35 +720,47 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
     # (in particular, on an empty answer -- see EmptyAnswerError above) must not make this check
     # either crash or silently "pass" by re-scoring nothing. Re-scoring an empty answer twice would
     # prove nothing about determinism; it only proves the judge is consistent on blank input.
+    #
+    # CI mode never calls the judge at all, so there is nothing to check determinism of here --
+    # StubLLM's own determinism is covered separately, by
+    # services/orchestrator/tests/test_stub_providers.py.
     first = second = None
-    determinism_row = next(
-        (r for r in row_records if not r["errored"] and r.get("answer", "").strip()),
-        None,
-    )
-    if determinism_row is not None:
-        check_label = f"row {determinism_row['index'] + 1}"
-        try:
-            first, second = judge_selfcheck(
-                judge_client,
-                settings.JUDGE_MODEL,
-                determinism_row["question"],
-                determinism_row["answer"],
-            )
-        except Exception as exc:  # noqa: BLE001 - reported, must not abort the run
-            print(f"\n--- Determinism check (judge_selfcheck on {check_label}) ---")
-            print(f"FAILED: {type(exc).__name__}: {exc}")
-        else:
-            print(f"\n--- Determinism check (judge_selfcheck on {check_label}) ---")
-            identical = first == second
-            print(f"comprehensibility run 1: {first}   run 2: {second}   identical: {identical}")
-            if first != second:
-                print(
-                    "WARNING: temperature=0 did not produce identical scores on the same input. "
-                    "Every downstream judge number in this run should be treated as noise."
-                )
-    else:
+    determinism_row = None
+    if ci_mode:
         print("\n--- Determinism check (judge_selfcheck) ---")
-        print("SKIPPED: no row produced a non-empty answer to check determinism against.")
+        print("SKIPPED (CI mode): no judge call is made in CI mode.")
+    else:
+        determinism_row = next(
+            (r for r in row_records if not r["errored"] and r.get("answer", "").strip()),
+            None,
+        )
+        if determinism_row is not None:
+            check_label = f"row {determinism_row['index'] + 1}"
+            try:
+                first, second = judge_selfcheck(
+                    judge_client,
+                    settings.JUDGE_MODEL,
+                    determinism_row["question"],
+                    determinism_row["answer"],
+                )
+            except Exception as exc:  # noqa: BLE001 - reported, must not abort the run
+                print(f"\n--- Determinism check (judge_selfcheck on {check_label}) ---")
+                print(f"FAILED: {type(exc).__name__}: {exc}")
+            else:
+                print(f"\n--- Determinism check (judge_selfcheck on {check_label}) ---")
+                identical = first == second
+                print(
+                    f"comprehensibility run 1: {first}   run 2: {second}   identical: {identical}"
+                )
+                if first != second:
+                    print(
+                        "WARNING: temperature=0 did not produce identical scores on the same "
+                        "input. Every downstream judge number in this run should be treated as "
+                        "noise."
+                    )
+        else:
+            print("\n--- Determinism check (judge_selfcheck) ---")
+            print("SKIPPED: no row produced a non-empty answer to check determinism against.")
 
     # --- RAGAS metrics: faithfulness, answer_relevancy, context_precision, one shared run. ---
     # Only over rows that scored successfully; a row that never got an answer has nothing for
@@ -523,9 +768,19 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
     # metrics itself (as opposed to one (row, metric) job exhausting its retry budget, which
     # run_ragas_metrics already isolates and reports in ragas_row_failures without raising) must
     # not crash the script before it writes results either.
+    #
+    # CI mode never runs RAGAS at all -- run_ragas_metrics is imported lazily, right here, so a CI
+    # run never imports ragas (see eval/metrics.py's module docstring and the top of this file).
     ragas_error: str | None = None
     ragas_row_failures: list[dict] = []
-    if scored_records:
+    if ci_mode:
+        print(
+            "\nSKIPPED (CI mode): faithfulness, answer_relevancy, context_precision need RAGAS "
+            "and the hosted judge; neither runs in CI mode."
+        )
+    elif scored_records:
+        from eval.metrics import run_ragas_metrics
+
         print("\nRunning RAGAS metrics (faithfulness, answer_relevancy, context_precision)...")
         ragas_rows = [
             {
@@ -574,25 +829,107 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
     # --- Aggregates (computed over scored_records only; every stat carries n and total) ---
     aggregate_stats, citation_detail = build_aggregate_stats(golden_rows, scored_records)
 
-    verdicts = {}
+    # --- Baselines (eval/baselines.json). CI mode must have one to gate against; a full run
+    # --- treats a missing/unreadable file as "no reference available" and keeps going, since the
+    # --- baseline comparison in full mode is informational only (THRESHOLDS alone gates it).
+    if ci_mode:
+        baselines_doc = load_baselines()
+    else:
+        try:
+            baselines_doc = load_baselines()
+        except Exception as exc:  # noqa: BLE001 - informational only in full mode, must not abort
+            print(f"\nNOTE: could not load {BASELINES_PATH} for the baseline comparison: {exc}")
+            baselines_doc = {}
+    ci_baseline_metrics = baselines_doc.get("ci_baseline", {}).get("metrics", {})
+
+    verdicts: dict[str, bool | None] = {}
+    baseline_verdicts: dict[str, bool | None] = {}
     overall_pass = True
-    for metric_name, spec in THRESHOLDS.items():
-        stat = aggregate_stats[metric_name]
-        value = stat["value"]
-        if not spec["gated"]:
+
+    # Refusal-classification bookkeeping (see CI_REFUSAL_BOOKKEEPING_GATE's comment): computed in
+    # both modes (cheap, and useful in a full run's results file too) but only gated in CI mode.
+    non_advice_scored_count = aggregate_stats["false_refusal_rate"]["n"]
+    advice_scored_count = aggregate_stats["advice_leakage_rate"]["n"]
+    unclassified_rows = sum(
+        1 for r in scored_records if r.get("refusal_classification") not in ("REFUSAL", "ANSWER")
+    )
+
+    if ci_mode:
+        # THRESHOLDS never gates in CI mode (see module docstring); every entry is reported as
+        # None here, and the printed table below shows CI's own gate/result columns instead.
+        for metric_name in THRESHOLDS:
             verdicts[metric_name] = None
-            continue
-        threshold = spec["value"]
-        if spec["op"] == ">=":
-            passed = value is not None and value >= threshold
-        elif spec["op"] == "<=":
-            passed = value is not None and value <= threshold
-        elif spec["op"] == "==":
-            passed = value is not None and value == threshold
-        else:
-            raise ValueError(f"Unknown operator for {metric_name}: {spec['op']}")
-        verdicts[metric_name] = passed
-        overall_pass = overall_pass and passed
+
+        # errored_rows / empty_answer_rows have no THRESHOLDS entry (they are structural
+        # invariants, not scored metrics) but are gated against the baseline the same way.
+        for count_name, current_value in (
+            ("errored_rows", errored_rows),
+            ("empty_answer_rows", empty_answer_rows),
+        ):
+            gate_spec = CI_BASELINE_GATE[count_name]
+            passed = compare_to_baseline(
+                current_value,
+                ci_baseline_metrics.get(count_name),
+                higher_is_better=gate_spec["higher_is_better"],
+                tolerance=gate_spec["tolerance"],
+            )
+            baseline_verdicts[count_name] = passed
+            overall_pass = overall_pass and bool(passed)
+
+        # Refusal-classification bookkeeping: gated in place of the rate values themselves (see
+        # CI_BASELINE_GATE's comment on why the rates are reported, not gated).
+        for check_name, current_value in (
+            ("non_advice_scored_count", non_advice_scored_count),
+            ("advice_scored_count", advice_scored_count),
+            ("unclassified_rows", unclassified_rows),
+        ):
+            gate_spec = CI_REFUSAL_BOOKKEEPING_GATE[check_name]
+            passed = compare_to_baseline(
+                current_value,
+                ci_baseline_metrics.get(check_name),
+                higher_is_better=gate_spec["higher_is_better"],
+                tolerance=gate_spec["tolerance"],
+            )
+            baseline_verdicts[check_name] = passed
+            overall_pass = overall_pass and bool(passed)
+
+        for metric_name in THRESHOLDS:
+            if metric_name in CI_SKIPPED_METRICS:
+                baseline_verdicts[metric_name] = None
+                continue
+            value = aggregate_stats[metric_name]["value"]
+            if metric_name in CI_BASELINE_GATE:
+                gate_spec = CI_BASELINE_GATE[metric_name]
+                passed = compare_to_baseline(
+                    value,
+                    ci_baseline_metrics.get(metric_name),
+                    higher_is_better=gate_spec["higher_is_better"],
+                    tolerance=gate_spec["tolerance"],
+                )
+                baseline_verdicts[metric_name] = passed
+                overall_pass = overall_pass and bool(passed)
+            else:
+                # CI_BASELINE_REPORTED, or CI_STUB_DERIVED_REPORTED_METRICS (false_refusal_rate /
+                # advice_leakage_rate): shown against the baseline for tracking, never gates.
+                baseline_verdicts[metric_name] = None
+    else:
+        for metric_name, spec in THRESHOLDS.items():
+            stat = aggregate_stats[metric_name]
+            value = stat["value"]
+            if not spec["gated"]:
+                verdicts[metric_name] = None
+                continue
+            threshold = spec["value"]
+            if spec["op"] == ">=":
+                passed = value is not None and value >= threshold
+            elif spec["op"] == "<=":
+                passed = value is not None and value <= threshold
+            elif spec["op"] == "==":
+                passed = value is not None and value == threshold
+            else:
+                raise ValueError(f"Unknown operator for {metric_name}: {spec['op']}")
+            verdicts[metric_name] = passed
+            overall_pass = overall_pass and passed
 
     incomplete = errored_rows > 0
     if incomplete:
@@ -603,24 +940,101 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
         f"\n--- Overall metrics (value(n_scored/total_rows)) --- scored {len(scored_records)}/"
         f"{len(golden_rows)} rows"
     )
-    print(
-        f"{'metric':<30}{'value':>10}  {'n/total':>9}  {'threshold':>12}  {'gate':>10}  "
-        f"{'result':>7}"
-    )
-    for metric_name, spec in THRESHOLDS.items():
-        stat = aggregate_stats[metric_name]
-        value = stat["value"]
-        n_total = f"{stat['n']}/{stat['total']}"
-        threshold_str = "n/a" if spec["value"] is None else f"{spec['op']} {spec['value']}"
-        gate_str = "GATED" if spec["gated"] else "REPORTED"
-        if not spec["gated"]:
-            result_str = "--"
-        else:
-            result_str = "PASS" if verdicts[metric_name] else "FAIL"
+    if ci_mode:
         print(
-            f"{metric_name:<30}{_fmt(value):>10}  {n_total:>9}  {threshold_str:>12}  "
-            f"{gate_str:>10}  {result_str:>7}"
+            f"{'metric':<30}{'value':>18}  {'n/total':>9}  {'baseline':>10}  "
+            f"{'gate':>18}  {'result':>17}"
         )
+
+        def _ci_result_str(passed: bool | None) -> str:
+            if passed is None:
+                return "MISSING BASELINE"
+            return "PASS" if passed else "FAIL"
+
+        for metric_name in THRESHOLDS:
+            stat = aggregate_stats[metric_name]
+            n_total = f"{stat['n']}/{stat['total']}"
+            if metric_name in CI_SKIPPED_METRICS:
+                print(
+                    f"{metric_name:<30}{'SKIPPED (CI mode)':>18}  {n_total:>9}  {'n/a':>10}  "
+                    f"{'SKIPPED (CI mode)':>18}  {'SKIPPED (CI mode)':>17}"
+                )
+                continue
+            value = stat["value"]
+            baseline_value = ci_baseline_metrics.get(metric_name)
+            if metric_name in CI_BASELINE_GATE:
+                gate_str = "GATED (baseline)"
+                result_str = _ci_result_str(baseline_verdicts[metric_name])
+            elif metric_name in CI_STUB_DERIVED_REPORTED_METRICS:
+                # Measures whether StubLLM's _STUB_ADVICE_PATTERNS agree with is_advice, not
+                # whether the real system refuses correctly -- see CI_BASELINE_GATE's comment.
+                gate_str = "REPORTED (stub-derived)"
+                result_str = "--"
+            else:
+                gate_str = "REPORTED"
+                result_str = "--"
+            print(
+                f"{metric_name:<30}{_fmt(value):>18}  {n_total:>9}  {_fmt(baseline_value):>10}  "
+                f"{gate_str:>18}  {result_str:>17}"
+            )
+        for count_name, current_value in (
+            ("errored_rows", errored_rows),
+            ("empty_answer_rows", empty_answer_rows),
+        ):
+            baseline_value = ci_baseline_metrics.get(count_name)
+            print(
+                f"{count_name:<30}{current_value:>18}  {'n/a':>9}  {_fmt(baseline_value):>10}  "
+                f"{'GATED (baseline)':>18}  {_ci_result_str(baseline_verdicts[count_name]):>17}"
+            )
+        print(
+            "\n--- Refusal-classification bookkeeping (gated in place of the rate values above; "
+            "see CI_BASELINE_GATE's comment) ---"
+        )
+        for check_name, current_value in (
+            ("non_advice_scored_count", non_advice_scored_count),
+            ("advice_scored_count", advice_scored_count),
+            ("unclassified_rows", unclassified_rows),
+        ):
+            baseline_value = ci_baseline_metrics.get(check_name)
+            print(
+                f"{check_name:<30}{current_value:>18}  {'n/a':>9}  {_fmt(baseline_value):>10}  "
+                f"{'GATED (baseline)':>18}  {_ci_result_str(baseline_verdicts[check_name]):>17}"
+            )
+    else:
+        print(
+            f"{'metric':<30}{'value':>10}  {'n/total':>9}  {'threshold':>12}  {'gate':>10}  "
+            f"{'result':>7}"
+        )
+        for metric_name, spec in THRESHOLDS.items():
+            stat = aggregate_stats[metric_name]
+            value = stat["value"]
+            n_total = f"{stat['n']}/{stat['total']}"
+            threshold_str = "n/a" if spec["value"] is None else f"{spec['op']} {spec['value']}"
+            gate_str = "GATED" if spec["gated"] else "REPORTED"
+            if not spec["gated"]:
+                result_str = "--"
+            else:
+                result_str = "PASS" if verdicts[metric_name] else "FAIL"
+            print(
+                f"{metric_name:<30}{_fmt(value):>10}  {n_total:>9}  {threshold_str:>12}  "
+                f"{gate_str:>10}  {result_str:>7}"
+            )
+
+        # --- Baseline comparison against the last full-run reference (informational only; a full
+        # --- run's exit code is decided by THRESHOLDS alone, unchanged from Phase 1). ---
+        full_reference = baselines_doc.get("full_run_reference", {})
+        full_reference_metrics = full_reference.get("metrics", {})
+        if full_reference_metrics:
+            print("\n--- Baseline comparison (informational only, never gates a full run) ---")
+            print(f"Reference: {full_reference.get('source', 'unknown')}")
+            print(f"{'metric':<30}{'value':>10}  {'reference':>10}  {'delta':>10}")
+            for metric_name, ref_value in full_reference_metrics.items():
+                value = aggregate_stats.get(metric_name, {}).get("value")
+                if value is None or ref_value is None:
+                    delta_str = "n/a"
+                else:
+                    delta_str = f"{value - ref_value:+.3f}"
+                print(f"{metric_name:<30}{_fmt(value):>10}  {_fmt(ref_value):>10}  {delta_str:>10}")
     print(
         f"\ncitation_hallucination detail: {citation_detail['rows_with_hallucination']}/"
         f"{len(scored_records)} scored rows had a hallucinated citation; "
@@ -716,15 +1130,20 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
     run_timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     results_path = RESULTS_DIR / f"{run_timestamp}.json"
     output = {
+        "mode": "ci" if ci_mode else "full",
+        "skipped_metrics": list(CI_SKIPPED_METRICS) if ci_mode else [],
         "run_at_utc": run_timestamp,
         "orchestrator_url": ORCHESTRATOR_URL,
-        "judge_model_requested": settings.JUDGE_MODEL,
+        "judge_model_requested": None if ci_mode else settings.JUDGE_MODEL,
         "judge_model_served": served_model,
         "thresholds": THRESHOLDS,
         "total_rows": len(golden_rows),
         "scored_rows": len(scored_records),
         "errored_rows": errored_rows,
         "empty_answer_rows": empty_answer_rows,
+        "non_advice_scored_count": non_advice_scored_count,
+        "advice_scored_count": advice_scored_count,
+        "unclassified_rows": unclassified_rows,
         "incomplete": incomplete,
         "rows": [
             {
@@ -756,6 +1175,7 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
         "ragas_error": ragas_error,
         "ragas_row_failures": ragas_row_failures,
         "verdicts": verdicts,
+        "baseline_verdicts": baseline_verdicts if ci_mode else {},
         "subset_breakdowns": {
             "volatility": {
                 "stable": subset_summary(row_records, "volatility", "stable"),

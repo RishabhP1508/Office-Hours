@@ -36,6 +36,7 @@ services:
       RETRIEVAL_TOP_K: "${RETRIEVAL_TOP_K:-5}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-lgtm:4318"
       OTEL_SERVICE_NAME: "office-hours-orchestrator"
+      INGEST_MODE: "${INGEST_MODE:-fetch}"
       CRAWL_DELAY_SECONDS: "${CRAWL_DELAY_SECONDS:-2.0}"
       USER_AGENT: "${USER_AGENT:-OfficeHoursBot/0.1 (+https://github.com/office-hours; contact: set-a-real-contact-here)}"
       JUDGE_PROVIDER: "${JUDGE_PROVIDER:-nvidia}"

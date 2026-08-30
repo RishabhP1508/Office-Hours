@@ -83,6 +83,7 @@ never commit it.
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | Where traces go and what service name they're tagged with. |
 | `GRAFANA_HOST_PORT` | Host port Grafana is published on, default 3000. Override it if something else on your machine already holds that port. |
 | `CRAWL_DELAY_SECONDS`, `USER_AGENT` | How politely `ingest.py` crawls the source pages. |
+| `INGEST_MODE` | `fetch` (default) reads the manifest and fetches live URLs. `snapshot` skips the network and chunks whatever `.md` snapshots are already in `RAW_SNAPSHOT_DIR` -- used only by the CI eval gate to ingest `eval/fixtures/sources/`. |
 
 ## How retrieval works right now
 
@@ -100,6 +101,31 @@ labels that contain them, and a couple of USCIS pages carry their only real sect
 h4 with no h2 at all. The chunker in `services/orchestrator/app/ingest.py` reads a heading with no
 body before the next heading as a group label rather than a content section, and assigns each
 chunk's parent from that label chain in document order, not from comparing heading level numbers.
+
+## CI eval gate
+
+`.github/workflows/eval.yml` defines two jobs. `ci-invariant-gate` runs on every pull request: it
+spins up a fresh Postgres, ingests the small fixture corpus at `eval/fixtures/sources/` with
+deterministic stub providers (`LLM_PROVIDER=stub`, `EMBED_PROVIDER=stub`, no network, no GPU, no
+API key), and runs `python -m eval.run --ci`. That checks retrieval, citation mapping, refusal
+bookkeeping, and error handling against `eval/baselines.json`'s recorded CI baseline. It does not
+measure answer quality, and the run says so in its own banner. `full-eval` runs only on
+`workflow_dispatch`, points at an orchestrator you already have running somewhere reachable, and
+uses `secrets.JUDGE_API_KEY` to run the real eval against the hosted judge and RAGAS. See
+`docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md` for why these are two separate gates
+rather than one, and `eval/README.md` for the full metric breakdown.
+
+Two things in this workflow are yours to do by hand; nothing in this repository does them for you:
+
+1. **Push `.github/workflows/eval.yml`.** A workflow file only starts running once it exists on
+   GitHub. Commit it and push like anything else in the repo.
+2. **Turn on branch protection for `main` and mark the check required.** In the repository's
+   Settings, under Branches, add a protection rule for `main` that requires the
+   `ci-invariant-gate` status check to pass before merging. Until you do this, the workflow runs and
+   reports a result, but nothing stops a pull request from merging on a red run.
+
+If `JUDGE_API_KEY` should ever be needed for the `full-eval` job, add it under Settings, Secrets and
+variables, Actions, as a repository secret. Never put it in a file that gets committed.
 
 ## Not legal advice
 
