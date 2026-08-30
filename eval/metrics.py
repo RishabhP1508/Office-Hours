@@ -7,14 +7,15 @@ against the real one; that uses the local Ollama nomic-embed-text model, not the
 introduces no self-preference bias and costs nothing.
 
 RAGAS parallelizes its own judge calls by default and, left unconstrained, comfortably exceeds the
-NVIDIA endpoint's ~40 requests/minute limit on its own. Every call RAGAS makes goes through the same
-ChatOpenAI instance, which is built here with `rate_limiter=eval.judge.SHARED_RATE_LIMITER` -- the
-identical rate limiter object eval/judge.py uses for its own two judged tasks -- so the whole eval
-run shares one throughput budget. `RAGAS_MAX_WORKERS = 1` on top of that means RAGAS never has more
-than one request in flight at a time: the shared limiter already caps the rate a new request can
-*start* at, but a strict start-time cap alone still lets two slow in-flight requests overlap when
-concurrency is above 1, and it is exactly that overlap that can look like a burst to the endpoint.
-One worker removes that possibility outright, at the cost of a slower (but still well within
+NVIDIA endpoint's ~40 requests/minute limit on its own. Every call RAGAS makes goes through the
+same ChatOpenAI instance, which is built here with
+`rate_limiter=eval.judge.get_shared_rate_limiter()` -- the identical rate limiter object
+eval/judge.py uses for its own two judged tasks -- so the whole eval run shares one throughput
+budget. `RAGAS_MAX_WORKERS = 1` on top of that means RAGAS never has more than one request in
+flight at a time: the shared limiter already caps the rate a new request can *start* at, but a
+strict start-time cap alone still lets two slow in-flight requests overlap when concurrency is
+above 1, and it is exactly that overlap that can look like a burst to the endpoint. One worker
+removes that possibility outright, at the cost of a slower (but still well within
 RAGAS_TIMEOUT_SECONDS) run.
 
 RunConfig also configures RAGAS's own retry-with-backoff (RunConfig.max_retries / max_wait, which
@@ -77,7 +78,7 @@ import textstat
 
 from app.config import Settings
 from app.providers.embeddings import OllamaEmbedder
-from eval.judge import RETRYABLE_JUDGE_ERRORS, SHARED_RATE_LIMITER, validate_judge_settings
+from eval.judge import RETRYABLE_JUDGE_ERRORS, get_shared_rate_limiter, validate_judge_settings
 
 # ragas, langchain-core, and langchain-openai are imported lazily, inside the functions that
 # actually run RAGAS (build_ragas_llm, build_ragas_embeddings, run_ragas_metrics), NOT at module
@@ -111,9 +112,9 @@ def _ragas_metrics_list() -> list:
     return [faithfulness, answer_relevancy, context_precision]
 
 
-# RAGAS concurrency. The outbound rate is already capped by SHARED_RATE_LIMITER regardless of this
-# number; max_workers=1 additionally guarantees at most one request in flight at a time, so a slow
-# response can never overlap with the next request the limiter allows to start (see module
+# RAGAS concurrency. The outbound rate is already capped by get_shared_rate_limiter() regardless of
+# this number; max_workers=1 additionally guarantees at most one request in flight at a time, so a
+# slow response can never overlap with the next request the limiter allows to start (see module
 # docstring for why that overlap -- not just the start-time rate -- is the thing that risked 429s).
 RAGAS_MAX_WORKERS = 1
 
@@ -164,7 +165,8 @@ def build_ragas_llm(settings: Settings) -> LangchainLLMWrapper:
     """The judge LLM RAGAS uses for faithfulness/answer_relevancy/context_precision.
 
     Same NVIDIA endpoint, same temperature=0 and thinking-disabled settings, and the same shared
-    rate limiter as eval/judge.py's two judged tasks (see module docstring).
+    rate limiter (eval.judge.get_shared_rate_limiter()) as eval/judge.py's two judged tasks (see
+    module docstring).
 
     `model_kwargs={"response_format": {"type": "json_object"}}` is added on top of that: every one
     of RAGAS's own prompts (faithfulness's statement/NLI prompts, answer_relevancy's question
@@ -190,7 +192,7 @@ def build_ragas_llm(settings: Settings) -> LangchainLLMWrapper:
         temperature=0,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         model_kwargs={"response_format": {"type": "json_object"}},
-        rate_limiter=SHARED_RATE_LIMITER,
+        rate_limiter=get_shared_rate_limiter(),
     )
     return LangchainLLMWrapper(chat)
 

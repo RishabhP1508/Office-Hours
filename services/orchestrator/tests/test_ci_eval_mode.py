@@ -143,15 +143,32 @@ def _find_repo_root(start: Path) -> Path:
     raise RuntimeError(f"could not find a directory containing eval/__init__.py above {start}")
 
 
-def test_importing_eval_run_never_imports_ragas():
-    """The whole point of eval/metrics.py's lazy imports (see its module docstring): CI mode's
-    dependency set (services/orchestrator/pyproject.toml's `eval-ci` extra) does not include ragas
-    at all, so merely importing eval.run must never require it. Run in a fresh subprocess, not the
-    current process, since some other already-imported module in this same pytest session could
-    have pulled ragas in first and mask a regression here.
+# Every package the eval-ci extra (services/orchestrator/pyproject.toml) deliberately does NOT
+# install. Merely importing eval.run -- what `python -m eval.run --ci` does before it ever branches
+# on ci_mode -- must never require any of these, even transitively through eval.judge or
+# eval.metrics (see both modules' lazy-import docstrings). ragas was the module actually named in
+# the traceback that broke the first real PR run; langchain_core is what actually broke it
+# (eval/judge.py imported InMemoryRateLimiter at module scope) while this test's earlier version
+# only probed for ragas and missed it -- langchain and langchain_openai are included too since
+# either one leaking would be the same class of bug.
+_FORBIDDEN_CI_MODULES = ("ragas", "langchain_core", "langchain", "langchain_openai")
+
+
+def test_importing_eval_run_never_imports_ragas_or_langchain():
+    """CI mode's dependency set (services/orchestrator/pyproject.toml's `eval-ci` extra) installs
+    only openai and textstat -- never ragas, langchain-core, langchain, or langchain-openai.
+    Merely importing eval.run must never require any of _FORBIDDEN_CI_MODULES, even transitively.
+    Run in a fresh subprocess, not the current process, since some other already-imported module in
+    this same pytest session could have pulled one of these in first and mask a regression here.
     """
     repo_root = _find_repo_root(Path(__file__).resolve())
-    probe = "import eval.run, sys; sys.exit(1 if 'ragas' in sys.modules else 0)"
+    probe = (
+        "import eval.run, sys\n"
+        f"forbidden = {_FORBIDDEN_CI_MODULES!r}\n"
+        "leaked = [m for m in forbidden if m in sys.modules]\n"
+        "print('LEAKED:' + ','.join(leaked))\n"
+        "sys.exit(1 if leaked else 0)\n"
+    )
     result = subprocess.run(
         [sys.executable, "-c", probe],
         cwd=repo_root,
@@ -159,6 +176,6 @@ def test_importing_eval_run_never_imports_ragas():
         text=True,
     )
     assert result.returncode == 0, (
-        f"importing eval.run pulled in ragas (or crashed): stdout={result.stdout!r} "
+        f"importing eval.run leaked a forbidden module: stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
     )

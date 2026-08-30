@@ -74,24 +74,21 @@ from pathlib import Path
 import httpx
 
 from app.config import get_settings
-from eval.judge import (
-    EmptyAnswerError,
-    classify_refusal,
-    get_judge_client,
-    judge_selfcheck,
-    score_comprehensibility,
-    validate_judge_settings,
-)
+from eval.judge import EmptyAnswerError
 from eval.metrics import reading_grade_level
 
-# eval.judge imports `openai` at module level (a small, always-installed dependency -- see
-# services/orchestrator/pyproject.toml's `eval-ci` extra) but never `ragas`/`langchain*`, and its
-# own module-level code (building SHARED_RATE_LIMITER) needs no judge secret, so importing it here
-# is safe in CI mode too. What CI mode actually must never do is CALL validate_judge_settings or
-# get_judge_client -- both would raise on the empty JUDGE_API_KEY a `pull_request` job legitimately
-# has -- so those two are only ever invoked below when `ci_mode` is False. `eval.metrics.
-# run_ragas_metrics` is imported lazily where it is used, further down, for the reason explained in
-# eval/metrics.py's own module docstring: importing it must never require ragas to be installed.
+# Only EmptyAnswerError is imported from eval.judge at module scope: it is a plain exception class
+# with no import-time cost, and both modes need it (an empty/whitespace-only answer is recorded as
+# an errored row in CI mode too -- see the per-row loop below). eval.judge itself imports only
+# `openai` at module level (small, always-installed -- see services/orchestrator/pyproject.toml's
+# `eval-ci` extra) and builds its shared rate limiter lazily (eval.judge.get_shared_rate_limiter()),
+# so merely importing eval.judge is safe in CI mode too -- but the rest of eval.judge's names
+# (validate_judge_settings, get_judge_client, score_comprehensibility, classify_refusal,
+# judge_selfcheck) are still imported lazily below, only on the full-mode path, as defence in depth:
+# CI mode must never even attempt to construct a judge client against the empty JUDGE_API_KEY a
+# `pull_request` job legitimately has. `eval.metrics.run_ragas_metrics` is imported lazily where it
+# is used, further down, for the reason explained in eval/metrics.py's own module docstring:
+# importing it must never require ragas to be installed.
 
 GOLDEN_PATH = Path(__file__).parent / "golden.jsonl"
 RESULTS_DIR = Path(__file__).parent / "results"
@@ -566,8 +563,19 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
         print("vs-aspirational-thresholds.md and eval/README.md.")
         print("=" * 78)
     else:
-        # Only a full run ever needs the hosted judge -- CI mode never calls either of these, so a
-        # `pull_request` job with no JUDGE_API_KEY secret never even reaches this line.
+        # Imported here, not at module scope, so CI mode never even imports these names, let alone
+        # calls them -- a `pull_request` job with no JUDGE_API_KEY secret never reaches this line.
+        # Python has function scope, not block scope, so classify_refusal/get_judge_client/
+        # judge_selfcheck/score_comprehensibility/validate_judge_settings remain bound for the rest
+        # of this function once this branch runs, exactly like every other name assigned here.
+        from eval.judge import (
+            classify_refusal,
+            get_judge_client,
+            judge_selfcheck,
+            score_comprehensibility,
+            validate_judge_settings,
+        )
+
         validate_judge_settings(settings)
 
     print("\n=== Office Hours eval run ===")
