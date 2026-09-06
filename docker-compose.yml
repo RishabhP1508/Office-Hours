@@ -49,6 +49,7 @@ services:
       JUDGE_MODEL: "${JUDGE_MODEL:-nvidia/nemotron-3.5-lightning-30b-a3b}"
       JUDGE_REQUESTS_PER_MINUTE: "${JUDGE_REQUESTS_PER_MINUTE:-20}"
       JUDGE_MAX_RETRIES: "${JUDGE_MAX_RETRIES:-12}"
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-http://localhost:3000}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

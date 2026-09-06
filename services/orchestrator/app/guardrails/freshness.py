@@ -37,10 +37,47 @@ questions.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from typing import Literal
 
 from app.db import RetrievedChunk
 from app.schemas import Freshness, FreshnessNotice, FreshnessSource
+
+
+def sources_freshness_state(
+    oldest_verified_at: datetime | None, now: datetime
+) -> tuple[Literal["current", "recent", "stale", "unknown"], float | None]:
+    """Phase 6: the header's "live sources" trust indicator (GET /sources/status). Pure -- no DB,
+    no clock of its own -- so the band decision lives here, testable in pytest, rather than in the
+    frontend: the frontend must only render what this function decides, never recompute a
+    freshness claim from raw dates on its own.
+
+    `oldest_verified_at` is the WEAKEST link: the minimum `last_verified_at` across every distinct
+    source in `documents` (app/main.py computes it as `min(per-source min(last_verified_at))`), not
+    the newest. A single freshly re-crawled source must never let the indicator claim "current"
+    while other sources sat unchecked for a week -- that is the whole reason this endpoint changed
+    from `max(last_verified_at)` to a per-source aggregation.
+
+    Bands, by age of that weakest link:
+        oldest_verified_at is None   -> ("unknown", None)   -- no rows in `documents` at all
+        age_hours <= 24               -> ("current", age_hours)
+        age_hours <= 168 (7 days)     -> ("recent",  age_hours)
+        otherwise                     -> ("stale",   age_hours)
+
+    A negative age_hours (oldest_verified_at in the future relative to `now` -- clock skew between
+    the app process and whatever wrote that timestamp, not a real staleness signal) falls into the
+    same `<= 24` branch as any other sub-24-hour value, so it reads as "current" with no special
+    case needed and no possibility of raising: there is nothing stale about a timestamp that, from
+    this process's point of view, has not happened yet.
+    """
+    if oldest_verified_at is None:
+        return "unknown", None
+    age_hours = (now - oldest_verified_at).total_seconds() / 3600
+    if age_hours <= 24:
+        return "current", age_hours
+    if age_hours <= 168:
+        return "recent", age_hours
+    return "stale", age_hours
 
 
 def _format_date(value: date) -> str:

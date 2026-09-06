@@ -134,3 +134,32 @@ class AnswerResponse(BaseModel):
     response_type: str
     refusal_reason: str | None = None
     freshness: Freshness | None = None
+
+
+class SourcesStatus(BaseModel):
+    """GET /sources/status (Phase 6): the header's "live sources" trust indicator reads this
+    directly, so every field is computed from a real query against `documents` -- see app/main.py
+    -- never a claim the frontend infers or hardcodes on its own.
+
+    `oldest_verified_at`/`newest_verified_at` are the min/max, ACROSS SOURCES, of each distinct
+    source's own oldest `last_verified_at` (a per-source `GROUP BY` first, then an aggregate over
+    those per-source values) -- not a plain `min`/`max` over every row in `documents`, which would
+    let one just-re-crawled row disguise a corpus where other sources went unchecked for a week.
+    `stale_source_count` is how many distinct sources have their own oldest chunk verified more
+    than 24 hours ago. `freshness_state` and `age_hours` are
+    app/guardrails/freshness.py::sources_freshness_state's verdict on `oldest_verified_at` -- the
+    ONLY place that band decision is computed; the frontend renders it, never recomputes it.
+
+    This field set replaces a single `last_verified_at` (a plain `max()` over every row), which let
+    one freshly verified source claim "checked today" while the rest of the corpus was stale; it
+    had exactly one consumer (the header), changed in the same pass, so there is no reason to keep
+    a field that could disagree with the new ones.
+    """
+
+    as_of: date
+    source_count: int
+    oldest_verified_at: datetime | None
+    newest_verified_at: datetime | None
+    stale_source_count: int
+    age_hours: float | None
+    freshness_state: Literal["current", "recent", "stale", "unknown"]

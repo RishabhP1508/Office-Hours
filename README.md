@@ -123,6 +123,7 @@ never commit it.
 | `GRAFANA_HOST_PORT` | Host port Grafana is published on, default 3000. Override it if something else on your machine already holds that port. |
 | `CRAWL_DELAY_SECONDS`, `USER_AGENT` | How politely `ingest.py` crawls the source pages. |
 | `INGEST_MODE` | `fetch` (default) reads the manifest and fetches live URLs. `snapshot` skips the network and chunks whatever `.md` snapshots are already in `RAW_SNAPSHOT_DIR` -- used only by the CI eval gate to ingest `eval/fixtures/sources/`. |
+| `ALLOWED_ORIGINS` | Comma-separated origins the orchestrator answers CORS preflight for. The Next.js frontend (`services/frontend`) calls the orchestrator directly until the Phase 7 gateway sits in front of it. |
 
 ## How retrieval works right now
 

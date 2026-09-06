@@ -174,6 +174,12 @@ class Settings(BaseSettings):
     REFRESH_MAX_FETCH_ATTEMPTS: int = 3
     REFRESH_RETRY_BACKOFF_SECONDS: float = 2.0
 
+    # CORS (Phase 6). The Next.js frontend (services/frontend) calls the orchestrator directly from
+    # the browser -- the same path the Phase 7 Go gateway will later sit in front of -- so the
+    # orchestrator has to answer the browser's preflight itself until then. Comma-separated list of
+    # allowed origins; the default covers the frontend's local dev server only.
+    ALLOWED_ORIGINS: str = "http://localhost:3000"
+
 
 @lru_cache
 def get_settings() -> Settings:

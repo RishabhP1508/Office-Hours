@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --espresso: #241b12;
+  --espresso-2: #30251a;
+  --ink: #241c13;
+  --body: #4a3e33;
+  --paper: #ffffff;
+  --page: #efece6;
+  --rule: #e2ddd5;
+  --saffron: #d98324;
+  --saffron-lit: #e8a33d;
+  --link: #9a5312;
+  --sand: #f8f2e8;
+  --muted: #7a6e62;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+}
+
+body {
+  background: var(--page);
+  color: var(--ink);
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--link);
+}
+
+/* A single, visible 2px saffron focus ring on every keyboard-reachable element -- never a browser
+   default outline, never suppressed. */
+:focus-visible {
+  outline: 2px solid var(--saffron);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+main {
+  flex: 1;
+}
+
+/* Form numbers and status codes must never wrap mid-token (see lib/nonbreaking.ts); this is the
+   belt-and-braces CSS equivalent for any span the helper wraps instead of substituting a
+   non-breaking hyphen character into. */
+.nb {
+  white-space: nowrap;
+}
