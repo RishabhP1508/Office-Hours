@@ -1,0 +1,1586 @@
+"""Phase 5 freshness tests: the pure diff/classify functions, the DB bookkeeping helpers, the
+freshness-in-answers guardrail, and (where the `[freshness]` extra is installed) the LangGraph
+refresh graph itself.
+
+Pure-function and freshness-guardrail tests below run with NO langgraph installed at all -- they
+import only app.recrawl's pure functions and app.guardrails.freshness, neither of which imports
+langgraph at module scope (see app/recrawl.py's own module docstring). Graph tests are marked
+`requires_langgraph` (skipped where the extra is not installed) and `@pytest.mark.freshness`.
+
+DB-backed tests use DATABASE_URL from the environment, the same convention
+tests/test_guardrails.py and tests/test_hybrid_retrieval.py use: point it at a scratch database
+(`officehours_freshness` or `officehours_fixtures`), never at the live 221-chunk `officehours`
+corpus. Every DB-writing test here (anything using the `conn` fixture: touch_last_verified/
+reindex_source directly, and every `requires_langgraph` graph test) inserts/deletes rows under a
+`source_url` unique to that test and cleans up after itself -- and, before doing either, the `conn`
+fixture itself refuses loudly to run at all if DATABASE_URL points at a database that already holds
+a row for every URL in data/sources/sources.yaml (see
+`_refuse_if_target_is_the_fully_ingested_real_corpus` below), since that is the signature of the
+real, fully-ingested corpus. Read-only tests (the `pool` fixture; everything in
+test_hybrid_retrieval.py) are not subject to that guard and may use `officehours_fixtures`'s
+already-ingested rows, or the live corpus, read-only.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from datetime import UTC, date, datetime
+from pathlib import Path
+
+import httpx
+import psycopg
+import pytest
+import yaml
+from pgvector import Vector
+from pgvector.psycopg import register_vector_async
+from psycopg.rows import dict_row
+
+from app.config import Settings, get_settings
+from app.db import RetrievedChunk, hybrid_search, make_pool
+from app.guardrails.freshness import build_freshness, freshness_notice_text
+from app.ingest import (
+    FetchedPage,
+    load_snapshot,
+    mint_snapshot_filename,
+    render_snapshot,
+)
+from app.pipeline import answer_question
+from app.providers.embeddings import OllamaEmbedder, StubEmbedder
+from app.providers.llm import LLM, StubLLM
+from app.recrawl import (
+    RefreshReport,
+    SourceResult,
+    _short_source_label,
+    classify_change,
+    make_conn_factory,
+    normalize_for_diff,
+    reindex_source,
+    run_refresh,
+    touch_last_verified,
+)
+from app.schemas import ResponseType
+
+
+def _has_langgraph_checkpoint_sqlite() -> bool:
+    """Whether `langgraph.checkpoint.sqlite.aio` -- the module `run_refresh` actually imports,
+    inside `_drive` -- is importable. Deliberately NOT `find_spec("langgraph") is None`: bare
+    `langgraph` is ALREADY installed in the image that serves /query, because the `eval` extra
+    pins `langchain==1.3.18`, and langchain 1.3.18 itself requires `langgraph<1.3.0,>=1.2.11` as
+    one of its own dependencies (`pip show langchain` inside that image lists it). So
+    `find_spec("langgraph") is None` is False there, and a skipif guarded on that alone would let
+    these tests run against an image that has langgraph but not the separate
+    `langgraph-checkpoint-sqlite` package the `[freshness]` extra adds on top -- and die with
+    `ModuleNotFoundError: No module named 'langgraph.checkpoint.sqlite'` instead of skipping.
+    Do NOT "simplify" this back to `find_spec("langgraph")`; that is the bug this predicate fixes.
+    """
+    try:
+        return importlib.util.find_spec("langgraph.checkpoint.sqlite.aio") is not None
+    except ModuleNotFoundError:
+        # find_spec on a dotted name imports its parent packages first to resolve `__path__`; if
+        # `langgraph` itself isn't installed at all (a plain dev/CI environment with neither the
+        # `eval` nor the `[freshness]` extra), that raises instead of returning None.
+        return False
+
+
+requires_langgraph = pytest.mark.skipif(
+    not _has_langgraph_checkpoint_sqlite(), reason="needs the [freshness] extra"
+)
+
+
+# =================================================================================================
+# PURE: normalize_for_diff / classify_change (no langgraph, no DB)
+# =================================================================================================
+
+
+def test_classify_change_unchanged_for_whitespace_and_last_updated_line_diff():
+    old_body = "# Heading\n\nSome content here.\n\nLast updated: August 27, 2026\n"
+    new_body = "# Heading\n\n  Some   content   here.  \n\nLast updated: September 1, 2026\n"
+
+    verdict = classify_change(old_body, new_body)
+
+    assert verdict.status == "unchanged"
+    assert verdict.reason == "identical_after_normalization"
+    assert verdict.added == []
+    assert verdict.removed == []
+    assert verdict.highlights == []
+
+
+def test_classify_change_reordered_body_is_cosmetic():
+    old_body = "# Heading\n\n## Section\n\nThe extension is 24 months.\n"
+    new_body = "# Heading\n\nThe extension is 24 months.\n\n## Section\n"
+
+    verdict = classify_change(old_body, new_body)
+
+    assert verdict.status == "cosmetic"
+    assert verdict.reason == "reordered_only"
+
+
+def test_classify_change_link_line_reformatting_is_cosmetic():
+    """ "An added navigation link line" is read here as: a line that already references another
+    page gets reformatted with markdown link syntax and different punctuation/case, with no actual
+    words changing -- classify_change's step 4 (aggressive normalization) is what makes this
+    cosmetic rather than meaningful. A genuinely NEW line that survives normalize_for_diff's
+    boilerplate filter (i.e. is not dropped outright) can never classify cosmetic under step 4
+    unless something else in the diff was removed to match it: that is the deliberate "any real
+    add/removal of a non-boilerplate line is meaningful" bias classify_change's own docstring
+    states, and this test does not weaken it -- it exercises the one case where a line involving a
+    link genuinely is cosmetic: reformatting, not addition.
+    """
+    # The link target is deliberately empty (`()`) so this isolates exactly the case/punctuation
+    # difference the aggressive-normalization step is designed to catch. A real new URL's own
+    # characters would be a genuine content addition, correctly classified meaningful instead.
+    old_body = "# Heading\n\n" "- Federal Register notice containing the final rule.\n"
+    new_body = "# Heading\n\n" "- [FEDERAL REGISTER NOTICE]() containing the final rule!\n"
+
+    verdict = classify_change(old_body, new_body)
+
+    assert verdict.status == "cosmetic"
+    assert verdict.reason == "formatting_only"
+
+
+def test_classify_change_added_navigation_link_line_is_unchanged():
+    """The real "added navigation link line" case the module docstring's `_is_boilerplate_line`
+    exists for: a genuinely NEW line that is only a markdown link (a bare "read more" / "skip to
+    section" style link, nothing else on the line) never reaches classify_change's comparison at
+    all -- normalize_for_diff drops it as boilerplate on the new side before either side is
+    diffed. classify_change is the function `_after_diff` actually routes on, so this is asserted
+    directly against it (not only against normalize_for_diff's own line-list output, which
+    test_normalize_for_diff_drops_boilerplate_and_collapses_whitespace below already covers).
+    """
+    old_body = "# Heading\n\nSome content here.\n"
+    new_body = "# Heading\n\nSome content here.\n\n[Read more](https://example.gov/more)\n"
+
+    verdict = classify_change(old_body, new_body)
+
+    assert verdict.status == "unchanged"
+    assert verdict.reason == "identical_after_normalization"
+
+
+@pytest.mark.full_corpus
+def test_classify_change_meaningful_for_a_real_rule_edit_with_changed_number_in_highlights():
+    """Uses the real Phase 5 snapshot (full_corpus-marked: this exact file is not part of the
+    small CI fixture corpus, the same reason test_chunking.py's real-corpus-only assertions are
+    marked full_corpus).
+    """
+    snapshot_path = (
+        Path(get_settings().RAW_SNAPSHOT_DIR)
+        / "fixed_admission-studyinthestates-final-rule-quick-facts.md"
+    )
+    _, old_body = load_snapshot(snapshot_path)
+    assert "30-day period for departure" in old_body, "fixture assumption changed; update this test"
+    new_body = old_body.replace("30-day period for departure", "45-day period for departure")
+
+    verdict = classify_change(old_body, new_body)
+
+    assert verdict.status == "meaningful"
+    assert verdict.reason == "content_lines_changed"
+    assert "45-day" in verdict.highlights
+
+
+def test_classify_change_highlights_never_influence_the_verdict():
+    """A real word-for-word content change with nothing highlight-worthy (no number+unit, dollar
+    amount, date, form number, or rule-shaped keyword) still classifies meaningful -- `highlights`
+    is explanatory only, per ChangeVerdict's own docstring.
+    """
+    old_body = "# Heading\n\nThe cat sat on the mat.\n"
+    new_body = "# Heading\n\nThe dog sat on the mat.\n"
+
+    verdict = classify_change(old_body, new_body)
+
+    assert verdict.status == "meaningful"
+    assert verdict.highlights == []
+
+
+def test_normalize_for_diff_drops_boilerplate_and_collapses_whitespace():
+    body = (
+        "\n\n[Skip to main content](#main)\n\n"
+        "# Heading\n\n"
+        "Some    content   here.\n\n"
+        "Last Reviewed/Updated: 08/27/2026\n\n"
+        "---\n\n"
+        "Return to top\n"
+        "Print\n"
+        "Share\n"
+    )
+    assert normalize_for_diff(body) == ["# Heading", "Some content here."]
+
+
+def test_importing_app_recrawl_never_imports_langgraph():
+    """Fresh subprocess: merely importing app.recrawl must never pull in langgraph OR langchain
+    (any module whose top-level name starts with either), even if some other already-imported
+    module in this pytest session happened to import one first (as test_ci_eval_mode.py's own
+    equivalent guard notes for eval.run/ragas). app.recrawl imports only app.config, app.db,
+    app.ingest, and stdlib -- asserting the whole class (not just the bare `langgraph` name) is
+    what catches a langchain-core leak arriving by some other route. Uses the exact same predicate
+    source as test_ci_eval_mode.py's serving-path guard
+    (conftest.LANGGRAPH_OR_LANGCHAIN_PREDICATE_SRC) so the two guards cannot drift apart.
+    """
+    from conftest import LANGGRAPH_OR_LANGCHAIN_PREDICATE_SRC
+
+    probe = (
+        "import app.recrawl, sys\n"
+        f"leaked = sorted(m for m in sys.modules if {LANGGRAPH_OR_LANGCHAIN_PREDICATE_SRC})\n"
+        "print('LEAKED:' + ','.join(leaked))\n"
+        "sys.exit(1 if leaked else 0)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert result.returncode == 0, (
+        f"importing app.recrawl leaked langgraph/langchain: stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+
+
+# =================================================================================================
+# PURE: RefreshReport / SourceResult -- the report's own plumbing (no langgraph, no DB)
+# =================================================================================================
+
+
+def _make_source_result(**overrides) -> SourceResult:
+    defaults = dict(
+        source_url="https://example.gov/report-test",
+        status="meaningful",
+        reason="content_lines_changed",
+        resumed=False,
+        fetched_this_run=True,
+        chunks_indexed=3,
+        attempts=1,
+        node_trail=["fetch", "diff", "chunk", "embed", "reindex"],
+    )
+    defaults.update(overrides)
+    return SourceResult(**defaults)
+
+
+def test_refresh_report_to_dict_carries_sample_lines_and_fetch_failed_serializes_safely():
+    """Drives RefreshReport/SourceResult directly (not through the graph) -- this section tests the
+    report's own plumbing, which R2's graph test below already proves is fed real verdict evidence.
+    """
+    changed = _make_source_result(
+        source_url="https://example.gov/report-test-changed",
+        added=["The extension period was updated to a longer duration."],
+        removed=["The extension period was previously a shorter duration."],
+        added_count=1,
+        removed_count=1,
+        highlights=["45-day"],
+    )
+    failed = _make_source_result(
+        source_url="https://example.gov/report-test-failed",
+        status="fetch_failed",
+        reason="max_attempts_exceeded",
+        fetched_this_run=False,
+        chunks_indexed=0,
+        attempts=3,
+        node_trail=["fetch", "fetch", "fetch", "record_failure"],
+        # no verdict at all for a fetch_failed source -- added/removed/highlights stay at their
+        # dataclass defaults, exactly as _verdict_evidence(None) produces.
+    )
+    report = RefreshReport(run_id="test-report", results=[changed, failed], http_fetches_this_run=2)
+
+    payload = report.to_dict()
+    by_url = {r["source_url"]: r for r in payload["results"]}
+
+    changed_payload = by_url[changed.source_url]
+    assert changed_payload["added"] == ["The extension period was updated to a longer duration."]
+    assert changed_payload["removed"] == ["The extension period was previously a shorter duration."]
+    assert changed_payload["added_count"] == 1
+    assert changed_payload["removed_count"] == 1
+    assert changed_payload["highlights"] == ["45-day"]
+
+    failed_payload = by_url[failed.source_url]
+    assert failed_payload["added"] == []
+    assert failed_payload["removed"] == []
+    assert failed_payload["added_count"] == 0
+    assert failed_payload["removed_count"] == 0
+    assert failed_payload["highlights"] == []
+
+    # This IS the artifact the scheduled job uploads -- it must actually serialize, including the
+    # fetch_failed row with no verdict at all.
+    serialized = json.dumps(payload)
+    assert "The extension period was updated to a longer duration." in serialized
+    assert "max_attempts_exceeded" in serialized
+
+    # render_table must not crash on the fetch_failed source either. It DOES show the highlight
+    # token (that's the "at a glance" summary the table is for), but never the full sample lines --
+    # that is what --json is for.
+    table = report.render_table()
+    assert "45-day" in table
+    assert "The extension period was updated to a longer duration." not in table
+    assert "The extension period was previously a shorter duration." not in table
+    assert "content_lines_changed" in table
+    assert "max_attempts_exceeded" in table
+
+
+def test_render_table_shows_counts_and_highlights_for_changed_sources_only():
+    changed = _make_source_result(
+        source_url="https://example.gov/report-test-meaningful",
+        added_count=1,
+        removed_count=1,
+        highlights=["45-day"],
+    )
+    unchanged = _make_source_result(
+        source_url="https://example.gov/report-test-unchanged",
+        status="unchanged",
+        reason="identical_after_normalization",
+        resumed=True,
+        fetched_this_run=False,
+        chunks_indexed=0,
+        node_trail=["fetch", "diff", "verify_only"],
+    )
+    report = RefreshReport(
+        run_id="test-report", results=[changed, unchanged], http_fetches_this_run=2
+    )
+
+    table = report.render_table()
+    lines = table.split("\n")
+    changed_line = next(line for line in lines if "report-test-meaningful" in line)
+    unchanged_line = next(line for line in lines if "report-test-unchanged" in line)
+
+    assert "+1/-1" in changed_line
+    assert "45-day" in changed_line
+    # unchanged never shows a +added/-removed count or highlights, even though the dataclass
+    # default (0/0/[]) would render as "+0/-0" if this guard were missing.
+    assert "+0/-0" not in unchanged_line
+    assert "45-day" not in unchanged_line
+
+
+def test_render_table_status_column_lines_up_for_the_longest_manifest_url():
+    """Column alignment is pure string formatting on whatever `source_url`s a `SourceResult`
+    carries -- it does not need the real manifest, and reading it through
+    `Settings.SOURCES_MANIFEST_PATH` only works inside the orchestrator's Docker image (the
+    default is `/app/data/sources/sources.yaml`), which does not exist on a CI runner. That is
+    also why this is the one test in this file that is NOT marked `full_corpus`: unlike
+    test_chunking.py's real-corpus assertions, this behavior is exercisable, and should be
+    checked, without the real 14-source corpus.
+
+    `longest_url` below is built at least as long as the actual longest manifest entry (the
+    fixed-admission FAQ URL, ~145 characters) so this stays a real stress case for
+    `render_table`'s column sizing rather than a stand-in shorter than what it actually has to
+    handle.
+    """
+    longest_url = (
+        "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission"
+        "-and-an-extension-of-stay-procedure-faq-for-testing-column-alignment-with-a-very-long-url"
+    )
+    shortest_url = "https://example.gov/faq"
+    assert len(longest_url) >= 145
+    assert longest_url != shortest_url
+
+    long_row = _make_source_result(
+        source_url=longest_url,
+        added=["some new line"],
+        removed=["some old line"],
+        added_count=1,
+        removed_count=1,
+        highlights=["45-day"],
+    )
+    short_row = _make_source_result(
+        source_url=shortest_url,
+        status="unchanged",
+        reason="identical_after_normalization",
+        resumed=True,
+        fetched_this_run=False,
+        chunks_indexed=0,
+        node_trail=["fetch", "diff", "verify_only"],
+    )
+    report = RefreshReport(
+        run_id="test-report", results=[long_row, short_row], http_fetches_this_run=2
+    )
+
+    table = report.render_table()
+
+    source_width = max(
+        len("source"), len(_short_source_label(longest_url)), len(_short_source_label(shortest_url))
+    )
+    expected_status_col = source_width + 1
+
+    lines = table.split("\n")
+    long_line = next(line for line in lines if _short_source_label(longest_url) in line)
+    short_line = next(line for line in lines if _short_source_label(shortest_url) in line)
+
+    assert long_line[expected_status_col:].split()[0] == "meaningful"
+    assert short_line[expected_status_col:].split()[0] == "unchanged"
+
+    # Sample lines never appear in the table, no matter how the columns are sized.
+    assert "some new line" not in table
+    assert "some old line" not in table
+    assert "Counts:" in table
+    assert "HTTP fetches this run: 2" in table
+
+
+# =================================================================================================
+# DB-BACKED: touch_last_verified / reindex_source (no langgraph needed)
+# =================================================================================================
+
+
+def _find_repo_root_containing_manifest(start: Path) -> Path | None:
+    """Search upward from `start` for the directory holding data/sources/sources.yaml -- the same
+    upward-search shape conftest.py already uses to locate the top-level `eval` package. Needed
+    here because Settings.SOURCES_MANIFEST_PATH defaults to a container path
+    (/app/data/sources/sources.yaml) that does not exist outside the orchestrator's own Docker
+    image, and these tests must be able to find the real manifest when run directly on a dev
+    machine.
+    """
+    for candidate in (start, *start.parents):
+        if (candidate / "data" / "sources" / "sources.yaml").is_file():
+            return candidate
+    return None
+
+
+def _manifest_urls() -> set[str]:
+    root = _find_repo_root_containing_manifest(Path(__file__).resolve())
+    assert (
+        root is not None
+    ), "could not locate data/sources/sources.yaml by searching upward from this test file"
+    manifest = yaml.safe_load(
+        (root / "data" / "sources" / "sources.yaml").read_text(encoding="utf-8")
+    )
+    return {entry["url"] for entry in manifest["sources"]}
+
+
+async def _refuse_if_target_is_the_fully_ingested_real_corpus(
+    conn: psycopg.AsyncConnection, database_url: str
+) -> None:
+    """The guard every DB-WRITING test in this file runs (via the `conn` fixture below) before it
+    ever inserts, updates, or deletes a row. Refuses loudly -- never a silent skip -- if
+    `database_url` already holds a row for every one of the 14 URLs in data/sources/sources.yaml:
+    that is the signature of the real, fully-ingested corpus (216/221 chunks as of this writing),
+    which is exactly the database these tests must never write to (see
+    test_touch_last_verified_moves_last_verified_and_leaves_everything_else and
+    test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_updated below, plus the
+    `requires_langgraph` graph tests further down, which all write through this same `conn`
+    fixture or through a conn_factory pointed at the same `database_url`).
+
+    Keyed on "every manifest URL present as a source_url", never on a row count: a row count
+    threshold would either fire on CI's small ingested fixture corpus (eval/fixtures/sources, 4 of
+    the 14 manifest URLs -- which these write tests run against in CI and must NOT be blocked from)
+    or fail to fire on a partially-ingested real corpus. Read-only tests (the `pool` fixture below,
+    and everything in test_hybrid_retrieval.py) never call this at all.
+    """
+    # psycopg's default autocommit=False means a bare execute() here would otherwise leave `conn`
+    # sitting in an open, uncommitted transaction for the rest of the test -- the guard is the
+    # FIRST thing the `conn` fixture does, before the test body's own transaction (e.g.
+    # _insert_test_row's `async with conn.transaction():`), so an uncommitted guard transaction
+    # would make every write a SAVEPOINT nested inside it rather than its own top-level transaction.
+    # That does not merely look wrong: a `requires_langgraph` graph test writes the SAME row again
+    # from a SECOND, separate connection (run_refresh's own conn_factory), and Postgres must then
+    # block that second connection on a row lock until this fixture's still-open transaction ends --
+    # a real deadlock/stale-read hazard, reproduced while writing this guard. rollback() (not
+    # commit(): this is a read-only check with nothing to persist) ends the transaction cleanly,
+    # leaving `conn` exactly as unencumbered as it was before this guard existed.
+    manifest_urls = _manifest_urls()
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT DISTINCT source_url FROM documents")
+        rows = await cur.fetchall()
+    await conn.rollback()
+    present_urls = {row[0] for row in rows}
+    if manifest_urls and manifest_urls <= present_urls:
+        pytest.fail(
+            f"Refusing to run a DB-writing test against DATABASE_URL={database_url!r}: it already "
+            f"holds a row for every one of the {len(manifest_urls)} URLs in "
+            "data/sources/sources.yaml, which is the signature of the real, fully-ingested corpus. "
+            "This test inserts/deletes rows in `documents`. Point DATABASE_URL at a scratch "
+            "database instead (for example officehours_fixtures or officehours_freshness) and "
+            "re-run."
+        )
+
+
+@pytest.fixture
+def database_url() -> str:
+    return os.environ.get("DATABASE_URL", get_settings().DATABASE_URL)
+
+
+@pytest.fixture
+async def conn(database_url):
+    connection = await psycopg.AsyncConnection.connect(database_url)
+    await register_vector_async(connection)
+    try:
+        await _refuse_if_target_is_the_fully_ingested_real_corpus(connection, database_url)
+        yield connection
+    finally:
+        await connection.close()
+
+
+async def _insert_test_row(
+    conn: psycopg.AsyncConnection,
+    source_url: str,
+    *,
+    fetched_at: datetime,
+    page_last_updated: date | None = None,
+    heading: str = "Old Heading",
+    content: str = "old content",
+) -> int:
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM documents WHERE source_url = %s", (source_url,))
+            await cur.execute(
+                """
+                INSERT INTO documents
+                    (content, source_url, resolved_url, section_heading, heading_level,
+                     page_last_updated, rule_effective_date, fetched_at, last_verified_at,
+                     embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    content,
+                    source_url,
+                    None,
+                    heading,
+                    2,
+                    page_last_updated,
+                    None,
+                    fetched_at,
+                    fetched_at,
+                    Vector([0.0] * 768),
+                ),
+            )
+            row = await cur.fetchone()
+            return row[0]
+
+
+async def _delete_test_rows(conn: psycopg.AsyncConnection, *source_urls: str) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute("DELETE FROM documents WHERE source_url = ANY(%s)", (list(source_urls),))
+    await conn.commit()
+
+
+async def test_touch_last_verified_moves_last_verified_and_leaves_everything_else(conn):
+    source_url = "https://example.gov/freshness-test-touch-last-verified"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    old_page_last_updated = date(2026, 1, 1)
+
+    row_id = await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=old_page_last_updated
+    )
+
+    new_now = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
+    new_rule_effective_date = date(2026, 9, 15)
+    rowcount = await touch_last_verified(
+        conn, source_url, now=new_now, rule_effective_date=new_rule_effective_date
+    )
+    assert rowcount == 1
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, content, fetched_at, last_verified_at, page_last_updated, "
+            "rule_effective_date FROM documents WHERE source_url = %s",
+            (source_url,),
+        )
+        row = await cur.fetchone()
+
+    assert row["id"] == row_id
+    assert row["content"] == "old content"
+    assert row["fetched_at"] == old_time
+    assert row["page_last_updated"] == old_page_last_updated
+    assert row["last_verified_at"] == new_now
+    assert row["rule_effective_date"] == new_rule_effective_date
+
+    await _delete_test_rows(conn, source_url)
+
+
+async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_updated(conn):
+    source_url = "https://example.gov/freshness-test-reindex"
+    other_source_url = "https://example.gov/freshness-test-reindex-other"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    old_page_last_updated = date(2026, 1, 1)
+
+    old_row_id = await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=old_page_last_updated
+    )
+    other_row_id = await _insert_test_row(
+        conn,
+        other_source_url,
+        fetched_at=old_time,
+        page_last_updated=old_page_last_updated,
+        heading="Other Heading",
+    )
+
+    embedder = StubEmbedder(dim=768)
+    new_now = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
+    new_page_last_updated = date(2026, 9, 1)
+    new_rule_effective_date = date(2026, 9, 15)
+    chunks = [
+        {
+            "heading": "New Heading",
+            "level": 2,
+            "parent": None,
+            "breadcrumb": "New Heading",
+            "text": "New Heading\n\nSome new content.",
+        }
+    ]
+
+    count = await reindex_source(
+        conn,
+        embedder,
+        source_url=source_url,
+        resolved_url=None,
+        page_last_updated=new_page_last_updated,
+        rule_effective_date=new_rule_effective_date,
+        chunks=chunks,
+        now=new_now,
+    )
+    assert count == 1
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, section_heading, fetched_at, last_verified_at, page_last_updated, "
+            "rule_effective_date FROM documents WHERE source_url = %s",
+            (source_url,),
+        )
+        rows = await cur.fetchall()
+
+    assert len(rows) == 1
+    new_row = rows[0]
+    assert new_row["id"] != old_row_id
+    assert new_row["section_heading"] == "New Heading"
+    assert new_row["fetched_at"] == new_now
+    assert new_row["last_verified_at"] == new_now
+    assert new_row["page_last_updated"] == new_page_last_updated
+    assert new_row["rule_effective_date"] == new_rule_effective_date
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, fetched_at FROM documents WHERE source_url = %s", (other_source_url,)
+        )
+        other_row = await cur.fetchone()
+    assert other_row["id"] == other_row_id
+    assert other_row["fetched_at"] == old_time
+
+    await _delete_test_rows(conn, source_url, other_source_url)
+
+
+# =================================================================================================
+# FRESHNESS GUARDRAIL: app/guardrails/freshness.py (no langgraph, no DB)
+# =================================================================================================
+
+
+def _make_chunk(**overrides) -> RetrievedChunk:
+    defaults = dict(
+        id=1,
+        content="chunk text",
+        source_url="https://example.gov/a",
+        resolved_url=None,
+        section_heading="Heading",
+        heading_level=2,
+        page_last_updated=None,
+        rule_effective_date=None,
+        fetched_at=datetime(2026, 8, 1, tzinfo=UTC),
+        last_verified_at=datetime(2026, 8, 1, tzinfo=UTC),
+        distance=0.1,
+        rrf_score=0.5,
+        semantic_rank=1,
+        keyword_rank=None,
+    )
+    defaults.update(overrides)
+    return RetrievedChunk(**defaults)
+
+
+def test_build_freshness_top_ranked_uncited_dated_source_produces_a_notice_with_link():
+    """The single retrieved chunk sits at position 1 (`chunks[0]`) -- condition (a), "top_ranked"
+    -- with an EMPTY `cited_indices`, so this is a top-ranked-but-uncited case, not a cited one.
+    """
+    chunk = _make_chunk(
+        source_url="https://studyinthestates.dhs.gov/quick-facts",
+        rule_effective_date=date(2026, 9, 15),
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 5), cited_indices=set())
+
+    assert len(freshness.notices) == 1
+    notice = freshness.notices[0]
+    assert notice.source_url == "https://studyinthestates.dhs.gov/quick-facts"
+    assert notice.rule_effective_date == date(2026, 9, 15)
+    assert notice.in_effect is False
+    assert notice.reason == "top_ranked"
+
+    text = freshness_notice_text(freshness.notices)
+    assert text is not None
+    assert "September 15, 2026" in text
+    assert "https://studyinthestates.dhs.gov/quick-facts" in text
+
+
+def test_build_freshness_cited_but_not_top_ranked_dated_source_produces_a_notice():
+    """Condition (b), "cited": the dated source's chunk sits at position 2, not position 1, but
+    its position is in `cited_indices` -- the generated answer's own bracket citation. This is the
+    live Phase 5 defect's fix: retrieval merely returning a dated chunk somewhere in the list is not
+    enough (see the non-qualifying test below); it has to be ranked first OR actually cited.
+    """
+    chunks = [
+        _make_chunk(source_url="https://example.gov/unrelated", rule_effective_date=None),
+        _make_chunk(
+            source_url="https://studyinthestates.dhs.gov/quick-facts",
+            rule_effective_date=date(2026, 9, 15),
+        ),
+    ]
+
+    freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={2})
+
+    assert len(freshness.notices) == 1
+    notice = freshness.notices[0]
+    assert notice.source_url == "https://studyinthestates.dhs.gov/quick-facts"
+    assert notice.reason == "cited"
+
+    text = freshness_notice_text(freshness.notices)
+    assert text is not None
+    assert "September 15, 2026" in text
+
+
+def test_build_freshness_dated_source_neither_top_ranked_nor_cited_produces_no_notice():
+    """The exact spurious case the Phase 5 defect report describes: a dated source is retrieved
+    (position 2, not top-ranked) but the generated answer never cited it. No notice, no appended
+    text -- but its `rule_effective_date` is still visible in `Freshness.sources`, so nothing about
+    that source's own freshness bookkeeping is lost, only the unwarranted prose warning is.
+    """
+    dated_url = "https://studyinthestates.dhs.gov/quick-facts"
+    chunks = [
+        _make_chunk(source_url="https://example.gov/unrelated", rule_effective_date=None),
+        _make_chunk(source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+    ]
+
+    freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices=set())
+
+    assert freshness.notices == []
+    assert freshness_notice_text(freshness.notices) is None
+
+    dated_source = next(s for s in freshness.sources if s.source_url == dated_url)
+    assert dated_source.rule_effective_date == date(2026, 9, 15)
+
+
+def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_sentence():
+    """The live Phase 5 case: both fixed_admission snapshots carry rule_effective_date=2026-09-15,
+    and a question retrieving both must not read the same sentence twice with two different links.
+    `Freshness.notices` itself stays one-per-source; only the rendered prose collapses. url_a
+    qualifies as top-ranked (position 1); url_b qualifies as cited (position 2, cited_indices={2})
+    -- both qualifying routes feed the same collapsing logic.
+    """
+    url_a = "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-procedure-faq"
+    url_b = "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-quick-facts"
+    chunks = [
+        _make_chunk(source_url=url_a, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(source_url=url_b, rule_effective_date=date(2026, 9, 15)),
+    ]
+
+    freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={2})
+
+    # The structured field stays granular: one notice per source.
+    assert len(freshness.notices) == 2
+    assert {n.source_url for n in freshness.notices} == {url_a, url_b}
+    by_url = {n.source_url: n for n in freshness.notices}
+    assert by_url[url_a].reason == "top_ranked"
+    assert by_url[url_b].reason == "cited"
+
+    text = freshness_notice_text(freshness.notices)
+    assert text is not None
+    assert (
+        text.count("September 15, 2026") == 1
+    ), f"expected exactly one sentence for the shared date, got: {text!r}"
+    assert url_a in text
+    assert url_b in text
+
+
+def test_freshness_notice_text_keeps_separate_sentences_for_different_dates():
+    chunks = [
+        _make_chunk(source_url="https://example.gov/a", rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(source_url="https://example.gov/b", rule_effective_date=date(2027, 1, 1)),
+    ]
+
+    freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={2})
+    text = freshness_notice_text(freshness.notices)
+
+    assert text is not None
+    assert "September 15, 2026" in text
+    assert "January 1, 2027" in text
+    assert text.count("https://example.gov/a") == 1
+    assert text.count("https://example.gov/b") == 1
+
+
+def test_build_freshness_without_rule_effective_date_produces_no_notice_and_no_text():
+    chunk = _make_chunk(rule_effective_date=None)
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 5), cited_indices=set())
+
+    assert freshness.notices == []
+    assert freshness_notice_text(freshness.notices) is None
+
+
+# =================================================================================================
+# PIPELINE-LEVEL freshness (no langgraph, no DB): driven with a monkeypatched hybrid_search and a
+# fake LLM whose citations are fully controlled by the test, so DoD 3 is proven by logic the test
+# itself dictates -- never by which chunks a real corpus's retrieval, or a content-blind stub
+# embedder's hash, happens to rank where.
+#
+# The previous version of this section drove the real hybrid_search against a real ingested
+# corpus and asserted that a specific source ("Admit Until Date") landed among the top
+# RETRIEVAL_TOP_K results, on the theory that the keyword arm made that reliable. It measured true
+# on the 17-chunk CI fixture corpus (the keyword arm's top ranks were ALL the dated source there)
+# and false on the real 221-chunk corpus (plainto_tsquery's OR-ed terms there rank the dated source
+# only 3rd-5th, behind unrelated STEM OPT/OPT chunks, so the stub embedder's content-blind semantic
+# arm pushed it out of the fused top 5 entirely) -- see docs/reports/phase-5.md's "Correction: the
+# DoD 3 test was fragile" for the full measurement. That made the test's outcome a function of
+# corpus composition, not of the freshness-notice logic it was meant to prove. Monkeypatching
+# hybrid_search removes that dependency entirely: `chunks` below IS the retrieval result, in the
+# exact order and with the exact rule_effective_date values each case needs, and a FixedAnswerLLM
+# makes "cited" vs. "not cited" a fact the test sets rather than one a real (or stub) generator
+# happens to produce.
+# =================================================================================================
+
+
+@pytest.fixture
+def embedder():
+    return StubEmbedder(dim=768)
+
+
+@pytest.fixture
+def llm():
+    return StubLLM()
+
+
+@pytest.fixture
+def settings():
+    return Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub", NO_ANSWER_MAX_DISTANCE=2.0)
+
+
+class ExplodingLLM(LLM):
+    async def generate(self, system: str, user: str) -> str:
+        raise AssertionError("LLM.generate must not be called")
+
+
+class ExplodingPool:
+    def __getattr__(self, name):
+        raise AssertionError(f"pool.{name} must not be touched on the CLARIFY path")
+
+
+class ExplodingEmbedder:
+    async def embed(self, texts):
+        raise AssertionError("embedder.embed must not be called on the CLARIFY path")
+
+
+@pytest.fixture
+async def pool():
+    settings = get_settings()
+    database_url_ = os.environ.get("DATABASE_URL", settings.DATABASE_URL)
+    p = make_pool(database_url_)
+    await p.open()
+    try:
+        yield p
+    finally:
+        await p.close()
+
+
+class FixedAnswerLLM(LLM):
+    """A fake LLM that always returns a fixed string, so a test can dictate exactly which bracket
+    indices are "cited" and which are not -- the same pattern
+    tests/test_guardrails.py::FixedAnswerLLM uses for the same reason.
+    """
+
+    def __init__(self, text: str):
+        self._text = text
+
+    async def generate(self, system: str, user: str) -> str:
+        return self._text
+
+
+def _patch_hybrid_search(monkeypatch: pytest.MonkeyPatch, chunks: list[RetrievedChunk]) -> None:
+    """Replace app.pipeline's own reference to hybrid_search with a fake that ignores every
+    argument (pool, embedding, question, k, rrf_k, candidate_pool) and always returns `chunks`, in
+    the exact order given. This is what makes the tests below independent of any corpus, any
+    embedder, and ts_rank_cd's behavior on any particular query text: retrieval order and content
+    are dictated by the test, not discovered from a database.
+    """
+
+    async def _fake_hybrid_search(*args, **kwargs):
+        del args, kwargs
+        return chunks
+
+    monkeypatch.setattr("app.pipeline.hybrid_search", _fake_hybrid_search)
+
+
+# A question with no advice-seeking phrasing (so Layer 1 of app.guardrails.classifier never fires)
+# and enough content words that app.guardrails.clarifier never fires either -- both guards run
+# before retrieval, using only the question text (see app/pipeline.py), so the same question text
+# is reused, unchanged, across every case below; only `chunks` and the fake LLM's answer differ.
+_QUESTION = "What does the fixed period of admission rule say for F-1 students?"
+
+
+async def test_pipeline_appends_notice_reason_top_ranked_for_an_uncited_dated_top_chunk(
+    monkeypatch, embedder, settings
+):
+    """DoD 3's live motivating case (docs/reports/phase-5.md: "How long do I have to leave the
+    United States after my OPT ends?"): the dated source ranks first, but the generated answer
+    cites a DIFFERENT chunk for the still-current rule and never cites the dated one.
+    build_freshness's "top_ranked" condition exists exactly so the notice still fires here.
+    """
+    dated_url = "https://example.gov/dated-top-ranked"
+    other_url = "https://example.gov/other-cited-instead"
+    chunks = [
+        _make_chunk(id=1, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(id=2, source_url=other_url, rule_effective_date=None),
+    ]
+    _patch_hybrid_search(monkeypatch, chunks)
+    fake_llm = FixedAnswerLLM("The current rule is stated here [2].")
+
+    response = await answer_question(
+        _QUESTION, pool=ExplodingPool(), embedder=embedder, llm=fake_llm, settings=settings
+    )
+
+    assert response.response_type == ResponseType.ANSWER.value
+    assert response.freshness is not None
+    assert response.freshness.as_of == datetime.now(UTC).date()
+
+    notices = response.freshness.notices
+    assert len(notices) == 1, notices
+    assert notices[0].source_url == dated_url
+    assert notices[0].reason == "top_ranked"
+
+    assert "September 15, 2026" in response.answer
+    assert dated_url in response.answer
+
+
+async def test_pipeline_appends_notice_reason_cited_for_a_non_top_dated_chunk_the_answer_cites(
+    monkeypatch, embedder, settings
+):
+    """The other qualifying condition: the dated source is NOT ranked first, but the generated
+    answer actually cited it (its 1-based position is in the answer's cited_indices)."""
+    other_url = "https://example.gov/other-top-ranked"
+    dated_url = "https://example.gov/dated-cited"
+    chunks = [
+        _make_chunk(id=1, source_url=other_url, rule_effective_date=None),
+        _make_chunk(id=2, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+    ]
+    _patch_hybrid_search(monkeypatch, chunks)
+    fake_llm = FixedAnswerLLM("As the second source states [2], the rule changes soon.")
+
+    response = await answer_question(
+        _QUESTION, pool=ExplodingPool(), embedder=embedder, llm=fake_llm, settings=settings
+    )
+
+    assert response.response_type == ResponseType.ANSWER.value
+    assert response.freshness is not None
+
+    notices = response.freshness.notices
+    assert len(notices) == 1, notices
+    assert notices[0].source_url == dated_url
+    assert notices[0].reason == "cited"
+
+    assert "September 15, 2026" in response.answer
+    assert dated_url in response.answer
+
+
+async def test_pipeline_appends_no_notice_for_a_dated_chunk_neither_top_ranked_nor_cited(
+    monkeypatch, embedder, settings
+):
+    """The exact spurious case build_freshness's gating exists to prevent: a dated source retrieved
+    incidentally (not top-ranked, never cited) must add NO text to the rendered answer, but its
+    rule_effective_date still has to survive in the structured Freshness.sources bookkeeping.
+    """
+    other_url = "https://example.gov/other-only-cited"
+    dated_url = "https://example.gov/dated-neither-top-nor-cited"
+    chunks = [
+        _make_chunk(id=1, source_url=other_url, rule_effective_date=None),
+        _make_chunk(id=2, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+    ]
+    _patch_hybrid_search(monkeypatch, chunks)
+    fixed_text = "The rule is stated here [1]."
+    fake_llm = FixedAnswerLLM(fixed_text)
+
+    response = await answer_question(
+        _QUESTION, pool=ExplodingPool(), embedder=embedder, llm=fake_llm, settings=settings
+    )
+
+    assert response.response_type == ResponseType.ANSWER.value
+    assert response.freshness is not None
+    assert response.freshness.notices == []
+    assert response.answer == fixed_text, (
+        f"a dated source that is neither top-ranked nor cited must add no text to the answer, got "
+        f"{response.answer!r}"
+    )
+
+    dated_source = next(s for s in response.freshness.sources if s.source_url == dated_url)
+    assert dated_source.rule_effective_date == date(2026, 9, 15)
+
+
+async def test_pipeline_appends_no_notice_when_no_retrieved_chunk_carries_a_dated_rule(
+    monkeypatch, embedder, settings
+):
+    only_url = "https://example.gov/no-dated-rule-anywhere"
+    chunks = [_make_chunk(id=1, source_url=only_url, rule_effective_date=None)]
+    _patch_hybrid_search(monkeypatch, chunks)
+    fixed_text = "The rule is stated here [1]."
+    fake_llm = FixedAnswerLLM(fixed_text)
+
+    response = await answer_question(
+        _QUESTION, pool=ExplodingPool(), embedder=embedder, llm=fake_llm, settings=settings
+    )
+
+    assert response.response_type == ResponseType.ANSWER.value
+    assert response.freshness is not None
+    assert response.freshness.notices == []
+    assert response.answer == fixed_text
+
+
+async def test_no_answer_and_clarify_responses_carry_no_freshness(pool, embedder):
+    no_answer_settings = Settings(
+        LLM_PROVIDER="stub", EMBED_PROVIDER="stub", NO_ANSWER_MAX_DISTANCE=-1.0
+    )
+    no_answer_response = await answer_question(
+        "What is a Form I-515A and when is it issued?",
+        pool=pool,
+        embedder=embedder,
+        llm=ExplodingLLM(),
+        settings=no_answer_settings,
+    )
+    assert no_answer_response.response_type == ResponseType.NO_ANSWER.value
+    assert no_answer_response.freshness is None
+
+    clarify_settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+    clarify_response = await answer_question(
+        "help",
+        pool=ExplodingPool(),
+        embedder=ExplodingEmbedder(),
+        llm=ExplodingLLM(),
+        settings=clarify_settings,
+    )
+    assert clarify_response.response_type == ResponseType.CLARIFY.value
+    assert clarify_response.freshness is None
+
+
+# full_corpus: calibrates nothing new here, just confirms the real embedder/live-shaped retrieval
+# path still carries rule_effective_date through hybrid_search -- kept separate from the
+# stub-driven pipeline test above so this file's non-full_corpus tests never need Ollama reachable.
+@pytest.mark.full_corpus
+async def test_hybrid_search_carries_rule_effective_date_through(pool):
+    settings = get_settings()
+    real_embedder = OllamaEmbedder(base_url=settings.OLLAMA_BASE_URL, model=settings.EMBED_MODEL)
+    question = "What is the Admit Until Date and how is it determined?"
+    [embedding] = await real_embedder.embed([question])
+    results = await hybrid_search(
+        pool, embedding, question, k=settings.RETRIEVAL_TOP_K, rrf_k=60, candidate_pool=20
+    )
+    assert any(r.rule_effective_date == date(2026, 9, 15) for r in results), (
+        f"expected at least one retrieved chunk to carry rule_effective_date=2026-09-15, got "
+        f"{[(r.id, r.source_url, r.rule_effective_date) for r in results]}"
+    )
+
+
+def _require_ollama_reachable(base_url: str) -> None:
+    """Skip cleanly (not a failure) if Ollama is not reachable at `base_url`. The test below needs
+    a real embedding call and is already `full_corpus`-marked (excluded from CI, which never has
+    Ollama); this additionally protects a dev machine, or a container used only for the write-guard
+    verification below, that has no Ollama running at all.
+    """
+    try:
+        httpx.get(f"{base_url.rstrip('/')}/api/tags", timeout=3.0)
+    except httpx.HTTPError as exc:
+        pytest.skip(f"Ollama not reachable at {base_url!r}: {exc}")
+
+
+@pytest.mark.full_corpus
+async def test_pipeline_freshness_notice_fires_via_top_ranked_on_the_live_corpus(pool):
+    """The real-corpus counterpart to the monkeypatched pipeline tests above: same
+    build_freshness gating logic, but fed real hybrid_search results from the committed real
+    corpus with the real nomic-embed-text embedder, so this actually exercises retrieval ranking
+    rather than a hand-built chunk list. Matches the live evidence recorded in
+    docs/reports/phase-5.md's DoD 3 table: the departure-period question retrieves a dated
+    fixed_admission source at rank 1 (qualifying via "top_ranked"), and the unrelated Form I-983
+    question retrieves no dated source among its RETRIEVAL_TOP_K results at all.
+
+    Read-only (hybrid_search is SELECT-only), so this needs no DB-writing guard. Generation is
+    deliberately out of scope here -- "top_ranked" is a fact about retrieval order alone, and
+    driving a real (or stub) generator on top of it would only add a second, unrelated source of
+    flakiness to a test whose job is to prove retrieval + build_freshness, not the full answer.
+    """
+    settings = get_settings()
+    _require_ollama_reachable(settings.OLLAMA_BASE_URL)
+    real_embedder = OllamaEmbedder(base_url=settings.OLLAMA_BASE_URL, model=settings.EMBED_MODEL)
+
+    async def notices_for(question: str) -> list:
+        [embedding] = await real_embedder.embed([question])
+        chunks = await hybrid_search(
+            pool, embedding, question, k=settings.RETRIEVAL_TOP_K, rrf_k=60, candidate_pool=20
+        )
+        freshness = build_freshness(chunks, today=datetime.now(UTC).date(), cited_indices=set())
+        return freshness.notices
+
+    departure_notices = await notices_for(
+        "How long do I have to leave the United States after my OPT ends?"
+    )
+    assert departure_notices, "expected the departure-period question to fire a freshness notice"
+    assert any(
+        n.reason == "top_ranked" for n in departure_notices
+    ), f"expected a top_ranked notice for the departure-period question, got {departure_notices}"
+
+    i983_notices = await notices_for("What is the I-983 and who fills it out?")
+    assert (
+        i983_notices == []
+    ), f"expected no freshness notice for the I-983 question, got {i983_notices}"
+
+
+# =================================================================================================
+# GRAPH: app/recrawl.py's LangGraph refresh graph (requires_langgraph, DB-backed against a scratch
+# database -- see conftest for how DATABASE_URL/officehours_freshness is wired up locally).
+# =================================================================================================
+
+
+class KillError(BaseException):
+    """Simulates an unrecoverable process kill (SIGKILL, OOM, host crash) -- NOT caught by
+    app.recrawl's own `except Exception` clauses (in `_fetch_node` and `run_refresh`'s per-source
+    loop), the same reason `KeyboardInterrupt`/`SystemExit`/`asyncio.CancelledError` subclass
+    `BaseException` rather than `Exception` in the standard library: those `except Exception`
+    clauses exist to isolate ORDINARY per-source failures (a bad HTTP response, a bug in one
+    source's own processing) from stopping the whole run, not to make the whole run un-killable. A
+    real kill signal is never something application code gets a chance to catch at all.
+    """
+
+
+def _write_test_snapshot(
+    raw_dir: Path, *, source_url: str, topic: str, title: str, body: str
+) -> Path:
+    frontmatter = {
+        "source_url": source_url,
+        "title": title,
+        "fetched_at": "2026-01-01",
+        "page_last_updated": "2026-01-01",
+        "topic": topic,
+    }
+    path = mint_snapshot_filename(topic, source_url, raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_snapshot(frontmatter, body), encoding="utf-8")
+    return path
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_meaningful_change_reindexes_and_rewrites_the_snapshot(
+    tmp_path, conn, database_url
+):
+    source_url = "https://example.gov/freshness-graph-meaningful"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    snapshot_path = _write_test_snapshot(
+        tmp_path,
+        source_url=source_url,
+        topic=topic,
+        title="Test Page",
+        body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
+    )
+    old_row_id = await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+    )
+
+    async def fetcher(entry):
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown="# Test Page\n\n## Section\n\nThe extension is 36 months.\n",
+        )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=tmp_path,
+        run_id="test-run-meaningful",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "meaningful"
+    assert result.chunks_indexed > 0
+
+    new_snapshot_text = snapshot_path.read_text(encoding="utf-8")
+    assert "36 months" in new_snapshot_text
+    assert "24 months" not in new_snapshot_text
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, fetched_at FROM documents WHERE source_url = %s", (source_url,)
+        )
+        rows = await cur.fetchall()
+
+    assert rows
+    assert all(r["id"] != old_row_id for r in rows)
+    assert all(r["fetched_at"] > old_time for r in rows)
+
+    await _delete_test_rows(conn, source_url)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_meaningful_change_carries_verdict_evidence_through_source_result(
+    tmp_path, conn, database_url
+):
+    """R1: `SourceResult` must carry the `ChangeVerdict` evidence (`added_count`, `removed_count`,
+    `highlights`) computed inside `_diff_node`, not just `status`/`reason` -- on BOTH the fresh-run
+    path and the already-terminal/resumed path (`_verdict_evidence` reading
+    `snapshot.values["verdict"]`). Driven entirely through `run_refresh` with a fake fetcher, so
+    this goes through real graph state rather than constructing a `SourceResult` by hand.
+    """
+    source_url = "https://example.gov/freshness-graph-verdict-evidence"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    _write_test_snapshot(
+        tmp_path,
+        source_url=source_url,
+        topic=topic,
+        title="Test Page",
+        body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
+    )
+    await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+    )
+
+    async def fetcher(entry):
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown="# Test Page\n\n## Section\n\nThe extension is 36 months.\n",
+        )
+
+    run_id = "test-run-verdict-evidence"
+    checkpoint_path = str(tmp_path / "checkpoint.sqlite")
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=tmp_path,
+        run_id=run_id,
+        checkpoint_path=checkpoint_path,
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "meaningful"
+    assert result.resumed is False
+    assert result.added_count > 0
+    assert result.removed_count > 0
+    assert any("36 months" in line for line in result.added)
+    assert any("24 months" in line for line in result.removed)
+    assert "36 months" in result.highlights
+
+    # Resuming the SAME already-terminal source (same run_id + checkpoint file) must report the
+    # SAME evidence, read from snapshot.values["verdict"] rather than dropping it.
+    resumed_report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=tmp_path,
+        run_id=run_id,
+        checkpoint_path=checkpoint_path,
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(resumed_report.results) == 1
+    resumed_result = resumed_report.results[0]
+    assert resumed_result.resumed is True
+    assert resumed_result.status == "meaningful"
+    assert resumed_result.added_count == result.added_count
+    assert resumed_result.removed_count == result.removed_count
+    assert resumed_result.highlights == result.highlights
+    assert resumed_result.added == result.added
+    assert resumed_result.removed == result.removed
+
+    await _delete_test_rows(conn, source_url)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_cosmetic_change_only_touches_last_verified(tmp_path, conn, database_url):
+    source_url = "https://example.gov/freshness-graph-cosmetic"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    old_body = "# Test Page\n\n## Section\n\nThe extension is 24 months.\n"
+
+    snapshot_path = _write_test_snapshot(
+        tmp_path, source_url=source_url, topic=topic, title="Test Page", body=old_body
+    )
+    old_snapshot_bytes = snapshot_path.read_bytes()
+    old_row_id = await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+    )
+
+    async def fetcher(entry):
+        # Cosmetic: same three lines, reordered -- see classify_change's step 3.
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown="# Test Page\n\nThe extension is 24 months.\n\n## Section\n",
+        )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=tmp_path,
+        run_id="test-run-cosmetic",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "cosmetic"
+    assert result.chunks_indexed == 0
+
+    assert snapshot_path.read_bytes() == old_snapshot_bytes
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, fetched_at, last_verified_at FROM documents WHERE source_url = %s",
+            (source_url,),
+        )
+        rows = await cur.fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == old_row_id
+    assert rows[0]["fetched_at"] == old_time
+    assert rows[0]["last_verified_at"] > old_time
+
+    await _delete_test_rows(conn, source_url)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_fetch_failure_isolation(tmp_path, conn, database_url):
+    good_url = "https://example.gov/freshness-graph-good"
+    bad_url = "https://example.gov/freshness-graph-bad"
+    topic = "freshness_test"
+
+    async def fetcher(entry):
+        if entry["url"] == bad_url:
+            raise RuntimeError("simulated network failure")
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown="# Good Page\n\n## Section\n\nSome content here.\n",
+        )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[
+            {"url": good_url, "topic": topic, "title": "Good Page"},
+            {"url": bad_url, "topic": topic, "title": "Bad Page"},
+        ],
+        raw_dir=tmp_path,
+        run_id="test-run-failure-isolation",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    by_url = {r.source_url: r for r in report.results}
+    assert by_url[bad_url].status == "fetch_failed"
+    assert by_url[bad_url].attempts == 3
+
+    assert by_url[good_url].status == "meaningful"
+
+    await _delete_test_rows(conn, good_url, bad_url)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_resume_does_not_refetch_completed_sources(tmp_path, conn, database_url):
+    urls = [f"https://example.gov/freshness-graph-resume-{i}" for i in range(3)]
+    topic = "freshness_test"
+    manifest = [{"url": u, "topic": topic, "title": f"Page {i}"} for i, u in enumerate(urls)]
+
+    call_log: list[str] = []
+
+    async def killing_fetcher(entry):
+        call_log.append(entry["url"])
+        if entry["url"] == urls[2]:
+            raise KillError("simulated process kill")
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown=f"# Page\n\n## Section\n\nContent for {entry['url']}.\n",
+        )
+
+    checkpoint_path = str(tmp_path / "checkpoint.sqlite")
+    run_id = "test-run-resume"
+
+    with pytest.raises(KillError):
+        await run_refresh(
+            settings=get_settings(),
+            manifest=manifest,
+            raw_dir=tmp_path,
+            run_id=run_id,
+            checkpoint_path=checkpoint_path,
+            fetcher=killing_fetcher,
+            conn_factory=make_conn_factory(database_url),
+            embedder=StubEmbedder(dim=768),
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert call_log == [urls[0], urls[1], urls[2]]
+    calls_before_resume = len(call_log)
+
+    async def working_fetcher(entry):
+        call_log.append(entry["url"])
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown=f"# Page\n\n## Section\n\nContent for {entry['url']}.\n",
+        )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=manifest,
+        raw_dir=tmp_path,
+        run_id=run_id,  # SAME run_id -> SAME thread_ids -> resumes from checkpoint
+        checkpoint_path=checkpoint_path,  # SAME checkpoint file
+        fetcher=working_fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    # (a) sources completed before the kill were NOT fetched again -- count fetcher calls.
+    new_calls = call_log[calls_before_resume:]
+    assert urls[0] not in new_calls
+    assert urls[1] not in new_calls
+    assert urls[2] in new_calls  # killed mid-fetch, never completed -- must be retried
+
+    # (b) every source ends with a terminal status after the second run.
+    assert len(report.results) == 3
+    statuses = {r.source_url: r.status for r in report.results}
+    for url in urls:
+        assert statuses[url] in {"unchanged", "cosmetic", "meaningful", "fetch_failed"}
+    assert statuses[urls[0]] == "meaningful"
+    assert statuses[urls[1]] == "meaningful"
+    assert statuses[urls[2]] == "meaningful"
+
+    await _delete_test_rows(conn, *urls)
+
+
+class _KillOnceEmbedder:
+    """Wraps a real embedder; raises `KillError` (BaseException, not caught by run_refresh's own
+    `except Exception` clauses) the FIRST time `embed()` is called for this run, then delegates to
+    the wrapped embedder on every subsequent call. `embed()` is called from inside
+    `reindex_source` -- the last step of the meaningful-change path (fetch -> diff -> chunk ->
+    embed(-node) -> reindex) -- so by the time this raises, fetch/diff/chunk have already run and
+    LangGraph has already checkpointed their state.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+
+    async def embed(self, texts):
+        self.calls += 1
+        if self.calls == 1:
+            raise KillError("simulated process kill during reindex")
+        return await self._inner.embed(texts)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_resume_continues_mid_source_without_refetching(tmp_path, conn, database_url):
+    """The other half of "a run that dies partway through resumes rather than restarting" from
+    test_graph_resume_does_not_refetch_completed_sources above: that test proves the driver SKIPS
+    sources that already reached a terminal status between runs. This proves the graph resumes
+    MID-SOURCE -- the checkpoint buys more than just "don't redo whole sources already finished."
+
+    A single source's own graph run is killed after fetch/diff/chunk have completed, INSIDE the
+    reindex step (via the embedder, not the fetcher) -- confirmed against the real langgraph
+    checkpointer with a standalone probe before writing this test: the first `run_refresh` call
+    propagates `KillError` (as `test_graph_resume_does_not_refetch_completed_sources` above already
+    establishes KillError does, being a BaseException), and a second call with the SAME run_id and
+    checkpoint file and a working embedder resumes from the checkpointed state rather than
+    restarting the graph from START.
+    """
+    url = "https://example.gov/freshness-graph-resume-mid-source"
+    topic = "freshness_test"
+    manifest = [{"url": url, "topic": topic, "title": "Resume Mid-Source Page"}]
+
+    call_log: list[str] = []
+
+    async def fetcher(entry):
+        call_log.append(entry["url"])
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown="# Resume Mid-Source Page\n\n## Section\n\nSome content here.\n",
+        )
+
+    checkpoint_path = str(tmp_path / "checkpoint.sqlite")
+    run_id = "test-run-resume-mid-source"
+    embedder = _KillOnceEmbedder(StubEmbedder(dim=768))
+
+    with pytest.raises(KillError):
+        await run_refresh(
+            settings=get_settings(),
+            manifest=manifest,
+            raw_dir=tmp_path,
+            run_id=run_id,
+            checkpoint_path=checkpoint_path,
+            fetcher=fetcher,
+            conn_factory=make_conn_factory(database_url),
+            embedder=embedder,
+            max_attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert call_log == [url]  # fetch completed once, before the kill
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=manifest,
+        raw_dir=tmp_path,
+        run_id=run_id,  # SAME run_id -> SAME thread_id -> resumes from checkpoint
+        checkpoint_path=checkpoint_path,  # SAME checkpoint file
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=embedder,  # SAME embedder: .calls is now 1, so its second call succeeds
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    # (a) the fetcher was NOT called again -- the graph resumed at the node it died on (reindex)
+    # rather than restarting from START.
+    assert call_log == [url]
+
+    # (b) the source ends meaningful, with its rows actually written.
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "meaningful"
+    assert result.chunks_indexed > 0
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT id FROM documents WHERE source_url = %s", (url,))
+        rows = await cur.fetchall()
+    assert rows
+
+    await _delete_test_rows(conn, url)

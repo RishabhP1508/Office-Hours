@@ -41,3 +41,10 @@ ALTER TABLE documents
 
 CREATE INDEX IF NOT EXISTS documents_content_tsv_gin ON documents USING gin (content_tsv);
 CREATE INDEX IF NOT EXISTS documents_embedding_hnsw ON documents USING hnsw (embedding vector_cosine_ops);
+
+-- Phase 5: a known future rule change (e.g. the DHS fixed-period-of-admission final rule, effective
+-- Sept 15 2026) is a curator annotation already present in a snapshot's frontmatter
+-- (`rule_effective_date: 2026-09-15` on both fixed_admission snapshots) -- lifted here into the
+-- table so the TEMPORAL ANSWERS rule (ARCHITECTURE.md: state both the current rule and its dated
+-- replacement) is driven by data rather than by the corpus happening to contain both texts.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS rule_effective_date DATE;
