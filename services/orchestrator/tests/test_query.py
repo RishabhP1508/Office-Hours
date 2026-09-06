@@ -14,11 +14,17 @@ import httpx
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
+from pgvector.psycopg import register_vector_async
+from test_freshness import (
+    _delete_test_rows,
+    _insert_test_row,
+    _refuse_if_target_is_the_fully_ingested_real_corpus,
+)
 
 from app.config import Settings, get_settings
 from app.db import make_pool
 from app.guardrails.freshness import sources_freshness_state
-from app.main import app
+from app.main import app, sources_status
 from app.pipeline import answer_question
 from app.providers.embeddings import StubEmbedder
 from app.providers.llm import StubLLM
@@ -49,7 +55,8 @@ def test_query_happy_path_returns_grounded_citation():
     settings = get_settings()
     with psycopg.connect(settings.DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT source_url, resolved_url FROM documents")
+            # Phase 7: resolved_url moved off `documents` onto `sources` (one row per source).
+            cur.execute("SELECT source_url, resolved_url FROM sources")
             rows = cur.fetchall()
     known_urls = set()
     for source_url, resolved_url in rows:
@@ -188,12 +195,75 @@ def test_sources_status_reports_a_real_source_count_and_freshness_fields(stub_cl
     assert body["oldest_verified_at"] is not None
     assert body["newest_verified_at"] is not None
     assert body["freshness_state"] in {"current", "recent", "stale", "unknown"}
+    # Phase 7 fields: present, well-typed, and internally consistent regardless of which corpus is
+    # currently loaded (a freshly ingested corpus has no broken sources at all).
+    assert isinstance(body["broken_source_count"], int)
+    assert isinstance(body["broken_sources"], list)
+    assert body["broken_source_count"] == len(body["broken_sources"])
+
+
+async def test_sources_status_reports_broken_sources_correctly():
+    """DoD 6: GET /sources/status reports broken_source_count/broken_sources correctly, decided
+    entirely by app.guardrails.freshness.source_health_state (never recomputed by this test or by
+    the endpoint's SQL) -- a source with 3 consecutive failures shows up as broken with its own
+    error/status/count carried through; an untouched, healthy source does not. Runs against a
+    scratch database (never the live, fully-ingested corpus -- same guard test_freshness.py's
+    DB-writing tests use), and calls the endpoint's own handler function directly rather than
+    through TestClient/lifespan, so this test owns exactly one connection pool.
+    """
+    database_url = os.environ.get("DATABASE_URL", get_settings().DATABASE_URL)
+    guard_conn = await psycopg.AsyncConnection.connect(database_url)
+    try:
+        await _refuse_if_target_is_the_fully_ingested_real_corpus(guard_conn, database_url)
+    finally:
+        await guard_conn.close()
+
+    ok_url = "https://example.gov/status-endpoint-ok"
+    broken_url = "https://example.gov/status-endpoint-broken"
+
+    write_conn = await psycopg.AsyncConnection.connect(database_url)
+    await register_vector_async(write_conn)
+
+    pool = make_pool(database_url)
+    await pool.open()
+    app.state.pool = pool
+    app.state.settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+
+    try:
+        now = datetime.now(UTC)
+        await _insert_test_row(write_conn, ok_url, fetched_at=now)
+        await _insert_test_row(write_conn, broken_url, fetched_at=now)
+
+        async with write_conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE sources SET consecutive_failures = 3, status = 'fetch_failed', "
+                "last_error = %s, last_http_status = %s WHERE source_url = %s",
+                ("simulated failure", 503, broken_url),
+            )
+        await write_conn.commit()
+
+        status = await sources_status()
+
+        broken_by_url = {b.source_url: b for b in status.broken_sources}
+        assert broken_url in broken_by_url
+        assert ok_url not in broken_by_url
+        assert broken_by_url[broken_url].status == "fetch_failed"
+        assert broken_by_url[broken_url].consecutive_failures == 3
+        assert broken_by_url[broken_url].last_error == "simulated failure"
+        assert broken_by_url[broken_url].last_http_status == 503
+        assert status.broken_source_count == len(status.broken_sources)
+    finally:
+        await _delete_test_rows(write_conn, ok_url, broken_url)
+        await write_conn.close()
+        await pool.close()
 
 
 def _true_min_max_last_verified_at(database_url: str) -> tuple[datetime, datetime]:
+    # Phase 7: last_verified_at moved off `documents` (one identical copy per chunk) onto
+    # `sources` (one row per source) -- see infra/sql/init.sql.
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT min(last_verified_at), max(last_verified_at) FROM documents")
+            cur.execute("SELECT min(last_verified_at), max(last_verified_at) FROM sources")
             true_min, true_max = cur.fetchone()
     return true_min, true_max
 

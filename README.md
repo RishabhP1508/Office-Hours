@@ -25,8 +25,10 @@ pipeline's own decision instead of guessing from the prose. The retrieve and gen
 produce their own OpenTelemetry span, visible as one trace in Grafana.
 
 Phase 5 added the re-crawl job described under "Staying current" below, and freshness data on every
-answer. Still to come: the Next.js frontend (Phase 6), the Go gateway with Redis rate limiting
-(Phase 7), and deployment (Phase 8).
+answer. The Next.js frontend and the Go gateway described elsewhere in this README are both built:
+the browser talks to the gateway, which rate limits, redacts PII out of the question, times the
+upstream call out, and propagates one trace across both services. Deployment (Phase 8) is what is
+still ahead.
 
 ## Running it
 
@@ -40,7 +42,7 @@ container; the orchestrator reaches it through Docker's `host.docker.internal` h
    cp .env.example .env
    ```
 
-2. Start Postgres, the orchestrator, and the observability stack:
+2. Start Postgres, the orchestrator, Redis, the Go gateway, and the observability stack:
 
    ```
    docker compose up -d --build
@@ -54,18 +56,36 @@ container; the orchestrator reaches it through Docker's `host.docker.internal` h
    docker compose run --rm orchestrator python -m app.ingest
    ```
 
-4. Ask it something:
+4. Ask it something. As of Phase 7, the browser and any other caller go through the gateway on
+   8080, not the orchestrator's own 8000 directly: the gateway rate limits, redacts PII out of the
+   question before it reaches the orchestrator, and times the upstream call out. `/query` becomes
+   `/v1/query`:
 
    ```
-   curl -s -X POST http://localhost:8000/query \
+   curl -s -X POST http://localhost:8080/v1/query \
      -H "Content-Type: application/json" \
      -d '{"question": "How long is the STEM OPT extension?"}'
    ```
 
-5. Open Grafana at [http://localhost:3000](http://localhost:3000) (or whatever port you set
+5. Run the frontend against the gateway:
+
+   ```
+   cd services/frontend
+   cp .env.local.example .env.local
+   npm install
+   npm run dev
+   ```
+
+   `npm run dev` prints the port it picked (3000 by default, or another one if that is already
+   taken). Open that address and ask a question through the page.
+   `NEXT_PUBLIC_GATEWAY_URL` in `.env.local` defaults to `http://localhost:8080`, matching the
+   gateway's published port above.
+
+6. Open Grafana at [http://localhost:3000](http://localhost:3000) (or whatever port you set
    `GRAFANA_HOST_PORT` to, if something else on your machine already holds 3000) and look in Tempo
-   (via Explore) for a trace from `office-hours-orchestrator`. Each query produces one trace with a
-   `retrieve` span and a `generate` span.
+   (via Explore) for a trace. As of Phase 7, one trace spans both services: a request through the
+   gateway produces spans from `office-hours-gateway` and `office-hours-orchestrator`, the latter
+   still carrying its own `retrieve` and `generate` spans underneath.
 
 Run the orchestrator's tests inside the container, since the host's Python version doesn't match
 what the image builds against:
@@ -123,7 +143,11 @@ never commit it.
 | `GRAFANA_HOST_PORT` | Host port Grafana is published on, default 3000. Override it if something else on your machine already holds that port. |
 | `CRAWL_DELAY_SECONDS`, `USER_AGENT` | How politely `ingest.py` crawls the source pages. |
 | `INGEST_MODE` | `fetch` (default) reads the manifest and fetches live URLs. `snapshot` skips the network and chunks whatever `.md` snapshots are already in `RAW_SNAPSHOT_DIR` -- used only by the CI eval gate to ingest `eval/fixtures/sources/`. |
-| `ALLOWED_ORIGINS` | Comma-separated origins the orchestrator answers CORS preflight for. The Next.js frontend (`services/frontend`) calls the orchestrator directly until the Phase 7 gateway sits in front of it. |
+| `ALLOWED_ORIGINS` | Comma-separated origins the CORS preflight is answered for. Read by both the orchestrator and the gateway; the browser talks to the gateway as of Phase 7. |
+| `SOURCE_BROKEN_CONSECUTIVE_FAILURES`, `SOURCE_BROKEN_NO_SUCCESS_DAYS` | When `GET /sources/status` calls a source broken rather than merely overdue: 3 consecutive failed crawls (three days running the daily refresh cron), or 7 days with no successful crawl at all -- the same 7-day boundary the freshness band already uses. |
+| `RATE_LIMIT_BUCKET_CAPACITY`, `RATE_LIMIT_REFILL_PER_SECOND` | The gateway's Redis token bucket, one bucket per client IP: capacity is the burst allowance, refill is tokens added per second. |
+| `UPSTREAM_TIMEOUT_SECONDS` | How long the gateway waits on the orchestrator: the whole call for `/v1/query` and `/v1/sources/status`, only the wait for response headers for `/v1/query/stream` (see `docs/adr/0007-go-python-split.md`). |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated CIDRs the gateway will believe an `X-Forwarded-For` header from. Empty by default, so the header is ignored and every request is keyed on its own TCP peer address -- trusting it unconditionally would let a caller pick a fresh rate-limit bucket on every request just by sending a different header value. |
 
 ## How retrieval works right now
 

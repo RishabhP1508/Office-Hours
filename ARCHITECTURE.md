@@ -227,7 +227,7 @@ Why: the orchestrator's work is IO-bound calls to a model and a database, where 
 the reason to be there. The gateway's work is concurrent connection handling under a limit, where Go's
 is. Sleeping to retry holds a goroutine and turns a slow upstream into an outage, and an empty bucket
 is already a known answer, so it should be returned rather than waited on. Recorded in
-`docs/adr/0003-go-python-split.md` at Phase 7.
+`docs/adr/0007-go-python-split.md` at Phase 7.
 
 ### Every service has a Dockerfile, and all config comes from environment variables **[P0]**
 

@@ -23,12 +23,14 @@ already-ingested rows, or the live corpus, read-only.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -41,7 +43,7 @@ from psycopg.rows import dict_row
 
 from app.config import Settings, get_settings
 from app.db import RetrievedChunk, hybrid_search, make_pool
-from app.guardrails.freshness import build_freshness, freshness_notice_text
+from app.guardrails.freshness import build_freshness, freshness_notice_text, source_health_state
 from app.ingest import (
     FetchedPage,
     load_snapshot,
@@ -58,6 +60,7 @@ from app.recrawl import (
     classify_change,
     make_conn_factory,
     normalize_for_diff,
+    record_source_failure,
     reindex_source,
     run_refresh,
     touch_last_verified,
@@ -512,28 +515,51 @@ async def _insert_test_row(
     heading: str = "Old Heading",
     content: str = "old content",
 ) -> int:
+    """Phase 7: `resolved_url`/`page_last_updated`/`fetched_at`/`last_verified_at` moved off
+    `documents` onto `sources` (the FK requires a `sources` row to exist before any `documents` row
+    can reference it, so the upsert below runs first). Initializes the same "healthy, just-crawled"
+    shape `_embed_and_store`'s own upsert does: last_success_at/last_changed_at := fetched_at,
+    change_count/consecutive_failures := 0, status := 'ok'.
+    """
     async with conn.transaction():
         async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO sources
+                    (source_url, resolved_url, page_last_updated, fetched_at, last_verified_at,
+                     last_changed_at, last_success_at, change_count, consecutive_failures,
+                     last_error, last_http_status, status)
+                VALUES (%s, NULL, %s, %s, %s, %s, %s, 0, 0, NULL, NULL, 'ok')
+                ON CONFLICT (source_url) DO UPDATE SET
+                    resolved_url = EXCLUDED.resolved_url,
+                    page_last_updated = EXCLUDED.page_last_updated,
+                    fetched_at = EXCLUDED.fetched_at,
+                    last_verified_at = EXCLUDED.last_verified_at,
+                    last_changed_at = EXCLUDED.last_changed_at,
+                    last_success_at = EXCLUDED.last_success_at,
+                    change_count = 0,
+                    consecutive_failures = 0,
+                    last_error = NULL,
+                    last_http_status = NULL,
+                    status = 'ok'
+                """,
+                (source_url, page_last_updated, fetched_at, fetched_at, fetched_at, fetched_at),
+            )
             await cur.execute("DELETE FROM documents WHERE source_url = %s", (source_url,))
             await cur.execute(
                 """
                 INSERT INTO documents
-                    (content, source_url, resolved_url, section_heading, heading_level,
-                     page_last_updated, rule_effective_date, fetched_at, last_verified_at,
-                     embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (content, source_url, section_heading, heading_level,
+                     rule_effective_date, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
                     content,
                     source_url,
-                    None,
                     heading,
                     2,
-                    page_last_updated,
                     None,
-                    fetched_at,
-                    fetched_at,
                     Vector([0.0] * 768),
                 ),
             )
@@ -542,8 +568,13 @@ async def _insert_test_row(
 
 
 async def _delete_test_rows(conn: psycopg.AsyncConnection, *source_urls: str) -> None:
+    """Deletes both `documents` rows and their `sources` row -- in that order, since the FK
+    (ON DELETE RESTRICT) forbids removing a `sources` row while any `documents` row still
+    references it.
+    """
     async with conn.cursor() as cur:
         await cur.execute("DELETE FROM documents WHERE source_url = ANY(%s)", (list(source_urls),))
+        await cur.execute("DELETE FROM sources WHERE source_url = ANY(%s)", (list(source_urls),))
     await conn.commit()
 
 
@@ -565,18 +596,33 @@ async def test_touch_last_verified_moves_last_verified_and_leaves_everything_els
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT id, content, fetched_at, last_verified_at, page_last_updated, "
-            "rule_effective_date FROM documents WHERE source_url = %s",
+            "SELECT id, content, rule_effective_date FROM documents WHERE source_url = %s",
             (source_url,),
         )
         row = await cur.fetchone()
 
     assert row["id"] == row_id
     assert row["content"] == "old content"
-    assert row["fetched_at"] == old_time
-    assert row["page_last_updated"] == old_page_last_updated
-    assert row["last_verified_at"] == new_now
     assert row["rule_effective_date"] == new_rule_effective_date
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fetched_at, last_verified_at, page_last_updated, last_success_at, "
+            "consecutive_failures, last_error, last_http_status, status "
+            "FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        source_row = await cur.fetchone()
+
+    # fetched_at/page_last_updated never move -- touch_last_verified is bookkeeping only.
+    assert source_row["fetched_at"] == old_time
+    assert source_row["page_last_updated"] == old_page_last_updated
+    assert source_row["last_verified_at"] == new_now
+    assert source_row["last_success_at"] == new_now
+    assert source_row["consecutive_failures"] == 0
+    assert source_row["last_error"] is None
+    assert source_row["last_http_status"] is None
+    assert source_row["status"] == "ok"
 
     await _delete_test_rows(conn, source_url)
 
@@ -626,8 +672,8 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT id, section_heading, fetched_at, last_verified_at, page_last_updated, "
-            "rule_effective_date FROM documents WHERE source_url = %s",
+            "SELECT id, section_heading, rule_effective_date FROM documents "
+            "WHERE source_url = %s",
             (source_url,),
         )
         rows = await cur.fetchall()
@@ -636,20 +682,406 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
     new_row = rows[0]
     assert new_row["id"] != old_row_id
     assert new_row["section_heading"] == "New Heading"
-    assert new_row["fetched_at"] == new_now
-    assert new_row["last_verified_at"] == new_now
-    assert new_row["page_last_updated"] == new_page_last_updated
     assert new_row["rule_effective_date"] == new_rule_effective_date
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT id, fetched_at FROM documents WHERE source_url = %s", (other_source_url,)
+            "SELECT fetched_at, last_verified_at, page_last_updated, last_changed_at, "
+            "change_count FROM sources WHERE source_url = %s",
+            (source_url,),
         )
+        source_row = await cur.fetchone()
+    assert source_row["fetched_at"] == new_now
+    assert source_row["last_verified_at"] == new_now
+    assert source_row["page_last_updated"] == new_page_last_updated
+    # reindex_source always passes mark_changed=True -- last_changed_at/change_count must move.
+    assert source_row["last_changed_at"] == new_now
+    assert source_row["change_count"] == 1
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT id FROM documents WHERE source_url = %s", (other_source_url,))
         other_row = await cur.fetchone()
     assert other_row["id"] == other_row_id
-    assert other_row["fetched_at"] == old_time
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fetched_at FROM sources WHERE source_url = %s", (other_source_url,)
+        )
+        other_source_row = await cur.fetchone()
+    assert other_source_row["fetched_at"] == old_time
 
     await _delete_test_rows(conn, source_url, other_source_url)
+
+
+# =================================================================================================
+# PHASE 7: the `sources` normalization invariant -- proven three ways (behavioral, schema, and a
+# static source-guard), plus record_source_failure's own never-advance-the-clock guarantee.
+# =================================================================================================
+
+
+class _RaisingEmbedder:
+    async def embed(self, texts):
+        del texts
+        raise RuntimeError("simulated embedder failure")
+
+
+async def test_reindex_source_embedder_failure_leaves_existing_chunks_intact(conn):
+    """DoD 1(a), BEHAVIORAL: a reindex_source call whose embedder raises must never leave a source
+    half-migrated -- the pre-existing chunks must survive, unchanged, by id. This asserts the
+    OBSERVABLE outcome (a fresh read from the database, not a claim about how the implementation
+    gets there), so it stays true even if a future refactor changes exactly where inside
+    `_embed_and_store` the embedder is called relative to the transaction.
+
+    LIMITATION, stated plainly rather than glossed over: `_embed_and_store` calls
+    `embedder.embed(texts)` BEFORE `async with conn.transaction():` opens, so this specific failure
+    never reaches the DELETE at all -- it is a fine regression test for "an embedder error must
+    never corrupt a source," but it does NOT exercise a real ROLLBACK, and would pass unchanged even
+    if the DELETE/INSERT were not transactional at all. The next test (
+    `test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_and_sources_upsert`) is
+    the one that actually proves the transaction rolls back: it fails INSIDE the transaction, after
+    the DELETE has already executed.
+    """
+    source_url = "https://example.gov/freshness-test-reindex-embedder-failure"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    old_row_id = await _insert_test_row(conn, source_url, fetched_at=old_time)
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id", (source_url,)
+        )
+        before_rows = await cur.fetchall()
+    assert [r["id"] for r in before_rows] == [old_row_id]
+
+    chunks = [
+        {
+            "heading": "New Heading",
+            "level": 2,
+            "parent": None,
+            "breadcrumb": "New Heading",
+            "text": "New Heading\n\nSome new content.",
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="simulated embedder failure"):
+        await reindex_source(
+            conn,
+            _RaisingEmbedder(),
+            source_url=source_url,
+            resolved_url=None,
+            page_last_updated=None,
+            rule_effective_date=None,
+            chunks=chunks,
+            now=datetime(2026, 9, 5, 12, 0, tzinfo=UTC),
+        )
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id", (source_url,)
+        )
+        after_rows = await cur.fetchall()
+    assert after_rows == before_rows
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT change_count FROM sources WHERE source_url = %s", (source_url,))
+        source_row = await cur.fetchone()
+    assert source_row["change_count"] == 0, "a failed reindex must never be recorded as a change"
+
+    await _delete_test_rows(conn, source_url)
+
+
+class _WrongDimensionEmbedder:
+    """Returns real vectors, but of the wrong dimension (3, not 768) -- `embed()` itself succeeds,
+    so `_embed_and_store` reaches its transaction, runs the `sources` upsert, runs the DELETE, and
+    only THEN fails, when Postgres rejects the mismatched vector on INSERT
+    (`psycopg.errors.DataException`, verified directly against a live pgvector column: "expected
+    768 dimensions, not 3"). This is what makes the test below a real proof of ROLLBACK, unlike
+    `test_reindex_source_embedder_failure_leaves_existing_chunks_intact` above.
+    """
+
+    async def embed(self, texts):
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+
+async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_and_sources_upsert(
+    conn,
+):
+    """DoD 1(a), the STRONGER proof: the failure happens INSIDE the transaction, after the DELETE
+    has already run against `documents` and after the `sources` upsert has already run -- so a
+    green result here actually exercises the ROLLBACK, not merely "nothing happened before the
+    transaction opened" (see the weaker test above). Asserts BOTH halves survive unchanged: the
+    pre-existing `documents` rows (by id and content) and the pre-existing `sources` row's fields
+    (fetched_at/last_verified_at/change_count) that the same transaction's upsert would otherwise
+    have overwritten.
+    """
+    source_url = "https://example.gov/freshness-test-reindex-wrong-dimension"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    old_row_id = await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+    )
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id", (source_url,)
+        )
+        before_rows = await cur.fetchall()
+    assert [r["id"] for r in before_rows] == [old_row_id]
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fetched_at, last_verified_at, page_last_updated, change_count "
+            "FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        before_source = await cur.fetchone()
+
+    chunks = [
+        {
+            "heading": "New Heading",
+            "level": 2,
+            "parent": None,
+            "breadcrumb": "New Heading",
+            "text": "New Heading\n\nSome new content.",
+        }
+    ]
+
+    with pytest.raises(psycopg.errors.DataException, match="768 dimensions"):
+        await reindex_source(
+            conn,
+            _WrongDimensionEmbedder(),
+            source_url=source_url,
+            resolved_url=None,
+            page_last_updated=date(2026, 9, 1),
+            rule_effective_date=None,
+            chunks=chunks,
+            now=datetime(2026, 9, 5, 12, 0, tzinfo=UTC),
+        )
+    await conn.rollback()
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id", (source_url,)
+        )
+        after_rows = await cur.fetchall()
+    assert after_rows == before_rows, "the DELETE that ran before the failed INSERT must roll back"
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fetched_at, last_verified_at, page_last_updated, change_count "
+            "FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        after_source = await cur.fetchone()
+    assert (
+        after_source == before_source
+    ), "the sources upsert that ran before the failed INSERT must roll back too"
+
+    await _delete_test_rows(conn, source_url)
+
+
+async def test_no_foreign_key_touching_documents_is_on_delete_cascade(conn):
+    """DoD 1(b), SCHEMA half: query pg_constraint directly for every foreign key that references
+    `documents` or is defined ON `documents`, and assert none of them is ON DELETE CASCADE
+    (confdeltype = 'c'). CASCADE would create exactly the path this phase exists to rule out:
+    deleting a `sources` row silently deleting every chunk that cites it, with nothing re-inserted
+    to replace them.
+    """
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("""
+            SELECT conname, confdeltype
+            FROM pg_constraint
+            WHERE contype = 'f'
+              AND (conrelid = 'documents'::regclass OR confrelid = 'documents'::regclass)
+            """)
+        rows = await cur.fetchall()
+
+    assert rows, "expected at least one foreign key referencing or defined on `documents`"
+    cascades = [r for r in rows if r["confdeltype"] == "c"]
+    assert cascades == [], f"found ON DELETE CASCADE foreign key(s) touching documents: {cascades}"
+
+
+async def test_deleting_a_sources_row_with_chunks_raises_foreign_key_violation(conn):
+    """DoD 1(b), BEHAVIORAL half: deleting a `sources` row that still has chunks referencing it
+    must raise a real ForeignKeyViolation, not silently cascade-delete those chunks.
+    """
+    source_url = "https://example.gov/freshness-test-fk-restrict"
+    await _insert_test_row(conn, source_url, fetched_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM sources WHERE source_url = %s", (source_url,))
+    await conn.rollback()
+
+    await _delete_test_rows(conn, source_url)
+
+
+_DESTRUCTIVE_DOCUMENTS_RE = re.compile(
+    r"\b(?:DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?(?:\s+ONLY)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?)"
+    r"\s+(?:\w+\.)?documents\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _find_dir_containing_app_package(start: Path) -> Path:
+    for candidate in (start, *start.parents):
+        if (candidate / "app" / "ingest.py").is_file():
+            return candidate
+    raise AssertionError(
+        "could not locate services/orchestrator/app by searching upward from this test file"
+    )
+
+
+def test_destructive_documents_statements_only_live_in_embed_and_store():
+    """DoD 1(c), SOURCE GUARD: scan every .py file under services/orchestrator/app/ for any
+    destructive statement against the `documents` table -- DELETE FROM documents, TRUNCATE
+    documents, DROP TABLE documents, case-insensitive, schema-qualified or not, with arbitrary
+    whitespace/newlines between tokens -- and assert every occurrence lives inside
+    app/ingest.py::_embed_and_store, the single call site that also performs the replacement INSERT
+    in the same transaction. Asserted BROADLY over the whole class of statements, and over every
+    file under app/ (via rglob, evaluated at test-run time), not just the one known statement in
+    ingest.py today -- this must fail the moment someone adds a DELETE/TRUNCATE/DROP against
+    `documents` anywhere else, including a new file that does not exist yet.
+    """
+    app_root = _find_dir_containing_app_package(Path(__file__).resolve()) / "app"
+    ingest_path = app_root / "ingest.py"
+
+    ingest_source = ingest_path.read_text(encoding="utf-8")
+    tree = ast.parse(ingest_source, filename=str(ingest_path))
+    embed_and_store_range: tuple[int, int] | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_embed_and_store":
+            embed_and_store_range = (node.lineno, node.end_lineno)
+            break
+    assert embed_and_store_range is not None, "could not locate _embed_and_store in app/ingest.py"
+    start_line, end_line = embed_and_store_range
+
+    violations: list[str] = []
+    total_matches = 0
+    for path in sorted(app_root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for match in _DESTRUCTIVE_DOCUMENTS_RE.finditer(text):
+            total_matches += 1
+            line_no = text.count("\n", 0, match.start()) + 1
+            if path != ingest_path or not (start_line <= line_no <= end_line):
+                violations.append(f"{path}:{line_no}: {match.group(0)!r}")
+
+    assert total_matches > 0, "the destructive-statement regex matched nothing at all in app/"
+    assert violations == [], (
+        "found a destructive statement against `documents` outside "
+        f"app/ingest.py::_embed_and_store: {violations}"
+    )
+
+
+async def test_record_source_failure_never_advances_verification_or_success_clocks(conn):
+    """DoD 2: record_source_failure must NEVER write last_verified_at/last_success_at/fetched_at/
+    last_changed_at/change_count -- a failing source's verification clock must not silently
+    advance. Captures every one of those columns before the call and asserts them byte-identical
+    after; asserts consecutive_failures/last_error/last_http_status/status DID move.
+    """
+    source_url = "https://example.gov/freshness-test-record-failure-clocks"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    await _insert_test_row(conn, source_url, fetched_at=old_time)
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fetched_at, last_verified_at, last_success_at, last_changed_at, "
+            "change_count FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        before = await cur.fetchone()
+
+    await record_source_failure(
+        conn,
+        source_url,
+        error="ConnectTimeout: timed out",
+        http_status=None,
+        status="fetch_failed",
+    )
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fetched_at, last_verified_at, last_success_at, last_changed_at, "
+            "change_count, consecutive_failures, last_error, last_http_status, status "
+            "FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        after = await cur.fetchone()
+
+    assert after["fetched_at"] == before["fetched_at"]
+    assert after["last_verified_at"] == before["last_verified_at"]
+    assert after["last_success_at"] == before["last_success_at"]
+    assert after["last_changed_at"] == before["last_changed_at"]
+    assert after["change_count"] == before["change_count"]
+
+    assert after["consecutive_failures"] == 1
+    assert after["last_error"] == "ConnectTimeout: timed out"
+    assert after["last_http_status"] is None
+    assert after["status"] == "fetch_failed"
+
+    await _delete_test_rows(conn, source_url)
+
+
+async def test_record_source_failure_robots_disallowed_does_not_increment_failures(conn):
+    """The other branch of record_source_failure: status="robots_disallowed" moves last_error/
+    status but deliberately does NOT increment consecutive_failures (a robots disallow is a
+    permanent curation condition, not a fetch failure to count)."""
+    source_url = "https://example.gov/freshness-test-record-failure-robots"
+    await _insert_test_row(conn, source_url, fetched_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+
+    await record_source_failure(
+        conn, source_url, error="robots_disallowed", http_status=None, status="robots_disallowed"
+    )
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT consecutive_failures, last_error, last_http_status, status "
+            "FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        row = await cur.fetchone()
+
+    assert row["consecutive_failures"] == 0
+    assert row["last_error"] == "robots_disallowed"
+    assert row["last_http_status"] is None
+    assert row["status"] == "robots_disallowed"
+
+    await _delete_test_rows(conn, source_url)
+
+
+# =================================================================================================
+# PHASE 7 pure: app/guardrails/freshness.py::source_health_state (no DB, no clock of its own)
+# =================================================================================================
+
+_HEALTH_NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("consecutive_failures", "status", "last_success_at", "expected"),
+    [
+        (0, "ok", _HEALTH_NOW, "ok"),
+        (2, "ok", _HEALTH_NOW, "ok"),  # boundary: 2 failures is still ok
+        (3, "ok", _HEALTH_NOW, "broken"),  # boundary: 3 failures is broken
+        (5, "ok", _HEALTH_NOW, "broken"),  # well past the threshold
+        (0, "robots_disallowed", _HEALTH_NOW, "broken"),  # permanent, immediate
+        (0, "ok", _HEALTH_NOW - timedelta(days=7), "ok"),  # boundary: exactly 7 days is still ok
+        (0, "ok", _HEALTH_NOW - timedelta(days=7, seconds=1), "broken"),  # just past 7 days
+        (0, "ok", _HEALTH_NOW - timedelta(days=30), "broken"),
+        (0, "ok", None, "broken"),  # never once succeeded
+    ],
+)
+def test_source_health_state_each_disjunct_and_boundary(
+    consecutive_failures, status, last_success_at, expected
+):
+    assert (
+        source_health_state(
+            consecutive_failures=consecutive_failures,
+            status=status,
+            last_success_at=last_success_at,
+            now=_HEALTH_NOW,
+            broken_after_failures=3,
+            broken_after_no_success_days=7,
+        )
+        == expected
+    )
 
 
 # =================================================================================================
@@ -1202,14 +1634,16 @@ async def test_graph_meaningful_change_reindexes_and_rewrites_the_snapshot(
     assert "24 months" not in new_snapshot_text
 
     async with conn.cursor(row_factory=dict_row) as cur:
-        await cur.execute(
-            "SELECT id, fetched_at FROM documents WHERE source_url = %s", (source_url,)
-        )
+        await cur.execute("SELECT id FROM documents WHERE source_url = %s", (source_url,))
         rows = await cur.fetchall()
 
     assert rows
     assert all(r["id"] != old_row_id for r in rows)
-    assert all(r["fetched_at"] > old_time for r in rows)
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT fetched_at FROM sources WHERE source_url = %s", (source_url,))
+        source_row = await cur.fetchone()
+    assert source_row["fetched_at"] > old_time
 
     await _delete_test_rows(conn, source_url)
 
@@ -1348,16 +1782,20 @@ async def test_graph_cosmetic_change_only_touches_last_verified(tmp_path, conn, 
     assert snapshot_path.read_bytes() == old_snapshot_bytes
 
     async with conn.cursor(row_factory=dict_row) as cur:
-        await cur.execute(
-            "SELECT id, fetched_at, last_verified_at FROM documents WHERE source_url = %s",
-            (source_url,),
-        )
+        await cur.execute("SELECT id FROM documents WHERE source_url = %s", (source_url,))
         rows = await cur.fetchall()
 
     assert len(rows) == 1
     assert rows[0]["id"] == old_row_id
-    assert rows[0]["fetched_at"] == old_time
-    assert rows[0]["last_verified_at"] > old_time
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fetched_at, last_verified_at FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        source_row = await cur.fetchone()
+    assert source_row["fetched_at"] == old_time
+    assert source_row["last_verified_at"] > old_time
 
     await _delete_test_rows(conn, source_url)
 
@@ -1584,3 +2022,166 @@ async def test_graph_resume_continues_mid_source_without_refetching(tmp_path, co
     assert rows
 
     await _delete_test_rows(conn, url)
+
+
+# =================================================================================================
+# PHASE 7 graph: robots_disallowed vs. a transient fetch error, and 404 vs. timeout. Each source
+# is pre-seeded via _insert_test_row (a real prior successful crawl) so record_source_failure has
+# a `sources` row to update -- the real production flow always ingests a source successfully at
+# least once (via `python -m app.ingest`) before the scheduled recrawl job's failure path can ever
+# run against it.
+# =================================================================================================
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_robots_disallowed_stops_at_one_attempt_and_does_not_count_as_a_failure(
+    tmp_path, conn, database_url
+):
+    """DoD 3: a fetcher signaling a robots.txt disallow (returns None) must stop at attempts == 1
+    (never retried, unlike a transient error), classify status == "robots_disallowed", and record
+    that in `sources` WITHOUT incrementing consecutive_failures.
+    """
+    source_url = "https://example.gov/freshness-graph-robots-disallowed"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    await _insert_test_row(conn, source_url, fetched_at=old_time)
+
+    async def robots_fetcher(entry):
+        del entry
+        return None
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Robots Page"}],
+        raw_dir=tmp_path,
+        run_id="test-run-robots-disallowed",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=robots_fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.attempts == 1, "a robots disallow must never be retried"
+    assert result.status == "robots_disallowed"
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT consecutive_failures, status FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        row = await cur.fetchone()
+    assert row["consecutive_failures"] == 0
+    assert row["status"] == "robots_disallowed"
+
+    await _delete_test_rows(conn, source_url)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_transient_fetch_error_retries_to_max_attempts_and_counts_as_a_failure(
+    tmp_path, conn, database_url
+):
+    """Contrast case for the test above: a transient exception (not a robots disallow) DOES retry
+    until max_attempts and DOES increment consecutive_failures.
+    """
+    source_url = "https://example.gov/freshness-graph-transient-fetch-error"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    await _insert_test_row(conn, source_url, fetched_at=old_time)
+
+    async def failing_fetcher(entry):
+        del entry
+        raise RuntimeError("simulated transient network failure")
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Transient Failure Page"}],
+        raw_dir=tmp_path,
+        run_id="test-run-transient-failure",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=failing_fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.attempts == 3
+    assert result.status == "fetch_failed"
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT consecutive_failures, status FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        row = await cur.fetchone()
+    assert row["consecutive_failures"] == 1
+    assert row["status"] == "fetch_failed"
+
+    await _delete_test_rows(conn, source_url)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_records_404_http_status_distinct_from_a_timeout(tmp_path, conn, database_url):
+    """DoD 4: a fetch failure carrying a real HTTP status (a 404, via httpx.HTTPStatusError) and
+    one that does not (a ConnectTimeout) must be distinguishable afterward: last_http_status is 404
+    in the first case and NULL in the second, and last_error differs.
+    """
+    url_404 = "https://example.gov/freshness-graph-404"
+    url_timeout = "https://example.gov/freshness-graph-timeout"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    await _insert_test_row(conn, url_404, fetched_at=old_time)
+    await _insert_test_row(conn, url_timeout, fetched_at=old_time, heading="Other Heading")
+
+    request_404 = httpx.Request("GET", url_404)
+    response_404 = httpx.Response(404, request=request_404)
+
+    async def fetcher(entry):
+        if entry["url"] == url_404:
+            raise httpx.HTTPStatusError("404 Not Found", request=request_404, response=response_404)
+        raise httpx.ConnectTimeout(
+            "connection timed out", request=httpx.Request("GET", url_timeout)
+        )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[
+            {"url": url_404, "topic": topic, "title": "404 Page"},
+            {"url": url_timeout, "topic": topic, "title": "Timeout Page"},
+        ],
+        raw_dir=tmp_path,
+        run_id="test-run-404-vs-timeout",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=1,
+        backoff_seconds=0,
+    )
+
+    by_url = {r.source_url: r for r in report.results}
+    assert by_url[url_404].status == "fetch_failed"
+    assert by_url[url_timeout].status == "fetch_failed"
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT source_url, last_http_status, last_error FROM sources "
+            "WHERE source_url = ANY(%s)",
+            ([url_404, url_timeout],),
+        )
+        rows = {r["source_url"]: r for r in await cur.fetchall()}
+
+    assert rows[url_404]["last_http_status"] == 404
+    assert rows[url_timeout]["last_http_status"] is None
+    assert rows[url_404]["last_error"] != rows[url_timeout]["last_error"]
+
+    await _delete_test_rows(conn, url_404, url_timeout)

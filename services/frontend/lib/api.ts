@@ -1,8 +1,16 @@
 // The only module in this app that talks to the backend. Every network call the frontend makes
 // goes through one of the two functions below.
+//
+// Phase 7: the browser talks to the Go gateway (services/gateway), never to the orchestrator
+// directly -- the gateway is what rate limits, redacts PII, and times upstream calls out (see
+// docs/adr/0007-go-python-split.md). Its routes are prefixed /v1 and it proxies POST /query as
+// POST /v1/query, POST /query/stream as POST /v1/query/stream, and GET /sources/status as
+// GET /v1/sources/status. NEXT_PUBLIC_ORCHESTRATOR_URL (the Phase 6 variable, pointed straight at
+// the orchestrator) is retired in favor of NEXT_PUBLIC_GATEWAY_URL -- keeping both would leave it
+// ambiguous which one a given request actually used, so this file reads only the new variable now.
 
-const ORCHESTRATOR_URL =
-  process.env.NEXT_PUBLIC_ORCHESTRATOR_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
+const GATEWAY_URL =
+  process.env.NEXT_PUBLIC_GATEWAY_URL?.replace(/\/$/, "") ?? "http://localhost:8080";
 
 export interface Citation {
   source_url: string;
@@ -62,6 +70,18 @@ export interface AnswerResponse {
 
 export type FreshnessState = "current" | "recent" | "stale" | "unknown";
 
+// app/schemas.py::BrokenSource (Phase 7). `status` is kept as `string`, not a literal union, for
+// the same forward-compatibility reason ResponseType above is: a value this frontend does not yet
+// know about must render as plain text, never crash.
+export interface BrokenSource {
+  source_url: string;
+  status: string;
+  consecutive_failures: number;
+  last_error: string | null;
+  last_http_status: number | null;
+  last_success_at: string | null;
+}
+
 export interface SourcesStatus {
   as_of: string;
   source_count: number;
@@ -70,6 +90,8 @@ export interface SourcesStatus {
   stale_source_count: number;
   age_hours: number | null;
   freshness_state: FreshnessState;
+  broken_source_count: number;
+  broken_sources: BrokenSource[];
 }
 
 export type StageName = "classify" | "retrieve" | "generate" | "verify";
@@ -97,7 +119,7 @@ export async function streamQuery(
   onEvent: (event: StageEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(`${ORCHESTRATOR_URL}/query/stream`, {
+  const response = await fetch(`${GATEWAY_URL}/v1/query/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ question }),
@@ -128,11 +150,11 @@ export async function streamQuery(
   }
 }
 
-/** GET /sources/status: the header's "live sources" trust indicator. */
+/** GET /v1/sources/status (via the gateway): the header's "live sources" trust indicator. */
 export async function getSourcesStatus(signal?: AbortSignal): Promise<SourcesStatus> {
-  const response = await fetch(`${ORCHESTRATOR_URL}/sources/status`, { signal });
+  const response = await fetch(`${GATEWAY_URL}/v1/sources/status`, { signal });
   if (!response.ok) {
-    throw new Error(`/sources/status returned HTTP ${response.status}`);
+    throw new Error(`/v1/sources/status returned HTTP ${response.status}`);
   }
   return (await response.json()) as SourcesStatus;
 }

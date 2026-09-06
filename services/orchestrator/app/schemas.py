@@ -136,24 +136,41 @@ class AnswerResponse(BaseModel):
     freshness: Freshness | None = None
 
 
-class SourcesStatus(BaseModel):
-    """GET /sources/status (Phase 6): the header's "live sources" trust indicator reads this
-    directly, so every field is computed from a real query against `documents` -- see app/main.py
-    -- never a claim the frontend infers or hardcodes on its own.
+class BrokenSource(BaseModel):
+    """One `sources` row app/guardrails/freshness.py::source_health_state has classified "broken"
+    (Phase 7) -- a source failing to fetch, or robots-disallowed, or with no successful crawl in too
+    long. Carries enough for the frontend to say something concrete without recomputing the rule
+    itself: which source, why (`status`), how many times running (`consecutive_failures`), what the
+    error was (`last_error`), what HTTP status it carried if any (`last_http_status`), and when it
+    last succeeded (`last_success_at`, `None` if it never has).
+    """
 
-    `oldest_verified_at`/`newest_verified_at` are the min/max, ACROSS SOURCES, of each distinct
-    source's own oldest `last_verified_at` (a per-source `GROUP BY` first, then an aggregate over
-    those per-source values) -- not a plain `min`/`max` over every row in `documents`, which would
-    let one just-re-crawled row disguise a corpus where other sources went unchecked for a week.
-    `stale_source_count` is how many distinct sources have their own oldest chunk verified more
-    than 24 hours ago. `freshness_state` and `age_hours` are
+    source_url: str
+    status: str
+    consecutive_failures: int
+    last_error: str | None
+    last_http_status: int | None
+    last_success_at: datetime | None
+
+
+class SourcesStatus(BaseModel):
+    """GET /sources/status (Phase 6, +Phase 7): the header's "live sources" trust indicator reads
+    this directly, so every field is computed from a real query against `sources` (Phase 7: one row
+    per source, not per chunk -- see app/main.py and infra/sql/init.sql) -- never a claim the
+    frontend infers or hardcodes on its own.
+
+    `oldest_verified_at`/`newest_verified_at` are the min/max, ACROSS SOURCES, of each source's own
+    `last_verified_at` -- not letting one just-re-crawled source disguise a corpus where other
+    sources went unchecked for a week. `stale_source_count` is how many distinct sources have their
+    own `last_verified_at` older than 24 hours. `freshness_state` and `age_hours` are
     app/guardrails/freshness.py::sources_freshness_state's verdict on `oldest_verified_at` -- the
     ONLY place that band decision is computed; the frontend renders it, never recomputes it.
 
-    This field set replaces a single `last_verified_at` (a plain `max()` over every row), which let
-    one freshly verified source claim "checked today" while the rest of the corpus was stale; it
-    had exactly one consumer (the header), changed in the same pass, so there is no reason to keep
-    a field that could disagree with the new ones.
+    `broken_source_count`/`broken_sources` (Phase 7) are a DIFFERENT signal from the freshness band
+    above: a source can be broken (failing to fetch, robots-disallowed, or long overdue for a
+    success) independently of whether the corpus as a whole reads "current"/"recent"/"stale".
+    Decided by app/guardrails/freshness.py::source_health_state per source, never recomputed by SQL
+    or by the frontend.
     """
 
     as_of: date
@@ -163,3 +180,5 @@ class SourcesStatus(BaseModel):
     stale_source_count: int
     age_hours: float | None
     freshness_state: Literal["current", "recent", "stale", "unknown"]
+    broken_source_count: int
+    broken_sources: list[BrokenSource]

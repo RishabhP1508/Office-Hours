@@ -174,6 +174,24 @@ class Settings(BaseSettings):
     REFRESH_MAX_FETCH_ATTEMPTS: int = 3
     REFRESH_RETRY_BACKOFF_SECONDS: float = 2.0
 
+    # Broken vs. merely overdue (Phase 7, app/guardrails/freshness.py::source_health_state). A
+    # source is BROKEN when consecutive_failures >= this, or status == 'robots_disallowed', or
+    # last_success_at is older than SOURCE_BROKEN_NO_SUCCESS_DAYS. Both numbers are derived from
+    # facts already fixed elsewhere, not invented for this check:
+    #
+    # - 3 consecutive failures: the refresh cron is daily (.github/workflows/recrawl.yml,
+    #   `17 8 * * *`), so three consecutive failures means three days running -- past where a
+    #   single transient network blip or one bad night explains it.
+    # - 7 days with no success: not a new number. It is exactly the existing "recent" -> "stale"
+    #   boundary sources_freshness_state already uses (168 hours), so the two signals agree with
+    #   each other instead of the codebase carrying two different staleness timescales that could
+    #   drift apart.
+    # - robots_disallowed is broken immediately, with no failure-count threshold at all: it is
+    #   permanent by nature (nothing about retrying makes a disallowed URL fetchable again), so
+    #   there is no count of attempts that would make it any less broken than the first one.
+    SOURCE_BROKEN_CONSECUTIVE_FAILURES: int = 3
+    SOURCE_BROKEN_NO_SUCCESS_DAYS: int = 7
+
     # CORS (Phase 6). The Next.js frontend (services/frontend) calls the orchestrator directly from
     # the browser -- the same path the Phase 7 Go gateway will later sit in front of -- so the
     # orchestrator has to answer the browser's preflight itself until then. Comma-separated list of

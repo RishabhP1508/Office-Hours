@@ -282,13 +282,19 @@ def _frontmatter_date_iso(frontmatter: dict, key: str) -> str | None:
 # ---------------------------------------------------------------------------------------------
 # DB bookkeeping. Importable without langgraph; each function takes a connection directly.
 #
-# WHY THE SPLIT: an unchanged or cosmetic re-crawl updates `last_verified_at` ONLY (via
-# touch_last_verified) -- this source was checked, right now, and nothing worth re-indexing
-# changed. A meaningful change updates `fetched_at` and `page_last_updated` too, and re-indexes
-# (via reindex_source). This is what keeps `fetched_at` honest: on a cosmetic change we
-# deliberately do NOT re-index, so the rows still hold exactly the content that was downloaded at
-# the older `fetched_at` -- the column keeps its Phase 0 meaning, "when the content in this row was
-# downloaded", rather than drifting to mean "when we last looked at this source".
+# WHY THE SPLIT: an unchanged or cosmetic re-crawl updates `sources.last_verified_at` (plus
+# `last_success_at`, and clears any prior failure bookkeeping) ONLY, via touch_last_verified --
+# this source was checked, right now, and nothing worth re-indexing changed. A meaningful change
+# updates `sources.fetched_at`/`page_last_updated` too, and re-indexes (via reindex_source, Phase 7:
+# both now live on `sources`, not on every chunk in `documents`, since Phase 7 normalized that
+# bookkeeping to one row per source -- see infra/sql/init.sql). This is what keeps `fetched_at`
+# honest: on a cosmetic change we deliberately do NOT re-index, so `sources.fetched_at` still holds
+# the time the content actually AT that fetched_at was downloaded -- the column keeps its Phase 0
+# meaning, "when the content currently indexed for this source was downloaded", rather than
+# drifting to mean "when we last looked at this source". A THIRD path, record_source_failure
+# (Phase 7, below), exists for when a re-crawl cannot even complete: it is the mirror image of this
+# comment's split -- it must advance NEITHER `last_verified_at` NOR `fetched_at`, because a failed
+# attempt checked nothing and fetched nothing.
 # ---------------------------------------------------------------------------------------------
 
 
@@ -299,21 +305,91 @@ async def touch_last_verified(
     now: datetime,
     rule_effective_date: date | None,
 ) -> int:
-    """Bookkeeping only: moves `last_verified_at` and syncs `rule_effective_date`. Never touches
-    `fetched_at`, `page_last_updated`, `content`, or `embedding` -- see the WHY THE SPLIT comment
-    above. `rule_effective_date` is synced here (even though nothing else changed) because it is a
-    curator annotation carried in the snapshot's own frontmatter, not fetched page content, so
-    keeping the table's copy current is bookkeeping in exactly the sense `last_verified_at` is.
-    Returns the number of rows updated.
+    """Bookkeeping only: moves `sources.last_verified_at` (and `last_success_at`, and clears any
+    prior failure bookkeeping -- a source that was previously failing but is now reachable again
+    and unchanged is exactly as healthy as one that never failed) and syncs
+    `documents.rule_effective_date`. Never touches `sources.fetched_at`/`page_last_updated`, or
+    `documents.content`/`embedding` -- see the WHY THE SPLIT comment above. `rule_effective_date` is
+    synced here (even though nothing else changed) because it is a curator annotation carried in
+    the snapshot's own frontmatter, not fetched page content, so keeping the table's copy current is
+    bookkeeping in exactly the sense `last_verified_at` is. Both writes happen in one transaction.
+    Returns the number of `documents` rows whose `rule_effective_date` was synced.
     """
     async with conn.transaction():
         async with conn.cursor() as cur:
             await cur.execute(
-                "UPDATE documents SET last_verified_at = %s, rule_effective_date = %s "
-                "WHERE source_url = %s",
-                (now, rule_effective_date, source_url),
+                """
+                UPDATE sources SET
+                    last_verified_at = %s,
+                    last_success_at = %s,
+                    consecutive_failures = 0,
+                    last_error = NULL,
+                    last_http_status = NULL,
+                    status = 'ok'
+                WHERE source_url = %s
+                """,
+                (now, now, source_url),
+            )
+            await cur.execute(
+                "UPDATE documents SET rule_effective_date = %s WHERE source_url = %s",
+                (rule_effective_date, source_url),
             )
             return cur.rowcount
+
+
+async def record_source_failure(
+    conn: psycopg.AsyncConnection,
+    source_url: str,
+    *,
+    error: str,
+    http_status: int | None,
+    status: str,
+) -> None:
+    """Phase 7: the failure-history write `documents` had no row to attach at all -- a source that
+    fails to fetch produces no new chunk, but it still has to be recorded somewhere so
+    GET /sources/status and app/guardrails/freshness.py::source_health_state can tell "broken" apart
+    from merely "not yet re-verified".
+
+    `status` is either `"fetch_failed"` (a transient condition: connection error, timeout, non-2xx
+    status -- `consecutive_failures` increments, since three of these in a row is what
+    `source_health_state` treats as broken) or `"robots_disallowed"` (robots.txt now disallows this
+    URL -- a permanent curation condition, not a fetch failure, so `consecutive_failures` is
+    deliberately left untouched; `source_health_state` treats ANY `robots_disallowed` status as
+    broken immediately, regardless of the failure count).
+
+    CRITICAL, and the entire reason this is a separate function from touch_last_verified/
+    reindex_source rather than a third branch bolted onto one of them: this must NEVER write
+    `last_verified_at`, `last_success_at`, `fetched_at`, `last_changed_at`, or `change_count`. A
+    failing source checked nothing and fetched nothing, so none of those clocks may advance -- this
+    is what lets the header's `min()`-based freshness indicator age on its own for a source stuck
+    failing, exactly the outcome ARCHITECTURE.md's freshness fields exist to make visible instead of
+    hidden by a bookkeeping update that looks like a successful check.
+    """
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            if status == "robots_disallowed":
+                await cur.execute(
+                    """
+                    UPDATE sources SET
+                        last_error = %s,
+                        last_http_status = NULL,
+                        status = 'robots_disallowed'
+                    WHERE source_url = %s
+                    """,
+                    (error, source_url),
+                )
+            else:
+                await cur.execute(
+                    """
+                    UPDATE sources SET
+                        consecutive_failures = consecutive_failures + 1,
+                        last_error = %s,
+                        last_http_status = %s,
+                        status = 'fetch_failed'
+                    WHERE source_url = %s
+                    """,
+                    (error, http_status, source_url),
+                )
 
 
 async def reindex_source(
@@ -332,8 +408,10 @@ async def reindex_source(
     re-fetched and re-checked right now) plus the new `page_last_updated`/`rule_effective_date`.
 
     Reuses app.ingest._embed_and_store instead of forking a second copy of the INSERT -- the same
-    delete-then-insert-in-one-transaction shape `python -m app.ingest` itself uses. Returns the
-    number of chunks written.
+    delete-then-insert-in-one-transaction shape `python -m app.ingest` itself uses. `mark_changed`
+    is always True here -- this function is only ever called on the meaningful-change path (see
+    `_after_diff`/`_reindex_node` below), so `sources.last_changed_at`/`change_count` must move.
+    Returns the number of chunks written.
     """
     await _embed_and_store(
         conn,
@@ -344,6 +422,7 @@ async def reindex_source(
         rule_effective_date=rule_effective_date,
         chunks=chunks,
         now=now,
+        mark_changed=True,
     )
     return len(chunks)
 
@@ -383,9 +462,12 @@ class RefreshState(TypedDict):
     run_id: str
     attempts: int
     max_attempts: int
-    status: str  # "pending" initially; terminal: unchanged | cosmetic | meaningful | fetch_failed
+    status: str  # "pending" initially; terminal: unchanged | cosmetic | meaningful | fetch_failed |
+    # robots_disallowed
     reason: str | None
     error: str | None
+    http_status: int | None  # the upstream HTTP status carried by the fetch failure, if any (a
+    # 404 carries one; a timeout does not -- see _fetch_node)
     resolved_url: str | None
     page_last_updated: str | None  # ISO date string, or None
     rule_effective_date: str | None  # ISO date string, or None
@@ -424,6 +506,7 @@ def _initial_state(entry: dict, run_id: str, max_attempts: int) -> RefreshState:
         "status": "pending",
         "reason": None,
         "error": None,
+        "http_status": None,
         "resolved_url": None,
         "page_last_updated": None,
         "rule_effective_date": None,
@@ -437,9 +520,17 @@ def _initial_state(entry: dict, run_id: str, max_attempts: int) -> RefreshState:
 
 
 async def _fetch_node(deps: RefreshDeps, state: RefreshState) -> dict:
-    """Fetch this source. Increments `attempts`; on any failure (the fetcher raised, or returned
-    None for a robots.txt disallow) sleeps `deps.backoff_seconds` -- a bounded backoff, never an
-    unbounded retry, since `_after_fetch` below stops retrying once `attempts >= max_attempts`.
+    """Fetch this source. Increments `attempts`; on a transient failure (the fetcher raised) sleeps
+    `deps.backoff_seconds` -- a bounded backoff, never an unbounded retry, since `_after_fetch`
+    below stops retrying once `attempts >= max_attempts`. A robots.txt disallow (the fetcher
+    returned None) is a permanent curation condition, not a transient one: there is no retry coming
+    for it (`_after_fetch` routes it straight to `record_failure`), so it never sleeps the backoff
+    either -- sleeping here would only delay a run that was never going to try again.
+
+    `http_status` captures the upstream HTTP status a failure carried, read off
+    `exc.response.status_code` when the exception has one (an `httpx.HTTPStatusError` from
+    `response.raise_for_status()` does; a timeout/connection error does not) -- `getattr(getattr(...
+    , None), ..., None)` so this never raises on an exception shaped without a `.response` at all.
     """
     attempts = state["attempts"] + 1
     entry = {"url": state["source_url"], "topic": state["topic"], "title": state.get("title")}
@@ -450,19 +541,20 @@ async def _fetch_node(deps: RefreshDeps, state: RefreshState) -> dict:
     except Exception as exc:  # noqa: BLE001 -- recorded on state; _after_fetch decides retry/fail
         if deps.backoff_seconds:
             await asyncio.sleep(deps.backoff_seconds)
+        http_status = getattr(getattr(exc, "response", None), "status_code", None)
         return {
             "attempts": attempts,
             "error": f"{type(exc).__name__}: {exc}",
+            "http_status": http_status,
             "body": None,
             "node_trail": trail,
         }
 
     if fetched is None:
-        if deps.backoff_seconds:
-            await asyncio.sleep(deps.backoff_seconds)
         return {
             "attempts": attempts,
             "error": "robots_disallowed",
+            "http_status": None,
             "body": None,
             "node_trail": trail,
         }
@@ -470,6 +562,7 @@ async def _fetch_node(deps: RefreshDeps, state: RefreshState) -> dict:
     return {
         "attempts": attempts,
         "error": None,
+        "http_status": None,
         "body": fetched.body_markdown,
         "resolved_url": fetched.resolved_url,
         "title": fetched.title,
@@ -484,6 +577,10 @@ async def _fetch_node(deps: RefreshDeps, state: RefreshState) -> dict:
 def _after_fetch(state: RefreshState) -> str:
     if state.get("body") is not None:
         return "diff"
+    if state.get("error") == "robots_disallowed":
+        # Permanent, not transient -- never retried, however low `attempts` is (it must be 1: a
+        # disallow is known on the very first fetch attempt).
+        return "record_failure"
     if state["attempts"] < state["max_attempts"]:
         return "fetch"
     return "record_failure"
@@ -637,11 +734,29 @@ async def _verify_only_node(deps: RefreshDeps, state: RefreshState) -> dict:
 
 
 async def _record_failure_node(deps: RefreshDeps, state: RefreshState) -> dict:
-    del deps
+    """Terminal failure path: `status` is `"robots_disallowed"` when that is exactly why fetching
+    stopped, `"fetch_failed"` otherwise (a transient error that exhausted `max_attempts`). Writes
+    the failure to `sources` via `record_source_failure` (skipped entirely in a dry run, per
+    `deps.dry_run` -- the same convention `_reindex_node`/`_verify_only_node` already follow).
+    """
     trail = [*state["node_trail"], "record_failure"]
+    error = state.get("error") or "max_attempts_exceeded"
+    is_robots_disallowed = state.get("error") == "robots_disallowed"
+    status = "robots_disallowed" if is_robots_disallowed else "fetch_failed"
+
+    if not deps.dry_run:
+        async with deps.conn_factory() as conn:
+            await record_source_failure(
+                conn,
+                state["source_url"],
+                error=error,
+                http_status=state.get("http_status"),
+                status=status,
+            )
+
     return {
-        "status": "fetch_failed",
-        "reason": state.get("error") or "max_attempts_exceeded",
+        "status": status,
+        "reason": error,
         "node_trail": trail,
     }
 
@@ -710,7 +825,9 @@ def build_refresh_graph(deps: RefreshDeps):
 # The driver and the report
 # ---------------------------------------------------------------------------------------------
 
-_TERMINAL_STATUSES = frozenset({"unchanged", "cosmetic", "meaningful", "fetch_failed"})
+_TERMINAL_STATUSES = frozenset(
+    {"unchanged", "cosmetic", "meaningful", "fetch_failed", "robots_disallowed"}
+)
 
 
 def _verdict_evidence(verdict: dict | None) -> dict:
