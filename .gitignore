@@ -45,3 +45,7 @@ Thumbs.db
 .idea/
 
 docs/design/
+
+.playwright-mcp/
+*.png
+!docs/**/*.png

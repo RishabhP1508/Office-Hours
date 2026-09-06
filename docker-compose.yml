@@ -66,5 +66,45 @@ services:
       - "4317:4317"
       - "4318:4318"
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Phase 7: the only thing the browser talks to from here on. Rate limits, redacts PII out of
+  # the request body, times upstream calls out, and propagates one trace across both services --
+  # see docs/adr/0007-go-python-split.md. The orchestrator's own CORS middleware is left in place
+  # (services/orchestrator/app/main.py) so a direct call (curl, a script) still works during
+  # development; this gateway answers the browser's preflight for its own /v1/* routes instead.
+  gateway:
+    build:
+      context: ./services/gateway
+    ports:
+      - "8080:8080"
+    environment:
+      GATEWAY_LISTEN_ADDR: ":8080"
+      ORCHESTRATOR_URL: "http://orchestrator:8000"
+      REDIS_URL: "redis://redis:6379"
+      RATE_LIMIT_BUCKET_CAPACITY: "${RATE_LIMIT_BUCKET_CAPACITY:-20}"
+      RATE_LIMIT_REFILL_PER_SECOND: "${RATE_LIMIT_REFILL_PER_SECOND:-1}"
+      UPSTREAM_TIMEOUT_SECONDS: "${UPSTREAM_TIMEOUT_SECONDS:-15}"
+      # Empty by default: nothing sits in front of this gateway in docker-compose (8080 is
+      # published directly), so X-Forwarded-For is ignored outright unless an operator sets this
+      # deliberately. See .env.example's own comment on TRUSTED_PROXY_CIDRS.
+      TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-}"
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-http://localhost:3000}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-lgtm:4318"
+      OTEL_SERVICE_NAME: "office-hours-gateway"
+    depends_on:
+      orchestrator:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
 volumes:
   pgdata:

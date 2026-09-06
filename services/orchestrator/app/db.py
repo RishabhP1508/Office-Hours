@@ -116,11 +116,18 @@ fused AS (
         kw.rank AS keyword_rank
     FROM semantic s FULL OUTER JOIN keyword kw ON s.id = kw.id
 )
-SELECT d.id, d.content, d.source_url, d.resolved_url, d.section_heading, d.heading_level,
-       d.page_last_updated, d.rule_effective_date, d.fetched_at, d.last_verified_at,
+-- Phase 7: resolved_url/page_last_updated/fetched_at/last_verified_at moved off `documents` onto
+-- `sources` (one row per source instead of one identical copy per chunk -- see infra/sql/init.sql).
+-- This join is the ONLY change this query makes for that move: the two CTEs and the FULL OUTER JOIN
+-- above are untouched, so RRF's ranking behavior is unaffected. Every distinct source_url in
+-- `documents` has a matching row in `sources` (the FK enforces it), so this is always effectively
+-- an inner join in practice -- but it stays a plain JOIN, not LEFT JOIN, precisely because the FK
+-- makes "no matching sources row" a schema violation, not a real case this query needs to tolerate.
+SELECT d.id, d.content, d.source_url, s.resolved_url, d.section_heading, d.heading_level,
+       s.page_last_updated, d.rule_effective_date, s.fetched_at, s.last_verified_at,
        d.embedding <=> %(embedding)s AS distance,
        f.rrf_score, f.semantic_rank, f.keyword_rank
-FROM fused f JOIN documents d ON d.id = f.id
+FROM fused f JOIN documents d ON d.id = f.id JOIN sources s ON s.source_url = d.source_url
 ORDER BY f.rrf_score DESC, d.id
 LIMIT %(k)s
 """

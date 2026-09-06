@@ -37,7 +37,7 @@ questions.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from app.db import RetrievedChunk
@@ -78,6 +78,49 @@ def sources_freshness_state(
     if age_hours <= 168:
         return "recent", age_hours
     return "stale", age_hours
+
+
+def source_health_state(
+    *,
+    consecutive_failures: int,
+    status: str,
+    last_success_at: datetime | None,
+    now: datetime,
+    broken_after_failures: int,
+    broken_after_no_success_days: int,
+) -> Literal["ok", "broken"]:
+    """Phase 7: the "broken" verdict GET /sources/status reports per source, alongside (not instead
+    of) the crawl-freshness band `sources_freshness_state` above already computes for the whole
+    corpus. Pure -- no DB, no clock of its own, no import of app.config -- so the threshold values
+    are passed in as plain arguments (Settings.SOURCE_BROKEN_CONSECUTIVE_FAILURES/
+    SOURCE_BROKEN_NO_SUCCESS_DAYS) rather than read from settings here, the same shape
+    `sources_freshness_state` already follows for `now`. The frontend must never recompute this
+    rule, the same way it never recomputes the freshness band: it renders app/main.py's verdict.
+
+    BROKEN when ANY of:
+      - consecutive_failures >= broken_after_failures (three daily cron ticks running -- see
+        app/config.py's comment on SOURCE_BROKEN_CONSECUTIVE_FAILURES for why three), or
+      - status == "robots_disallowed" (permanent by nature: nothing about retrying makes a
+        disallowed URL fetchable again, so this is broken on the very first occurrence, with no
+        failure-count threshold at all), or
+      - last_success_at is more than broken_after_no_success_days old, OR last_success_at is None
+        (a source that has never once succeeded is unambiguously broken, not merely "unknown" --
+        there is no successful check to measure an age from).
+
+    Otherwise "ok". `consecutive_failures < broken_after_failures` at the exact boundary reads
+    "ok" (e.g. 2 failures with a threshold of 3): only reaching the threshold, not approaching it,
+    counts as broken.
+    """
+    if status == "robots_disallowed":
+        return "broken"
+    if consecutive_failures >= broken_after_failures:
+        return "broken"
+    if last_success_at is None:
+        return "broken"
+    age = now - last_success_at
+    if age > timedelta(days=broken_after_no_success_days):
+        return "broken"
+    return "ok"
 
 
 def _format_date(value: date) -> str:

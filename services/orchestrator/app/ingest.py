@@ -580,6 +580,7 @@ async def _embed_and_store(
     chunks: list[dict],
     rule_effective_date: date | None = None,
     now: datetime | None = None,
+    mark_changed: bool = False,
 ) -> None:
     """`rule_effective_date` is the curator annotation carried in a snapshot's own frontmatter
     (e.g. `rule_effective_date: 2026-09-15` on both fixed_admission snapshots), never computed here
@@ -587,6 +588,18 @@ async def _embed_and_store(
     is an explicit parameter so app/recrawl.py::reindex_source (Phase 5) can pass one `now` value
     for both `fetched_at` and `last_verified_at`, deterministically, instead of two separate calls
     to datetime.now(UTC) that could disagree by a few microseconds.
+
+    Phase 7: `documents.source_url` is a foreign key into `sources`, so that row has to exist
+    before any chunk referencing it can be inserted -- the upsert below runs FIRST, inside the same
+    transaction as the delete-then-insert of this source's chunks, so a killed/rolled-back run never
+    leaves a chunk pointing at a `sources` row that was never committed (and never leaves a
+    `sources` row upserted without its chunks, either -- the whole thing is one transaction).
+
+    `mark_changed` is False for every ordinary ingest/verify-only call (a first-time ingest, or a
+    re-embed of an unchanged page): `last_changed_at`/`change_count` should move only when a
+    re-crawl found the content actually different, which is exactly what
+    app/recrawl.py::reindex_source (the only caller that ever re-runs this for a source already in
+    `sources`) sets it True for.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -595,26 +608,59 @@ async def _embed_and_store(
 
     async with conn.transaction():
         async with conn.cursor() as cur:
+            # ONE upsert statement, not two near-identical copies differing only in the
+            # mark_changed branch: `last_changed_at`/`change_count` are the only fields whose
+            # values actually depend on `mark_changed`, so that dependency is expressed as a SQL
+            # CASE inline rather than as two statements that could drift out of sync with each
+            # other over time -- this function is the single place that owns the delete-and-replace
+            # invariant, so it should not itself carry a copy-paste risk.
+            await cur.execute(
+                """
+                INSERT INTO sources
+                    (source_url, resolved_url, page_last_updated, fetched_at, last_verified_at,
+                     last_changed_at, last_success_at, change_count, consecutive_failures,
+                     last_error, last_http_status, status)
+                VALUES (%(source_url)s, %(resolved_url)s, %(page_last_updated)s, %(now)s, %(now)s,
+                        %(now)s, %(now)s, 0, 0, NULL, NULL, 'ok')
+                ON CONFLICT (source_url) DO UPDATE SET
+                    resolved_url = EXCLUDED.resolved_url,
+                    page_last_updated = EXCLUDED.page_last_updated,
+                    fetched_at = EXCLUDED.fetched_at,
+                    last_verified_at = EXCLUDED.last_verified_at,
+                    last_success_at = EXCLUDED.last_success_at,
+                    status = 'ok',
+                    consecutive_failures = 0,
+                    last_error = NULL,
+                    last_http_status = NULL,
+                    last_changed_at = CASE WHEN %(mark_changed)s THEN EXCLUDED.last_changed_at
+                                            ELSE sources.last_changed_at END,
+                    change_count = sources.change_count
+                        + CASE WHEN %(mark_changed)s THEN 1 ELSE 0 END
+                """,
+                {
+                    "source_url": source_url,
+                    "resolved_url": resolved_url,
+                    "page_last_updated": page_last_updated,
+                    "now": now,
+                    "mark_changed": mark_changed,
+                },
+            )
+
             await cur.execute("DELETE FROM documents WHERE source_url = %s", (source_url,))
             for chunk, vector in zip(chunks, vectors, strict=True):
                 await cur.execute(
                     """
                     INSERT INTO documents
-                        (content, source_url, resolved_url, section_heading, heading_level,
-                         page_last_updated, rule_effective_date, fetched_at, last_verified_at,
-                         embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (content, source_url, section_heading, heading_level,
+                         rule_effective_date, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (
                         chunk["text"],
                         source_url,
-                        resolved_url,
                         chunk["heading"],
                         chunk["level"],
-                        page_last_updated,
                         rule_effective_date,
-                        now,
-                        now,
                         Vector(vector),
                     ),
                 )

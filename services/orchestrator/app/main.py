@@ -15,11 +15,11 @@ from starlette.responses import StreamingResponse
 
 from app.config import get_settings
 from app.db import make_pool
-from app.guardrails.freshness import sources_freshness_state
+from app.guardrails.freshness import source_health_state, sources_freshness_state
 from app.pipeline import answer_question
 from app.providers.embeddings import get_embedder
 from app.providers.llm import get_llm
-from app.schemas import AnswerResponse, QueryRequest, SourcesStatus
+from app.schemas import AnswerResponse, BrokenSource, QueryRequest, SourcesStatus
 from app.telemetry import setup_telemetry
 
 logger = logging.getLogger(__name__)
@@ -147,33 +147,69 @@ async def query_stream(request: QueryRequest) -> StreamingResponse:
 
 @app.get("/sources/status", response_model=SourcesStatus)
 async def sources_status() -> SourcesStatus:
-    """The header's "live sources" trust indicator reads this. Computed with a real per-source
-    aggregation against `documents` -- never a hardcoded or cached claim, and never a plain
-    `max(last_verified_at)` over every row, which would let one freshly re-crawled source claim
+    """The header's "live sources" trust indicator reads this. Phase 7: reads `sources` directly (14
+    rows, one per manifest entry) instead of aggregating over `documents` (221 chunks) -- the
+    per-source crawl bookkeeping that used to be duplicated on every chunk now lives on exactly one
+    row per source, so there is nothing left to GROUP BY. Never a hardcoded or cached claim, and
+    never a plain `max(last_verified_at)`, which would let one freshly re-crawled source claim
     "checked today" while the rest of the corpus sat stale (see app/schemas.py::SourcesStatus).
 
-    The subquery groups by `source_url` first (one row per distinct source, each with its OWN
-    oldest/newest `last_verified_at`), then the outer query aggregates ACROSS those per-source
-    rows: `min(oldest)` is the weakest link across every source, `max(newest)` the freshest, and
-    the FILTER counts how many distinct sources have their own oldest chunk verified more than 24
-    hours ago. `sources_freshness_state` (app/guardrails/freshness.py) is the one place that turns
-    `min(oldest)`'s age into the "current"/"recent"/"stale"/"unknown" band the frontend renders.
+    `min`/`max(last_verified_at)` across all `sources` rows are the weakest/freshest link;
+    `sources_freshness_state` (app/guardrails/freshness.py) turns the weakest link's age into the
+    "current"/"recent"/"stale"/"unknown" band the frontend renders. `source_health_state` (same
+    module) makes the SEPARATE broken-vs-ok call per source -- never duplicated here as SQL -- and
+    every broken row is reported in full via `BrokenSource` so the frontend can say something
+    concrete without recomputing the rule itself.
     """
+    now = datetime.now(UTC)
     async with app.state.pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("""
-                SELECT count(*), min(oldest), max(newest),
-                       count(*) FILTER (WHERE oldest < now() - interval '24 hours')
-                FROM (SELECT source_url,
-                             min(last_verified_at) AS oldest,
-                             max(last_verified_at) AS newest
-                      FROM documents GROUP BY source_url) s
+                SELECT count(*), min(last_verified_at), max(last_verified_at),
+                       count(*) FILTER (WHERE last_verified_at < now() - interval '24 hours')
+                FROM sources
                 """)
             source_count, oldest_verified_at, newest_verified_at, stale_source_count = (
                 await cur.fetchone()
             )
-    now = datetime.now(UTC)
+            await cur.execute("""
+                SELECT source_url, status, consecutive_failures, last_error, last_http_status,
+                       last_success_at
+                FROM sources
+                """)
+            rows = await cur.fetchall()
+
     freshness_state, age_hours = sources_freshness_state(oldest_verified_at, now)
+
+    broken_sources = []
+    for (
+        source_url,
+        status,
+        consecutive_failures,
+        last_error,
+        last_http_status,
+        last_success_at,
+    ) in rows:
+        health = source_health_state(
+            consecutive_failures=consecutive_failures,
+            status=status,
+            last_success_at=last_success_at,
+            now=now,
+            broken_after_failures=app.state.settings.SOURCE_BROKEN_CONSECUTIVE_FAILURES,
+            broken_after_no_success_days=app.state.settings.SOURCE_BROKEN_NO_SUCCESS_DAYS,
+        )
+        if health == "broken":
+            broken_sources.append(
+                BrokenSource(
+                    source_url=source_url,
+                    status=status,
+                    consecutive_failures=consecutive_failures,
+                    last_error=last_error,
+                    last_http_status=last_http_status,
+                    last_success_at=last_success_at,
+                )
+            )
+
     return SourcesStatus(
         as_of=now.date(),
         source_count=source_count,
@@ -182,4 +218,6 @@ async def sources_status() -> SourcesStatus:
         stale_source_count=stale_source_count,
         age_hours=age_hours,
         freshness_state=freshness_state,
+        broken_source_count=len(broken_sources),
+        broken_sources=broken_sources,
     )

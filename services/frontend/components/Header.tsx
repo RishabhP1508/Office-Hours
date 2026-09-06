@@ -48,6 +48,49 @@ function freshnessDisplay(status: SourcesStatus): FreshnessDisplay | null {
   }
 }
 
+/** The broken-source indicator (Phase 7): a source failing to fetch, robots-disallowed, or long
+ * overdue for a success (app/guardrails/freshness.py::source_health_state -- decided entirely on
+ * the backend; this function only renders `broken_source_count`/`broken_sources`, never
+ * recomputes the rule). Renders with `showDot: false`, the same shape the "stale" freshness band
+ * already uses -- no saffron dot (a dot reads as an all-clear, exactly wrong here) and no third hue
+ * introduced beyond the two Phase 6 fixed: this reuses the same neutral text-only rendering,
+ * distinguished from "stale" by its wording alone. Takes precedence over `freshnessDisplay` below
+ * (see the `display` computation): a source actually failing is a stronger, more informative
+ * statement than "the corpus as a whole is N days old". */
+function brokenDisplay(status: SourcesStatus): FreshnessDisplay | null {
+  if (status.broken_source_count <= 0) return null;
+
+  const total = status.source_count;
+  const count = status.broken_source_count;
+  const noun = total === 1 ? "source" : "sources";
+
+  const successDates = status.broken_sources
+    .map((s) => s.last_success_at)
+    .filter((d): d is string => d !== null);
+  // A source that has never once succeeded has no date to report at all -- its presence forces
+  // the "no date" wording regardless of what any other broken source's own last_success_at says.
+  const hasNeverSucceeded = status.broken_sources.some((s) => s.last_success_at === null);
+
+  if (hasNeverSucceeded || successDates.length === 0) {
+    return {
+      label: `${count} of ${total} ${noun} not reachable`,
+      terseLabel: `${count}/${total} unreachable`,
+      showDot: false,
+    };
+  }
+
+  // The weakest link: the OLDEST last_success_at across every broken source, the same "report the
+  // least favorable fact, not the most" principle sources_freshness_state already applies to
+  // oldest_verified_at above.
+  const oldest = successDates.reduce((min, d) => (d < min ? d : min));
+  const date = formatDayMonthYear(oldest);
+  return {
+    label: `${count} of ${total} ${noun} not reachable since ${date}`,
+    terseLabel: `${count}/${total} unreachable`,
+    showDot: false,
+  };
+}
+
 /** The header band: a sticky slim top row (wordmark, "Unofficial" tag, live sources indicator)
  * plus the standing disclaimer band underneath, which is NOT sticky and scrolls away normally. The
  * indicator's text is read from GET /sources/status -- it must never display a claim the database
@@ -64,7 +107,9 @@ export default function Header() {
     return () => controller.abort();
   }, []);
 
-  const display = status ? freshnessDisplay(status) : null;
+  // Broken takes precedence over the age label when both apply -- it is the more urgent and
+  // strictly more informative statement (see brokenDisplay's own docstring).
+  const display = status ? (brokenDisplay(status) ?? freshnessDisplay(status)) : null;
 
   return (
     <>
