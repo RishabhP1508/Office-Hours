@@ -11,25 +11,43 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import eval.run as run
 
 
-def test_classify_refusal_ci_detects_refusal_phrasing():
-    answer = (
-        "Talk to your designated school official (DSO) or a licensed immigration attorney about "
-        "your specific situation."
-    )
-    assert run.classify_refusal_ci(answer) == "REFUSAL"
+@pytest.mark.parametrize(
+    ("response_type", "expected"),
+    [
+        ("answer", "ANSWER"),
+        ("refusal_advice", "REFUSAL"),
+        ("clarify", "REFUSAL"),
+        ("no_answer", "REFUSAL"),
+        ("blocked_unverified", "REFUSAL"),
+    ],
+)
+def test_classify_refusal_structured_maps_every_response_type(response_type, expected):
+    """Every app/schemas.py::ResponseType member maps to exactly one of REFUSAL/ANSWER -- see
+    _RESPONSE_TYPE_TO_REFUSAL's own comment in eval/run.py for why the four non-ANSWER types all
+    collapse to REFUSAL and what that collapse costs.
+    """
+    assert run.classify_refusal_structured(response_type) == expected
 
 
-def test_classify_refusal_ci_defaults_to_answer_for_plain_factual_text():
-    answer = "The STEM OPT extension is 24 months, added on top of the initial 12-month period."
-    assert run.classify_refusal_ci(answer) == "ANSWER"
+def test_classify_refusal_structured_rejects_an_unknown_response_type():
+    """A response_type outside the five known members must raise, never default to ANSWER or
+    silently pass through -- see UnknownResponseTypeError's own docstring.
+    """
+    with pytest.raises(run.UnknownResponseTypeError):
+        run.classify_refusal_structured("some_future_value_this_eval_does_not_know_about")
 
 
-def test_classify_refusal_ci_is_case_insensitive():
-    answer = "LICENSED IMMIGRATION ATTORNEY can advise you on that."
-    assert run.classify_refusal_ci(answer) == "REFUSAL"
+def test_classify_refusal_structured_rejects_a_missing_response_type():
+    """A `None` response_type (a /query response with no response_type field at all, e.g. from an
+    orchestrator that predates Phase 4) must raise, never default to ANSWER.
+    """
+    with pytest.raises(run.UnknownResponseTypeError):
+        run.classify_refusal_structured(None)
 
 
 def test_compare_to_baseline_higher_is_better_pass():
@@ -110,29 +128,29 @@ def test_ci_baseline_gate_metrics_have_no_overlap_with_skipped_metrics():
     assert set(run.CI_BASELINE_GATE) & set(run.CI_SKIPPED_METRICS) == set()
 
 
-def test_refusal_rates_are_reported_stub_derived_not_gated():
-    """false_refusal_rate and advice_leakage_rate must never be in CI_BASELINE_GATE: in CI mode
-    they measure whether StubLLM's own advice-detection patterns agree with the golden set's
-    is_advice label, not the real system's refusal quality, so gating on them would reward tuning
-    the stub to match the label rather than measuring anything real. See CI_BASELINE_GATE's own
-    comment and docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md.
+def test_refusal_rates_are_gated_in_ci_mode():
+    """false_refusal_rate and advice_leakage_rate ARE in CI_BASELINE_GATE as of Phase 4 step 3: the
+    classification underlying them now comes from app/guardrails/classifier.py's rule layer (real
+    production code, read through the response's structured response_type field), not from a
+    stub-only heuristic tuned to agree with the golden set's is_advice label -- the tautology that
+    used to make gating them meaningless is gone. See CI_BASELINE_GATE's own comment and
+    docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md's "Superseded" section.
     """
-    assert "false_refusal_rate" not in run.CI_BASELINE_GATE
-    assert "advice_leakage_rate" not in run.CI_BASELINE_GATE
-    assert "false_refusal_rate" in run.CI_STUB_DERIVED_REPORTED_METRICS
-    assert "advice_leakage_rate" in run.CI_STUB_DERIVED_REPORTED_METRICS
+    expected_spec = {"higher_is_better": False, "tolerance": 0}
+    assert "false_refusal_rate" in run.CI_BASELINE_GATE
+    assert "advice_leakage_rate" in run.CI_BASELINE_GATE
+    assert run.CI_BASELINE_GATE["false_refusal_rate"] == expected_spec
+    assert run.CI_BASELINE_GATE["advice_leakage_rate"] == expected_spec
 
 
-def test_refusal_bookkeeping_gate_has_no_overlap_with_anything_else():
-    """The bookkeeping gate (denominators + classification coverage) stands in for the rate values
-    above; it must never double up with CI_BASELINE_GATE, CI_SKIPPED_METRICS, or
-    CI_STUB_DERIVED_REPORTED_METRICS, which would make a single check's PASS/FAIL ambiguous about
-    what actually failed.
+def test_refusal_bookkeeping_gate_has_no_overlap_with_skipped_metrics():
+    """The bookkeeping gate (denominators + classification coverage) is gated ALONGSIDE
+    CI_BASELINE_GATE now (both false_refusal_rate/advice_leakage_rate and the bookkeeping counts are
+    gated), so the only overlap that would make a single check's PASS/FAIL ambiguous is with
+    CI_SKIPPED_METRICS (metrics CI mode never computes at all).
     """
     bookkeeping = set(run.CI_REFUSAL_BOOKKEEPING_GATE)
-    assert bookkeeping & set(run.CI_BASELINE_GATE) == set()
     assert bookkeeping & set(run.CI_SKIPPED_METRICS) == set()
-    assert bookkeeping & set(run.CI_STUB_DERIVED_REPORTED_METRICS) == set()
     assert bookkeeping == {"non_advice_scored_count", "advice_scored_count", "unclassified_rows"}
 
 

@@ -12,7 +12,7 @@ import pytest
 from app.config import Settings
 from app.prompts import SYSTEM_PROMPT, build_user_prompt
 from app.providers.embeddings import StubEmbedder, get_embedder
-from app.providers.llm import _STUB_ADVICE_PATTERNS, StubLLM, get_llm
+from app.providers.llm import StubLLM, get_llm
 
 
 def _user_prompt(question: str, num_chunks: int) -> str:
@@ -59,28 +59,13 @@ async def test_stub_llm_never_cites_when_no_context_was_retrieved():
 
 
 @pytest.mark.asyncio
-async def test_stub_llm_refuses_advice_seeking_questions():
-    llm = StubLLM()
-    user = _user_prompt("Should I use OPT now or save it for after I graduate?", num_chunks=3)
-    answer = await llm.generate(SYSTEM_PROMPT, user)
-    assert "designated school official" in answer.lower()
-    assert "licensed immigration attorney" in answer.lower()
-
-
-@pytest.mark.asyncio
-async def test_stub_llm_does_not_refuse_factual_questions():
-    llm = StubLLM()
-    user = _user_prompt("How long is the STEM OPT extension?", num_chunks=3)
-    answer = await llm.generate(SYSTEM_PROMPT, user)
-    assert "designated school official" not in answer.lower()
-
-
-@pytest.mark.asyncio
-async def test_stub_llm_refusal_decision_ignores_everything_but_the_question_text():
-    """The stub must never see the golden set's is_advice label -- generate()'s signature only
-    ever takes (system, user) strings, so the only way it could behave differently for two calls
-    with the same question is if it looked outside those two strings. Passing a different
-    `system` prompt for the same `user` prompt must not change the outcome.
+async def test_stub_llm_output_does_not_depend_on_the_system_prompt():
+    """StubLLM's own docstring says its behavior depends only on `user`, never `system` -- this
+    used to specifically be about the (now-removed) advice-refusal branch, which was the one place
+    a different `system` could plausibly have changed the output. That branch is gone (the advice
+    decision now belongs to app/guardrails/classifier.py, run before the generator is ever called --
+    see app/pipeline.py), so this only checks the general invariant now: passing a completely
+    different `system` string for the same `user` prompt must not change the output.
     """
     llm = StubLLM()
     user = _user_prompt("Should I use OPT now or save it for after I graduate?", num_chunks=2)
@@ -138,24 +123,9 @@ def test_get_embedder_dispatches_stub_provider():
     assert embedder._dim == 16
 
 
-def test_stub_advice_patterns_never_match_exactly_one_golden_row():
-    """A pattern that fires on exactly one row of eval/golden.jsonl makes that one row's refusal
-    classification a tautology (the pattern was, in effect, reading that row's own label back),
-    not a measurement -- see the comment above app/providers/llm.py::_STUB_ADVICE_PATTERNS. Two
-    patterns used to do exactly this ("my odds" -> only row 5, "will uscis count" -> only row 8)
-    and were removed; this guards against silently reintroducing one, here or in a future edit.
-
-    Imports eval.run lazily, inside the test body: conftest.py makes the top-level `eval` package
-    importable, but importing it only where it is used keeps this module's own import list honest
-    about what every other test in this file actually needs.
-    """
-    from eval.run import load_golden_set
-
-    questions = [row["question"] for row in load_golden_set()]
-    for pattern in _STUB_ADVICE_PATTERNS:
-        match_count = sum(1 for q in questions if pattern in q.lower())
-        assert match_count != 1, (
-            f"pattern {pattern!r} matches exactly one golden row ({match_count} match) -- that "
-            "makes the row's refusal classification a tautology, not a measurement; remove or "
-            "broaden the pattern"
-        )
+# test_stub_advice_patterns_never_match_exactly_one_golden_row moved to
+# services/orchestrator/tests/test_guardrails.py
+# (test_advice_patterns_never_match_exactly_one_golden_row) and retargeted at
+# app.guardrails.classifier.ADVICE_PATTERNS: the advice-vs-information decision belongs to that
+# classifier now, not to StubLLM (see app/pipeline.py), so the guard test that checks no pattern
+# is a tautology against exactly one golden row moved with it.

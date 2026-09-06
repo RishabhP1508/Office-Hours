@@ -84,6 +84,44 @@ run, the same way this phase did. That is a deliberate, visible action (a file d
 and can question), not an automatic ratchet in either direction, and it is the price of the baseline
 being meaningful at all.
 
+## Superseded in Phase 4 step 3 (2026-09-05): the two refusal rates are now gated in CI mode
+
+Everything above this section is left exactly as written, because it was correct for what existed
+at the time: through Phase 4 step 2, CI mode's `false_refusal_rate` and `advice_leakage_rate` were
+computed from a regex-based approximation of the judge (`eval/run.py::CI_REFUSAL_PATTERNS`, since
+removed) over `StubLLM`'s own hardcoded advice-detection patterns
+(`app/providers/llm.py::_STUB_ADVICE_PATTERNS`, also since removed). Gating either rate would have
+measured whether that stub-only heuristic agreed with `eval/golden.jsonl`'s `is_advice` label, not
+whether the real system refuses correctly -- exactly the tautology this ADR, and
+`eval/run.py::CI_BASELINE_GATE`'s original comment, argued against. This ADR's own Tradeoff section
+above anticipated the fix in advance almost exactly: "If a future change legitimately makes
+`false_refusal_rate` worse in CI mode for a good reason (say, the guardrail classifier lands in
+Phase 4 and changes StubLLM's refusal behavior in some direction that is correct but different),
+someone has to consciously re-record `eval/baselines.json`'s `ci_baseline`." That is precisely what
+happened.
+
+What changed: the advice-vs-information decision moved out of `StubLLM` entirely and into
+`app/guardrails/classifier.py`'s rule layer (Layer 1) -- real production code, the same code path a
+real request takes, not a stub-only heuristic built only to give CI something to detect. CI mode now
+reads each response's structured `response_type` field (`app/schemas.py::ResponseType`) through
+`eval/run.py::classify_refusal_structured`, replacing the deleted `CI_REFUSAL_PATTERNS` regex
+entirely. There is no longer a stub-specific decision to game by tuning a pattern list, because there
+is no longer a pattern list in the classification path at all -- `ADVICE_PATTERNS` in
+`app/guardrails/classifier.py` is real, production-facing logic, checked (in
+`services/orchestrator/tests/test_guardrails.py`) against the same "never match exactly one golden
+row" invariant this ADR's underlying concern was always about. With the tautology gone,
+`false_refusal_rate` and `advice_leakage_rate` moved into `eval/run.py::CI_BASELINE_GATE`
+(`higher_is_better=False`, `tolerance=0`, since CI mode is fully deterministic under stub providers),
+gated exactly like `citation_hallucination_rate` already was. `CI_REFUSAL_BOOKKEEPING_GATE` is
+unchanged and still gates alongside them, not in place of them.
+
+One limitation is unchanged and worth restating here: `LLM_PROVIDER=stub` means Layer 2 (the model
+escalation in `classify_advice`) never runs in CI mode, so any golden row whose advice phrasing only
+Layer 2 would catch reads as a leaked advice row in this gate. That is an honest measurement of the
+rule layer's coverage on its own corpus-independent code path, not a gap in this gate's integrity --
+see `eval/run.py`'s module docstring for the exact rows this affects and why adding a pattern to
+"fix" it would recreate the tautology this section describes moving away from.
+
 ## Alternatives considered
 
 - **A second, weaker set of thresholds for CI mode.** Rejected: this is the same "loosen it until it

@@ -91,59 +91,6 @@ class OllamaLLM(LLM):
 
 
 _STUB_CONTEXT_RE = re.compile(r"^\[(\d+)\] Source:", re.MULTILINE)
-_STUB_QUESTION_RE = re.compile(r"Question:\s*(.*)", re.DOTALL)
-
-# Deterministic, question-text-only heuristic for whether StubLLM refuses instead of answering.
-# This is NOT the Phase 4 guardrail classifier (app/guardrails/classifier.py) and it is never
-# handed eval/golden.jsonl's is_advice label -- StubLLM.generate only ever sees the system/user
-# prompt strings, the same inputs a real provider gets. Keeping the stub blind to the label is
-# what keeps the CI refusal metrics an honest check of the plumbing (retrieval -> prompt ->
-# generation -> citation/refusal bookkeeping) rather than a self-fulfilling check against a label
-# handed to the thing being measured.
-#
-# Being blind to the label is not enough on its own, though: a pattern that happens to match
-# exactly one row in the 21-row golden set makes that one row's classification a tautology, not a
-# measurement, whatever the pattern's intent was. Four patterns that were here before turned out to
-# do exactly that against the current golden set -- "my odds" and "will uscis count" each matched
-# only the one row they were clearly worded after ("What are my odds in the H-1B lottery this
-# year?", "Will USCIS count it as a specialty occupation?"), and "should my" and "what should i do"
-# each matched only one row too, coincidentally. All four are gone; every pattern remaining below
-# was checked against eval/golden.jsonl and matches either zero or several rows, never exactly one
-# (see services/orchestrator/tests/test_stub_providers.py::
-# test_stub_advice_patterns_never_match_exactly_one_golden_row, which re-checks this on every run so
-# a future edit can't quietly reintroduce a single-row match). This is still only a rough,
-# deliberately generic heuristic ("should I", "which is better") -- see eval/run.py's
-# CI_STUB_DERIVED_REPORTED_METRICS for why the CI metrics it feeds are reported, not gated.
-_STUB_ADVICE_PATTERNS = (
-    "should i",
-    "should we",
-    "which is better",
-    "which one should",
-    "which visa is best",
-    "which status is best",
-    "is it better to",
-    "will i be approved",
-    "my chances",
-    "what would you do",
-    "can you recommend",
-    "would you recommend",
-)
-
-# Deliberately contains phrasing eval/run.py's CI_REFUSAL_PATTERNS (see that module) is built to
-# recognize, so a CI run that reaches this path has something real to detect -- see that module's
-# own comment for what the detector approximates and why it exists.
-_STUB_REFUSAL_TEXT = (
-    "Whether to do this, which option is better, or whether something will be approved is a "
-    "judgment call this tool will not make. Talk to your designated school official (DSO) or a "
-    "licensed immigration attorney about your specific situation -- they can weigh the facts that "
-    "apply to you. [StubLLM deterministic refusal, generated for the CI invariant gate -- see "
-    "app/providers/llm.py.]"
-)
-
-
-def _stub_looks_like_advice(question: str) -> bool:
-    lowered = question.lower()
-    return any(pattern in lowered for pattern in _STUB_ADVICE_PATTERNS)
 
 
 def _stub_answer_text(num_contexts: int) -> str:
@@ -169,25 +116,26 @@ class StubLLM(LLM):
     Same input always gives the same output: no randomness, no clock, no network call. Behavior
     depends only on the `user` prompt handed to `generate` (built by
     app/prompts.py::build_user_prompt), never on `system`, and never on anything outside the two
-    prompt strings -- in particular, never on eval/golden.jsonl's is_advice label (see
-    _STUB_ADVICE_PATTERNS above for why that matters).
+    prompt strings -- in particular, never on eval/golden.jsonl's is_advice label.
 
-    Refuses (see _STUB_REFUSAL_TEXT) when the question text matches _STUB_ADVICE_PATTERNS,
-    exercising the refusal path the way a real advice-seeking question would. Otherwise, cites a
-    fixed subset of the retrieved context indices ([1], and [2] when a second context is present)
-    in the `format_context` bracket numbering, so the citation-hallucination and
+    Cites a fixed subset of the retrieved context indices ([1], and [2] when a second context is
+    present) in the `format_context` bracket numbering, so the citation-hallucination and
     unreferenced-citation checks have something real to parse. Citing only indices that are
     actually present in the prompt is what keeps citation_hallucination_rate at zero by
     construction; it is never coerced to zero after the fact.
+
+    StubLLM used to have its own advice-detection branch (question-text patterns, refusing with a
+    fixed string) so the CI invariant gate had a refusal path to exercise before the real guardrail
+    existed. That branch is gone: the advice-vs-information decision now belongs entirely to
+    app/guardrails/classifier.py, which runs before the generator is ever called (see
+    app/pipeline.py) -- under LLM_PROVIDER=stub, Layer 1 (the deterministic rule) is the only layer
+    that can fire, and StubLLM itself is never asked to make that decision at all, for either an
+    advice-shaped or an informational question.
     """
 
     async def generate(self, system: str, user: str) -> str:
         del system  # unused: the stub's behavior depends only on the user prompt (see docstring)
-        question_match = _STUB_QUESTION_RE.search(user)
-        question = question_match.group(1).strip() if question_match else ""
         num_contexts = len(_STUB_CONTEXT_RE.findall(user))
-        if _stub_looks_like_advice(question):
-            return _STUB_REFUSAL_TEXT
         return _stub_answer_text(num_contexts)
 
 

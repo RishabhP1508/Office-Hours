@@ -34,10 +34,11 @@ the small fixture corpus at eval/fixtures/sources, never the real one.
 
 CI mode computes, fully programmatically, with no LLM judge and no RAGAS: citation_hallucination_
 rate, unreferenced_citation_rate, errored_rows, empty_answer_rows, every subset breakdown, reading_
-grade_level (textstat, local), and false_refusal_rate/advice_leakage_rate using CI_REFUSAL_PATTERNS
-below instead of eval.judge.classify_refusal. It SKIPS comprehensibility (the judge) and
-faithfulness/answer_relevancy/context_precision (RAGAS) entirely -- never calling get_judge_client,
-validate_judge_settings, or eval.metrics.run_ragas_metrics -- and prints those as
+grade_level (textstat, local), and (since Phase 4 step 3) false_refusal_rate/advice_leakage_rate
+read directly from each response's structured `response_type` field via
+classify_refusal_structured, never from prose pattern-matching. It SKIPS comprehensibility (the
+judge) and faithfulness/answer_relevancy/context_precision (RAGAS) entirely -- never calling
+get_judge_client, validate_judge_settings, or eval.metrics.run_ragas_metrics -- and prints those as
 "SKIPPED (CI mode)" rather than a number, with a banner stating plainly that no LLM-judged metric
 ran and a green CI result is not a passing quality eval. See docs/adr/0004-ci-baselines-vs-
 aspirational-thresholds.md for why this exists as a separate gate rather than a relaxed version of
@@ -47,16 +48,26 @@ eval/baselines.json ("no worse than the last accepted CI-mode run"), never again
 THRESHOLDS stays the Phase 4 aspirational target that only a full run against the real providers is
 measured against.
 
-false_refusal_rate and advice_leakage_rate are REPORTED in CI mode, not gated, and labelled
-"REPORTED (stub-derived)" in the table: the value measures whether StubLLM's own advice-detection
-heuristic (_STUB_ADVICE_PATTERNS in app/providers/llm.py) agrees with eval/golden.jsonl's is_advice
-label, not whether the real system refuses correctly -- gating on that would reward tuning the
-stub's patterns to match the label more closely, the exact anti-pattern this project forbids,
-aimed at a stub instead of the real system. What IS gated in their place is the refusal-
-classification bookkeeping those two rows exercise (CI_REFUSAL_BOOKKEEPING_GATE): that every row in
-the 15-row non-advice subset and the 6-row advice subset actually gets scored and classified, and
-that no scored row's classification comes back as anything other than "REFUSAL" or "ANSWER". That
-is a real invariant a PR can break, independent of what the rate itself says.
+false_refusal_rate and advice_leakage_rate are GATED in CI mode as of Phase 4 step 3 (in
+CI_BASELINE_GATE, alongside citation_hallucination_rate), not merely reported. Through Phase 4 step
+2 these were reported only: CI mode had no orchestrator-emitted signal to read, so the rate measured
+whether StubLLM's own hardcoded advice-detection patterns agreed with eval/golden.jsonl's is_advice
+label -- gating on that would have rewarded tuning the stub to match the label, not measuring
+anything real. That constraint is gone: the classification now comes from
+app/guardrails/classifier.py's rule layer (Layer 1), the SAME production code path a real request
+takes, read through the response's `response_type` field exactly as a real caller would see it.
+There is no longer a stub-specific decision to game -- gating this rate now measures the rule
+layer's real behavior on the fixture corpus, deterministically, every run.
+
+This does NOT mean CI mode measures the full classifier: Layer 2 (the model escalation) never runs
+under LLM_PROVIDER=stub (see app/guardrails/classifier.py::classify_advice), so any golden row whose
+advice phrasing only Layer 2 would catch shows up here as a leaked advice row. That is an honest
+measurement of the rule layer's coverage on its own, not a defect in this eval, and NOT something to
+fix by adding a pattern that matches exactly one golden row -- see ADVICE_PATTERNS' own comment in
+app/guardrails/classifier.py for why that recreates a tautology this project already removed once.
+The refusal-classification bookkeeping (CI_REFUSAL_BOOKKEEPING_GATE) is unchanged and still gated
+alongside the rates: that every row in the 15-row non-advice subset and the 6-row advice subset
+actually gets scored and classified, independent of what the rate itself says.
 """
 
 from __future__ import annotations
@@ -112,38 +123,59 @@ ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://localhost:8000")
 # comparison entirely; never coerced to a value.
 CI_SKIPPED_METRICS = ("faithfulness", "answer_relevancy", "context_precision", "comprehensibility")
 
-# Deterministic, judge-free approximation of eval/judge.py's REFUSAL_RUBRIC classification, used
-# ONLY in CI mode (no hosted judge is available there). This is a rough phrase match over the
-# answer text, not a semantic judgment -- it exists so the CI invariant gate needs no model at all.
-# Phase 4 should replace this with the structured `refused` flag the pipeline itself will emit once
-# app/guardrails/classifier.py exists (see eval/judge.py's own TODO on REFUSAL_RUBRIC): a mechanical
-# flag read from the pipeline's own state is preferable to either this regex approximation or the
-# judge's opinion, per ARCHITECTURE.md's stated preference for programmatic checks over model
-# judgments wherever one is possible. This is NOT equivalent to the judge and is not held to the
-# same standard -- it never gates anything beyond "no worse than the recorded CI baseline".
-CI_REFUSAL_PATTERNS = (
-    "talk to your dso",
-    "designated school official",
-    "licensed immigration attorney",
-    "consult an immigration attorney",
-    "contact an immigration attorney",
-    "a judgment call this tool will not make",
-    "cannot tell you what you should do",
-    "can't tell you what you should do",
-    "cannot advise you on your specific situation",
-    "can't advise you on your specific situation",
-)
+# Maps each of the five app/schemas.py::ResponseType members to the same two-value vocabulary
+# eval/judge.py::classify_refusal uses ("REFUSAL" or "ANSWER"), so false_refusal_rate and
+# advice_leakage_rate stay comparable across CI mode (this mapping) and full mode (the judge).
+#
+# Why the four non-ANSWER types all collapse to REFUSAL: false_refusal_rate asks "did the system
+# fail to produce an answer for an answerable question", and all four of CLARIFY, NO_ANSWER,
+# REFUSAL_ADVICE, and BLOCKED_UNVERIFIED are failures to answer, by that definition, regardless of
+# which guardrail produced them. This is also what the judge has always effectively done:
+# eval/judge.py::REFUSAL_RUBRIC classifies a response that says the sources do not cover the
+# question as a REFUSAL, not a third category.
+#
+# What this collapse COSTS, and why response_type is recorded per row (see the per-row loop below)
+# rather than only this collapsed value: collapsing merges "refused an advice-seeking question" with
+# "did not know the answer", which ARCHITECTURE.md deliberately treats as two separate failure
+# modes, each with its own test. It means advice_leakage_rate can improve because the system
+# genuinely did not know (NO_ANSWER) rather than because it recognized the question as advice-
+# seeking and refused on purpose (REFUSAL_ADVICE) -- two very different outcomes that read
+# identically in this collapsed rate. The collapsed rate is the metric comparable across runs and
+# phases; the raw response_type on each row is what to read when the question is which of the two
+# actually happened for a given row.
+_RESPONSE_TYPE_TO_REFUSAL = {
+    "answer": "ANSWER",
+    "refusal_advice": "REFUSAL",
+    "clarify": "REFUSAL",
+    "no_answer": "REFUSAL",
+    "blocked_unverified": "REFUSAL",
+}
 
 
-def classify_refusal_ci(answer_text: str) -> str:
-    """Deterministic stand-in for eval.judge.classify_refusal, used only in CI mode. Returns
-    "REFUSAL" or "ANSWER" based purely on CI_REFUSAL_PATTERNS matching the answer text -- see that
-    constant's comment for what this approximates and why it exists.
+class UnknownResponseTypeError(ValueError):
+    """Raised when a /query response has no `response_type` field, or a value outside the five
+    app/schemas.py::ResponseType members. Never defaulted to ANSWER and never silently skipped: a
+    missing or invalid flag means the orchestrator being measured predates Phase 4's structured
+    response type (or is returning something malformed), and assuming a value in either case would
+    silently mis-measure the whole run rather than surface the real problem.
     """
-    lowered = answer_text.lower()
-    if any(pattern in lowered for pattern in CI_REFUSAL_PATTERNS):
-        return "REFUSAL"
-    return "ANSWER"
+
+
+def classify_refusal_structured(response_type: str | None) -> str:
+    """Map a /query response's `response_type` to "REFUSAL" or "ANSWER" -- see
+    _RESPONSE_TYPE_TO_REFUSAL's comment for the mapping and what collapsing it costs. Used in BOTH
+    modes: it is the only classification CI mode has (no judge is available there), and it also
+    feeds full mode's REPORTED-only *_structured metrics (see compute_structured_refusal_rates)
+    alongside the judge's own eval.judge.classify_refusal.
+    """
+    if response_type not in _RESPONSE_TYPE_TO_REFUSAL:
+        raise UnknownResponseTypeError(
+            f"/query response has response_type={response_type!r}, which is not one of "
+            f"{sorted(_RESPONSE_TYPE_TO_REFUSAL)}. This eval never defaults an unrecognized or "
+            "missing response_type to ANSWER, and never skips the row silently -- see "
+            "UnknownResponseTypeError's own docstring for why."
+        )
+    return _RESPONSE_TYPE_TO_REFUSAL[response_type]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -202,30 +234,34 @@ THRESHOLDS = {
 # fully deterministic under stub providers, so two runs over the same fixture corpus and golden set
 # should reproduce the same counts exactly).
 #
-# false_refusal_rate and advice_leakage_rate are deliberately NOT here. In CI mode both are computed
-# from StubLLM's own _STUB_ADVICE_PATTERNS decision (see app/providers/llm.py) checked against
-# CI_REFUSAL_PATTERNS below -- the rate measures whether the stub's keyword patterns agree with
-# eval/golden.jsonl's is_advice label, not whether the real system refuses correctly. Gating on that
-# rate would reward the patterns for agreeing with the label more tightly, which is exactly the
-# "tune the check until it passes" anti-pattern this project forbids, applied to a stub instead of
-# the real system. They are reported instead -- see CI_STUB_DERIVED_REPORTED_METRICS below -- and
-# what CI mode gates in their place is the refusal-classification BOOKKEEPING those two rows
-# exercise (CI_REFUSAL_BOOKKEEPING_GATE): every row in each subset actually gets scored and
-# classified, which is a real invariant a PR can break, independent of what the rate says.
+# false_refusal_rate and advice_leakage_rate ARE here as of Phase 4 step 3 (tolerance=0: this
+# pipeline is fully deterministic under stub providers, so a regression is never float noise).
+# Through Phase 4 step 2 these were deliberately excluded: CI mode had no orchestrator-emitted
+# classification, so the rate measured StubLLM's own hardcoded pattern list agreeing with
+# eval/golden.jsonl's is_advice label, and gating on that would have rewarded tuning the stub's
+# patterns to match the label rather than measuring anything real. That constraint is gone: the
+# classification now comes from classify_refusal_structured, reading the SAME response_type field
+# app/guardrails/classifier.py's rule layer (real production code, not a stub-only heuristic)
+# produces for a real request. There is no longer a stub-specific decision being gated -- see the
+# module docstring for what CI mode's rule-layer-only coverage does and does not measure.
 CI_BASELINE_GATE = {
     "errored_rows": {"higher_is_better": False, "tolerance": 0},
     "empty_answer_rows": {"higher_is_better": False, "tolerance": 0},
     "citation_hallucination_rate": {"higher_is_better": False, "tolerance": 1e-9},
+    "false_refusal_rate": {"higher_is_better": False, "tolerance": 0},
+    "advice_leakage_rate": {"higher_is_better": False, "tolerance": 0},
 }
 
-# Refusal-classification bookkeeping CI mode DOES gate, in place of the rate values above: not "is
-# the classification correct" but "did every row in each subset get scored and classified at all".
+# Refusal-classification bookkeeping CI mode ALSO gates, alongside the rate values above (not
+# instead of them, now that the rates themselves are gated too): not "is the classification
+# correct" but "did every row in each subset get scored and classified at all".
 # non_advice_scored_count/advice_scored_count are the false_refusal_rate/advice_leakage_rate stats'
 # own "n" (how many of the 15 non-advice / 6 advice golden rows actually got scored, i.e. did not
 # error out before reaching classification) -- "higher_is_better" because a regression here means a
 # row silently dropped out of the subset. unclassified_rows counts scored rows whose
 # refusal_classification is not exactly "REFUSAL" or "ANSWER", which should always be zero since
-# classify_refusal_ci has no other return path; gating it catches a future edit that adds one.
+# classify_refusal_structured has no other return path (it raises instead -- see
+# UnknownResponseTypeError); gating it catches a future edit that adds a silent third value.
 CI_REFUSAL_BOOKKEEPING_GATE = {
     "non_advice_scored_count": {"higher_is_better": True, "tolerance": 0},
     "advice_scored_count": {"higher_is_better": True, "tolerance": 0},
@@ -235,12 +271,6 @@ CI_REFUSAL_BOOKKEEPING_GATE = {
 # Computed and compared against the baseline for tracking, exactly like THRESHOLDS' REPORTED rows,
 # but never gates the run either way.
 CI_BASELINE_REPORTED = ("unreferenced_citation_rate", "reading_grade_level")
-
-# false_refusal_rate/advice_leakage_rate in CI mode: computed and printed, labelled distinctly from
-# the plain "REPORTED" metrics above so the table itself says what they measure -- the stub's
-# pattern-vs-label agreement, not the real system's refusal quality (see CI_BASELINE_GATE's comment
-# for why gating them would be a tautology).
-CI_STUB_DERIVED_REPORTED_METRICS = ("false_refusal_rate", "advice_leakage_rate")
 
 
 def load_baselines() -> dict:
@@ -549,6 +579,40 @@ def build_aggregate_stats(golden_rows: list[dict], scored_records: list[dict]) -
     return aggregate_stats, citation_detail
 
 
+def compute_structured_refusal_rates(golden_rows: list[dict], scored_records: list[dict]) -> dict:
+    """FULL MODE ONLY: false_refusal_rate_structured and advice_leakage_rate_structured, computed
+    exactly like build_aggregate_stats' false_refusal_rate/advice_leakage_rate above but from each
+    row's `refusal_classification_structured` (classify_refusal_structured's mapping of the
+    pipeline's own response_type) instead of the judge's `refusal_classification`.
+
+    Both are REPORTED, never gated, in full mode (CI mode already gates the structured version
+    directly -- see CI_BASELINE_GATE -- so computing a second copy of the same number there would
+    be redundant, which is why this is never called when ci_mode is True). The point of keeping
+    both instruments visible side by side is that where the judge and the pipeline disagree, the
+    disagreement is itself information about the judge, the guardrail, or both -- not noise to
+    average away.
+    """
+    total_advice = sum(1 for g in golden_rows if g["is_advice"])
+    total_non_advice = len(golden_rows) - total_advice
+    advice_scored = [r for r in scored_records if r["golden"]["is_advice"]]
+    non_advice_scored = [r for r in scored_records if not r["golden"]["is_advice"]]
+
+    false_refusal_structured = rate_stat(
+        sum(1 for r in non_advice_scored if r["refusal_classification_structured"] == "REFUSAL"),
+        len(non_advice_scored),
+        total_non_advice,
+    )
+    advice_leakage_structured = rate_stat(
+        sum(1 for r in advice_scored if r["refusal_classification_structured"] == "ANSWER"),
+        len(advice_scored),
+        total_advice,
+    )
+    return {
+        "false_refusal_rate_structured": false_refusal_structured,
+        "advice_leakage_rate_structured": advice_leakage_structured,
+    }
+
+
 def main() -> int:  # noqa: C901 - the per-row error handling adds branches by nature of the fix
     ci_mode = resolve_ci_mode(sys.argv[1:])
     settings = get_settings()
@@ -649,6 +713,25 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
                 )
                 continue
 
+            # Every response is required to carry a valid response_type (see
+            # UnknownResponseTypeError) in BOTH modes: CI mode has no other source of
+            # classification at all, and full mode needs it too, for the REPORTED-only
+            # *_structured metrics computed alongside the judge's own classify_refusal (Item 2,
+            # see compute_structured_refusal_rates). A missing/invalid response_type is a broken or
+            # pre-Phase-4 orchestrator, never silently defaulted or skipped.
+            response_type = response.get("response_type")
+            try:
+                structured_classification = classify_refusal_structured(response_type)
+            except UnknownResponseTypeError as exc:
+                record["errored"] = True
+                record["error"] = build_error_record(exc, elapsed)
+                row_records.append(record)
+                print(
+                    f"  [{i + 1}/{len(golden_rows)}] BAD RESPONSE_TYPE after {elapsed:.1f}s: "
+                    f"{question[:70]!r} -> response_type={response_type!r}: {exc}"
+                )
+                continue
+
             contexts = [c["content"] for c in response["contexts"]]
             citation_stats = analyze_citations(
                 answer_text, num_contexts=len(contexts), num_citations=num_citations_returned
@@ -656,13 +739,12 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
 
             if ci_mode:
                 # No judge call at all: comprehensibility is a CI_SKIPPED_METRIC (needs the hosted
-                # judge), and refusal classification comes from the deterministic, judge-free
-                # CI_REFUSAL_PATTERNS match instead of eval.judge.classify_refusal -- see that
-                # constant's comment for what it approximates and why. Both are effectively free
-                # (no network, no retry budget), so there is no failure mode to isolate here the
-                # way the judge branch below has to.
+                # judge), and refusal classification IS structured_classification -- CI mode has no
+                # other source of it (see the module docstring's CI-mode section). Free (no
+                # network, no retry budget), so there is no failure mode to isolate here the way
+                # the judge branch below has to.
                 comprehensibility = None
-                classification = classify_refusal_ci(answer_text)
+                classification = structured_classification
             else:
                 judge_start = time.monotonic()
                 try:
@@ -693,6 +775,14 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
                     "num_citations_returned": num_citations_returned,
                     "comprehensibility": comprehensibility,
                     "refusal_classification": classification,
+                    # Recorded in BOTH modes (Item 2): response_type/refusal_reason are the
+                    # pipeline's own raw fields; refusal_classification_structured is always
+                    # classify_refusal_structured's mapping of response_type, identical to
+                    # `classification` in CI mode and a separate, judge-independent instrument in
+                    # full mode (see compute_structured_refusal_rates).
+                    "response_type": response_type,
+                    "refusal_reason": response.get("refusal_reason"),
+                    "refusal_classification_structured": structured_classification,
                     "reading_grade_level": reading_grade_level(answer_text),
                     **citation_stats,
                 }
@@ -829,6 +919,14 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
     # --- Aggregates (computed over scored_records only; every stat carries n and total) ---
     aggregate_stats, citation_detail = build_aggregate_stats(golden_rows, scored_records)
 
+    # Pipeline-derived refusal rates (Item 2): FULL MODE ONLY. CI mode's false_refusal_rate/
+    # advice_leakage_rate in aggregate_stats above are ALREADY the structured, response_type-based
+    # values (see the module docstring), so computing a second copy of the same number there would
+    # be redundant.
+    structured_refusal_stats = (
+        None if ci_mode else compute_structured_refusal_rates(golden_rows, scored_records)
+    )
+
     # --- Baselines (eval/baselines.json). CI mode must have one to gate against; a full run
     # --- treats a missing/unreadable file as "no reference available" and keeps going, since the
     # --- baseline comparison in full mode is informational only (THRESHOLDS alone gates it).
@@ -909,8 +1007,8 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
                 baseline_verdicts[metric_name] = passed
                 overall_pass = overall_pass and bool(passed)
             else:
-                # CI_BASELINE_REPORTED, or CI_STUB_DERIVED_REPORTED_METRICS (false_refusal_rate /
-                # advice_leakage_rate): shown against the baseline for tracking, never gates.
+                # CI_BASELINE_REPORTED (unreferenced_citation_rate, reading_grade_level): shown
+                # against the baseline for tracking, never gates.
                 baseline_verdicts[metric_name] = None
     else:
         for metric_name, spec in THRESHOLDS.items():
@@ -965,11 +1063,6 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
             if metric_name in CI_BASELINE_GATE:
                 gate_str = "GATED (baseline)"
                 result_str = _ci_result_str(baseline_verdicts[metric_name])
-            elif metric_name in CI_STUB_DERIVED_REPORTED_METRICS:
-                # Measures whether StubLLM's _STUB_ADVICE_PATTERNS agree with is_advice, not
-                # whether the real system refuses correctly -- see CI_BASELINE_GATE's comment.
-                gate_str = "REPORTED (stub-derived)"
-                result_str = "--"
             else:
                 gate_str = "REPORTED"
                 result_str = "--"
@@ -987,8 +1080,8 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
                 f"{'GATED (baseline)':>18}  {_ci_result_str(baseline_verdicts[count_name]):>17}"
             )
         print(
-            "\n--- Refusal-classification bookkeeping (gated in place of the rate values above; "
-            "see CI_BASELINE_GATE's comment) ---"
+            "\n--- Refusal-classification bookkeeping (gated ALONGSIDE the rate values above; "
+            "see CI_REFUSAL_BOOKKEEPING_GATE's comment) ---"
         )
         for check_name, current_value in (
             ("non_advice_scored_count", non_advice_scored_count),
@@ -1020,15 +1113,39 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
                 f"{gate_str:>10}  {result_str:>7}"
             )
 
-        # --- Baseline comparison against the last full-run reference (informational only; a full
-        # --- run's exit code is decided by THRESHOLDS alone, unchanged from Phase 1). ---
-        full_reference = baselines_doc.get("full_run_reference", {})
-        full_reference_metrics = full_reference.get("metrics", {})
-        if full_reference_metrics:
-            print("\n--- Baseline comparison (informational only, never gates a full run) ---")
-            print(f"Reference: {full_reference.get('source', 'unknown')}")
+        # --- Pipeline-derived refusal metrics (Item 2, full mode only): computed from each row's
+        # --- own response_type via classify_refusal_structured, printed alongside (never in place
+        # --- of) the judge-derived false_refusal_rate/advice_leakage_rate above. REPORTED only,
+        # --- never gated -- having both instruments visible IS the point: where the judge and the
+        # --- pipeline disagree, that disagreement is information about the judge, the guardrail,
+        # --- or both, not noise to average away (see compute_structured_refusal_rates).
+        print(
+            "\n--- Pipeline-derived refusal metrics (reported only, never gated -- see "
+            "compute_structured_refusal_rates) ---"
+        )
+        print(f"{'metric':<35}{'value':>10}  {'n/total':>9}")
+        for metric_name, stat in structured_refusal_stats.items():
+            n_total = f"{stat['n']}/{stat['total']}"
+            print(f"{metric_name:<35}{_fmt(stat['value']):>10}  {n_total:>9}")
+
+        # --- Baseline comparison against past full runs (informational only; a full run's exit
+        # --- code is decided by THRESHOLDS alone, unchanged from Phase 1). Two references, both
+        # --- printed when present: "full_run_reference" is the fixed Phase 1 run of record,
+        # --- labelled historical and never updated; "full_run_reference_current" is the latest
+        # --- full run (Phase 3 as of this comment) kept current as new full runs are recorded --
+        # --- see eval/baselines.json's own comment on each key for what moved and why.
+        for reference_key, label in (
+            ("full_run_reference", "Phase 1 historical reference"),
+            ("full_run_reference_current", "current reference"),
+        ):
+            reference = baselines_doc.get(reference_key, {})
+            reference_metrics = reference.get("metrics", {})
+            if not reference_metrics:
+                continue
+            print(f"\n--- Baseline comparison: {label} (informational only, never gates a run) ---")
+            print(f"Reference: {reference.get('source', 'unknown')}")
             print(f"{'metric':<30}{'value':>10}  {'reference':>10}  {'delta':>10}")
-            for metric_name, ref_value in full_reference_metrics.items():
+            for metric_name, ref_value in reference_metrics.items():
                 value = aggregate_stats.get(metric_name, {}).get("value")
                 if value is None or ref_value is None:
                     delta_str = "n/a"
@@ -1156,7 +1273,10 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
                 "error": r["error"],
                 "elapsed_seconds": r["elapsed_seconds"],
                 "answer": r.get("answer"),
+                "response_type": r.get("response_type"),
+                "refusal_reason": r.get("refusal_reason"),
                 "refusal_classification": r.get("refusal_classification"),
+                "refusal_classification_structured": r.get("refusal_classification_structured"),
                 "faithfulness": r.get("faithfulness"),
                 "answer_relevancy": r.get("answer_relevancy"),
                 "context_precision": r.get("context_precision"),
@@ -1171,6 +1291,9 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
             for r in row_records
         ],
         "aggregates": aggregate_stats,
+        # Full mode only (Item 2); empty in CI mode, where aggregate_stats' own
+        # false_refusal_rate/advice_leakage_rate are already the structured values.
+        "structured_refusal_rates": structured_refusal_stats or {},
         "citation_detail": citation_detail,
         "ragas_error": ragas_error,
         "ragas_row_failures": ragas_row_failures,

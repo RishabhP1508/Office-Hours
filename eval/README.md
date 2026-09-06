@@ -114,35 +114,46 @@ network-free stand-ins, never used outside CI) over the small fixture corpus at
 
 CI mode computes, fully programmatically, with no model call at all: `citation_hallucination_rate`,
 `unreferenced_citation_rate`, `errored_rows`, `empty_answer_rows`, every subset breakdown,
-`reading_grade_level` (textstat, local), and `false_refusal_rate`/`advice_leakage_rate` using a
-regex-based approximation of the judge's classification (`eval/run.py::CI_REFUSAL_PATTERNS` --
-see that constant's own comment for what it approximates and why, and Phase 4's plan to replace it
-with a structured flag from the pipeline itself). It skips `comprehensibility`, `faithfulness`,
+`reading_grade_level` (textstat, local), and (as of Phase 4 step 3) `false_refusal_rate`/
+`advice_leakage_rate` read directly from each response's structured `response_type` field
+(`app/schemas.py::ResponseType`) via `eval/run.py::classify_refusal_structured`, never from
+pattern-matching the answer's prose. It skips `comprehensibility`, `faithfulness`,
 `answer_relevancy`, and `context_precision` entirely -- they need the hosted judge or RAGAS, neither
 of which a `pull_request` job can reach -- and prints them as `SKIPPED (CI mode)`, with a banner at
 the top of the run stating plainly that no LLM-judged metric ran and a green result is not a passing
 quality eval.
 
-`false_refusal_rate` and `advice_leakage_rate` are printed as `REPORTED (stub-derived)`, never
-gated: in CI mode both are computed from `app/providers/llm.py::StubLLM`'s own advice-detection
-patterns, so the rate measures whether those patterns agree with `eval/golden.jsonl`'s `is_advice`
-label, not whether the real system refuses correctly. Gating on that number would just reward
-tuning the stub's patterns to match the label more tightly -- the same "tune the check until it
-passes" problem this project forbids, aimed at a stub instead of the real system. What IS gated in
-their place is the refusal-classification *bookkeeping*: that all 15 non-advice rows and all 6
-advice rows actually get scored and classified (`non_advice_scored_count`, `advice_scored_count`),
-and that no scored row's classification comes back as anything other than `REFUSAL` or `ANSWER`
-(`unclassified_rows`). That catches a real regression in the plumbing without pretending to measure
-refusal quality.
+`false_refusal_rate` and `advice_leakage_rate` are GATED in CI mode, in `eval/run.py::
+CI_BASELINE_GATE` alongside `citation_hallucination_rate` -- not merely reported. Through Phase 4
+step 2 they were reported only: the classification came from `app/providers/llm.py::StubLLM`'s own
+hardcoded advice-detection patterns, so the rate measured whether those patterns agreed with
+`eval/golden.jsonl`'s `is_advice` label, not whether the real system refuses correctly, and gating on
+that would have rewarded tuning the stub to match the label. That constraint is gone: the
+classification now comes from `app/guardrails/classifier.py`'s rule layer (Layer 1) -- the same
+production code path a real request takes -- read through `response_type` exactly as a real caller
+would see it, so there is no longer a stub-specific decision to game. This does NOT mean CI mode
+measures the full classifier: Layer 2 (the model escalation) never runs under `LLM_PROVIDER=stub`,
+so a golden row whose advice phrasing only Layer 2 would catch reads as a leaked advice row here --
+an honest measurement of the rule layer's own coverage, not a defect, and not something to fix by
+adding a pattern that matches exactly one golden row (see `app/guardrails/classifier.py::
+ADVICE_PATTERNS`'s own comment). The refusal-classification *bookkeeping* is still gated alongside
+the rates, not in their place: that all 15 non-advice rows and all 6 advice rows actually get scored
+and classified (`non_advice_scored_count`, `advice_scored_count`), and that no scored row's
+classification comes back as anything other than `REFUSAL` or `ANSWER` (`unclassified_rows`).
 
 CI mode's gate is `eval/baselines.json`'s `ci_baseline`, not `THRESHOLDS`: the current run must be
 no worse than the last CI-mode run a human accepted, within the small tolerance in
 `eval/run.py::CI_BASELINE_GATE` (and, for the bookkeeping checks above, `CI_REFUSAL_BOOKKEEPING_
 GATE`). `THRESHOLDS` stays the fixed Phase 4 target that only a full run is measured against; see
-`docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md` for why these are two separate gates. A
-full run additionally prints its own numbers against `eval/baselines.json`'s `full_run_reference`
-(the Phase 1 run of record) purely for tracking the gap over time -- informational only, never
-gating a full run's exit code.
+`docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md` (including its "Superseded in Phase 4 step
+3" section) for why these are two separate gates and what changed. A full run additionally prints its
+own numbers against `eval/baselines.json`'s `full_run_reference` (the Phase 1 run of record,
+historical) and `full_run_reference_current` (the latest full run, kept current), purely for tracking
+the gap over time -- informational only, never gating a full run's exit code. It also prints two
+REPORTED-only metrics, `false_refusal_rate_structured`/`advice_leakage_rate_structured`, computed
+from `response_type` the same way CI mode's are, alongside the judge-derived `false_refusal_rate`/
+`advice_leakage_rate` -- see `eval/run.py::compute_structured_refusal_rates` for why both instruments
+stay visible side by side.
 
 Installing just enough to run CI mode (no ragas, no langchain -- see the module docstrings in
 `eval/metrics.py` and `eval/run.py` for why those imports are lazy and never triggered in CI mode):
