@@ -110,6 +110,60 @@ class Settings(BaseSettings):
     # fetching any live URL (see docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md).
     INGEST_MODE: str = "fetch"
 
+    # No-answer guardrail (Phase 4). If retrieval returns nothing, or the MINIMUM cosine distance
+    # across every retrieved chunk exceeds this, app/pipeline.py returns NO_ANSWER and never calls
+    # the generator at all -- ARCHITECTURE.md's "the system says when it does not know". Gated on
+    # the minimum across all retrieved chunks, not the RRF-top-1 chunk's own distance: RRF-top-1 is
+    # a fused-rank quantity, not a semantic-closeness one, and can be noisier than the single
+    # closest chunk actually retrieved.
+    #
+    # 0.50, derived from the 7 off-topic control queries ALONE (sourdough, capital of France, car
+    # insurance, vitamin D, World Cup, faucet, game programming), measured against the live corpus
+    # and real nomic-embed-text embeddings: 0.4370, 0.5251, 0.5315, 0.5358, 0.5431, 0.5540, 0.5668.
+    # Six of the seven sit in a tight cluster from 0.5251 up; 0.50 sits just below that cluster.
+    # This is an honest, accepted gap, not an oversight: 0.50 misses the "car insurance" control at
+    # 0.4370, and CLAUDE.md's carve-out means the fix for that miss is prompt rule 3 ("say plainly
+    # when the sources do not cover it", app/prompts.py::SYSTEM_PROMPT), which stays the PRIMARY
+    # "sources do not cover it" mechanism -- not a lower threshold, because a threshold low enough
+    # to also catch "car insurance" starts suppressing real, answerable questions (see next
+    # paragraph). The 7 in-domain control queries this project also measured (0.1563-0.3814) are
+    # nowhere near this threshold either way and were not used to pick it.
+    #
+    # The golden set (eval/golden.jsonl) was measured only AFTER 0.50 was chosen from the controls
+    # above, to check the threshold's consequence, never to pick the threshold itself. That check
+    # is exactly why an earlier value of 0.42 was rejected: at 0.42, three real, answerable golden
+    # rows have a best-retrieved-chunk distance above threshold and would have been wrongly
+    # suppressed -- row 16 ("How does the wage-weighted lottery work?", 0.4720), row 0 ("What is
+    # the I-983 and who fills it out?", 0.4348), and row 7 ("Should my employer put me in at a
+    # higher wage level...", 0.4344); every other golden row sits below 0.36, and the best sits at
+    # 0.1748. At 0.47 only row 16 still fires; at 0.50 none do. Row 0 matters most: its answer lives
+    # in a single chunk (out of 216) that contains the token "-983", so its semantic signal is
+    # genuinely weak -- that chunk is exactly what Phase 3's keyword arm exists to surface (see
+    # docs/adr/0001-rrf-vs-weighted-blend.md), and gating retrieval on semantic distance alone would
+    # silently undo that fix. A second gate on the keyword arm's ts_rank_cd was checked and rejected
+    # too: row 0 scores ts_rank_cd 3.6 over 3 keyword hits, the "car insurance" off-topic control
+    # scores a similar 3.4 over 6 hits, and "game programming" scores a HIGHER 7.2 -- no threshold
+    # on either arm, or on both together, separates row 0 from the off-topic controls, so this is
+    # not a gap a cleverer mechanical check can close; it is why prompt rule 3 has to carry it.
+    #
+    # CI's stub embedder (EMBED_PROVIDER=stub) is a content-blind hash with no semantic meaning at
+    # all -- measured top-1 distances of 0.92-0.95 against the 17-chunk fixture corpus, which would
+    # fire this path on every single CI row under 0.50 and destroy the recorded CI baseline. See
+    # .github/workflows/eval.yml's ci-invariant-gate job, which overrides this to "2.0" (the maximum
+    # possible cosine distance, so the gate can never fire there) for exactly that reason; the
+    # no-answer path itself is exercised by dedicated tests instead of the CI golden run.
+    NO_ANSWER_MAX_DISTANCE: float = 0.50
+
+    # Clarifier (Phase 4, app/guardrails/clarifier.py). A query needs at least this many content
+    # words, after generic English stopwords are stripped, before it is considered specific enough
+    # to retrieve against; fewer than this returns CLARIFY (one clarifying question, no retrieval)
+    # unless the query also names a recognized topic anchor (a visa/status code, a form number, or
+    # a topic noun this corpus covers) alongside at least one other content word. Deliberately
+    # small: a false-positive clarify on a real, short factual question costs the person an extra
+    # round trip for no reason, which is worse than occasionally letting a genuinely vague query
+    # through to retrieval instead.
+    CLARIFY_MIN_CONTENT_WORDS: int = 3
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -62,6 +62,15 @@ jobs:
       # network fetch of a government page from this job, ever (see app/config.py::INGEST_MODE).
       INGEST_MODE: snapshot
       RAW_SNAPSHOT_DIR: ${{ github.workspace }}/eval/fixtures/sources
+      # 2.0 is the maximum possible cosine distance, so the no-answer guardrail (app/pipeline.py,
+      # Settings.NO_ANSWER_MAX_DISTANCE) can never fire in this job. The real default (0.50) is
+      # calibrated against real nomic-embed-text semantics; EMBED_PROVIDER=stub above is a
+      # content-blind hash with no semantic meaning at all (measured top-1 distances of 0.92-0.95
+      # against this 17-chunk fixture corpus), so 0.50 here would fire the no-answer path on every
+      # single CI row, empty every citation list, and silently destroy the recorded CI baseline.
+      # The no-answer path itself is exercised by services/orchestrator/tests/test_guardrails.py
+      # instead of by this job.
+      NO_ANSWER_MAX_DISTANCE: "2.0"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
       OTEL_SERVICE_NAME: office-hours-orchestrator-ci
       ORCHESTRATOR_URL: http://localhost:8000
