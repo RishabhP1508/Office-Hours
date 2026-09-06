@@ -37,9 +37,20 @@ Concretely, in order:
    cited, stays visible in the structured `Freshness.sources` field but appends no text. CLARIFY,
    NO_ANSWER, and BLOCKED_UNVERIFIED responses carry freshness=None and no appended text -- none of
    those three renders a generated answer at all.
+
+Phase 6 addition: an optional, keyword-only `on_event` callback (app/main.py's POST /query/stream
+uses it to drive the frontend's progress UI; POST /query passes nothing, so its behavior is
+byte-identical to before this callback existed). When given, it is awaited at the four real stage
+boundaries above -- classify, retrieve, generate, verify -- with a `{"event": "stage", "stage":
+..., "status": "start"|"done", ...}` dict, and ONLY for a stage this call actually reaches: a
+CLARIFY response emits classify start/done and returns; a NO_ANSWER response emits classify and
+retrieve start/done and returns; neither ever emits a generate or verify event, because neither
+stage ran. `on_event=None` (the default) makes every one of these a no-op, so nothing about the
+pipeline's own control flow or return value changes when it is omitted.
 """
 
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from opentelemetry import trace
@@ -123,15 +134,25 @@ async def answer_question(
     embedder: Embedder,
     llm: LLM,
     settings: Settings,
+    on_event: Callable[[dict], Awaitable[None]] | None = None,
 ) -> AnswerResponse:
     tracer = get_tracer()
 
+    async def _emit(event: dict) -> None:
+        # No-op when on_event is None (the default, and what POST /query passes) -- see this
+        # module's docstring. Every call site below awaits this unconditionally so the emission
+        # points read the same regardless of whether a caller is listening.
+        if on_event is not None:
+            await on_event(event)
+
     # --- Step 1: clarify. Must not touch pool or embedder at all if it fires. ---
+    await _emit({"event": "stage", "stage": "classify", "status": "start"})
     with tracer.start_as_current_span("classify") as classify_span:
         vague = is_too_vague(question, min_content_words=settings.CLARIFY_MIN_CONTENT_WORDS)
         classify_span.set_attribute("clarify_triggered", vague)
         if vague:
             classify_span.set_attribute("response_type", ResponseType.CLARIFY.value)
+            await _emit({"event": "stage", "stage": "classify", "status": "done"})
             return _empty_response(
                 answer=CLARIFY_QUESTION,
                 response_type=ResponseType.CLARIFY,
@@ -142,10 +163,12 @@ async def answer_question(
         classification = await classify_advice(question, llm=llm, settings=settings)
         classify_span.set_attribute("advice_decided_by", classification.decided_by)
         classify_span.set_attribute("is_advice", classification.is_advice)
+    await _emit({"event": "stage", "stage": "classify", "status": "done"})
 
     # --- Step 3: retrieve. Runs regardless of the classification -- an advice-seeking question
     # --- still needs the same retrieved context an informational one would get (see module
     # --- docstring and docs/adr/0002-advice-vs-information-line.md). ---
+    await _emit({"event": "stage", "stage": "retrieve", "status": "start"})
     with tracer.start_as_current_span("retrieve") as retrieve_span:
         retrieve_span.set_attribute("top_k", settings.RETRIEVAL_TOP_K)
         retrieve_span.set_attribute("retrieval_mode", "hybrid_rrf")
@@ -191,6 +214,15 @@ async def answer_question(
             "min_distance", min_distance if min_distance is not None else -1.0
         )
 
+        # retrieve genuinely completed by this point (chunks fetched, span attributes recorded)
+        # whether or not the no-answer gate below ends up firing, so this event fires
+        # unconditionally -- a NO_ANSWER response really did retrieve, it just found nothing close
+        # enough (see this module's docstring on which stages an early-return path actually
+        # reaches).
+        await _emit(
+            {"event": "stage", "stage": "retrieve", "status": "done", "source_count": len(chunks)}
+        )
+
         # --- Step 4: no-answer check. Never calls the generator if this fires. ---
         no_relevant_chunk = not chunks or (
             min_distance is not None and min_distance > settings.NO_ANSWER_MAX_DISTANCE
@@ -222,12 +254,17 @@ async def answer_question(
         generate_span.set_attribute("model", settings.LLM_MODEL)
         generate_span.set_attribute("prompt_chars", len(user_prompt))
         generate_span.set_attribute("candidate_response_type", candidate_response_type.value)
+        await _emit({"event": "stage", "stage": "generate", "status": "start"})
         try:
             answer_text = await llm.generate(system_prompt, user_prompt)
         except Exception as exc:  # noqa: BLE001 - re-raised after recording on the span
             generate_span.set_status(Status(StatusCode.ERROR, str(exc)))
+            # No "generate":"done" event on this path -- generation did not actually complete, and
+            # this exception propagates out of answer_question entirely (no verify stage runs
+            # either), so emitting "done" here would claim a stage finished that did not.
             raise
         generate_span.set_attribute("answer_chars", len(answer_text))
+        await _emit({"event": "stage", "stage": "generate", "status": "done"})
 
     # --- Step 6: strip a trailing source-list block BEFORE verification, not after. ---
     # Verification has to check the text that will actually render. If citations were verified on
@@ -239,9 +276,11 @@ async def answer_question(
     answer_text = strip_source_list_block(answer_text)
 
     # --- Step 7: verify citations. Blocks rendering the generated text on failure. ---
+    await _emit({"event": "stage", "stage": "verify", "status": "start"})
     verification = verify_citations(
         answer_text, num_contexts=len(chunks), response_type=candidate_response_type.value
     )
+    await _emit({"event": "stage", "stage": "verify", "status": "done", "ok": verification.ok})
 
     citations = [
         Citation(

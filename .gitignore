@@ -30,6 +30,10 @@ dist/
 # Node / Next.js
 node_modules/
 .next/
+services/frontend/out/
+next-env.d.ts
+.turbo/
+*.tsbuildinfo
 
 # Logs
 *.log
@@ -39,3 +43,5 @@ node_modules/
 Thumbs.db
 .vscode/
 .idea/
+
+docs/design/
