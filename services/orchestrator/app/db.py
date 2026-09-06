@@ -25,6 +25,7 @@ class RetrievedChunk:
     section_heading: str
     heading_level: int
     page_last_updated: date | None
+    rule_effective_date: date | None
     fetched_at: datetime
     last_verified_at: datetime
     distance: float
@@ -116,7 +117,7 @@ fused AS (
     FROM semantic s FULL OUTER JOIN keyword kw ON s.id = kw.id
 )
 SELECT d.id, d.content, d.source_url, d.resolved_url, d.section_heading, d.heading_level,
-       d.page_last_updated, d.fetched_at, d.last_verified_at,
+       d.page_last_updated, d.rule_effective_date, d.fetched_at, d.last_verified_at,
        d.embedding <=> %(embedding)s AS distance,
        f.rrf_score, f.semantic_rank, f.keyword_rank
 FROM fused f JOIN documents d ON d.id = f.id

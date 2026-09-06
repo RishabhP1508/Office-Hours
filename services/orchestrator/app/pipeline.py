@@ -1,8 +1,8 @@
 """The query pipeline.
 
 classify (clarify, then advice-vs-information) -> retrieve (hybrid RRF, Phase 3 -- see
-app/db.py::hybrid_search) -> no-answer check -> generate -> verify citations -> render. This is the
-full Phase 4 pipeline; freshness (volatile-topic flagging, Phase 5) is the only seam still open:
+app/db.py::hybrid_search) -> no-answer check -> generate -> verify citations -> freshness -> render.
+This is the full Phase 5 pipeline:
 
     classify -> clarify -> retrieve -> generate -> verify -> freshness
 
@@ -29,6 +29,14 @@ Concretely, in order:
    BLOCKED_UNVERIFIED if a cited index falls outside the retrieved range, or if an ANSWER carries no
    citation at all. Then, only if verification passed, append the DSO/attorney redirect sentence to
    an advice response if the model did not already include one.
+8. Freshness (app/guardrails/freshness.py): build the structured freshness block from the same
+   retrieved chunks and, for ANSWER and REFUSAL_ADVICE only, append the effective-date notice
+   sentence to the answer text -- but only for a dated source that is either the top-ranked
+   retrieved chunk or actually cited in the generated text (see build_freshness's own docstring for
+   why both conditions are needed); a dated source retrieved incidentally, neither top-ranked nor
+   cited, stays visible in the structured `Freshness.sources` field but appends no text. CLARIFY,
+   NO_ANSWER, and BLOCKED_UNVERIFIED responses carry freshness=None and no appended text -- none of
+   those three renders a generated answer at all.
 """
 
 import re
@@ -40,9 +48,10 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.config import Settings
 from app.db import RetrievedChunk, hybrid_search
-from app.guardrails.citations import verify_citations
+from app.guardrails.citations import parse_cited_indices, verify_citations
 from app.guardrails.clarifier import CLARIFY_QUESTION, is_too_vague
 from app.guardrails.classifier import classify_advice
+from app.guardrails.freshness import build_freshness, freshness_notice_text
 from app.prompts import (
     REFUSAL_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
@@ -273,6 +282,23 @@ async def answer_question(
         if not _has_redirect(answer_text):
             answer_text = f"{answer_text}\n\n{_DSO_REDIRECT_SENTENCE}"
 
+    # --- Step 8 (Phase 5): freshness. Built from the same retrieved chunks, for ANSWER and
+    # --- REFUSAL_ADVICE alike (both are the response types that render generated text and
+    # --- citations at all). The notice sentence carries no bracket, so appending it here -- after
+    # --- verify_citations already ran in step 7 -- can never change what that check saw.
+    #
+    # cited_indices is read from `answer_text` as it stands right now: post-strip (step 6) so it
+    # matches exactly what verify_citations checked in step 7, and (for an advice response) before
+    # or after the DSO redirect makes no difference, since that sentence never carries a bracket.
+    # Reused from app/guardrails/citations.py rather than re-implemented here, per that module's
+    # own docstring ("the same convention eval/run.py's own parse_cited_indices uses").
+    freshness = build_freshness(
+        chunks, today=datetime.now(UTC).date(), cited_indices=parse_cited_indices(answer_text)
+    )
+    notice_text = freshness_notice_text(freshness.notices)
+    if notice_text:
+        answer_text = f"{answer_text}\n\n{notice_text}"
+
     trace.get_current_span().set_attribute("response_type", candidate_response_type.value)
 
     return AnswerResponse(
@@ -282,4 +308,5 @@ async def answer_question(
         response_type=candidate_response_type.value,
         refusal_reason=refusal_reason,
         generated_at=datetime.now(UTC),
+        freshness=freshness,
     )

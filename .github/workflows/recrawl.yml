@@ -1,0 +1,129 @@
+name: Scheduled source refresh
+
+# Re-crawls data/sources/sources.yaml once a day, diffs each page against what is currently indexed
+# (app/recrawl.py), and re-indexes only the sources whose content meaningfully changed. This is a
+# separate workflow from eval.yml on purpose (see docs/adr/0004-ci-baselines-vs-aspirational-
+# thresholds.md for the same reasoning applied there): this job never runs the eval, and it needs a
+# real, reachable production database and a real embedder, neither of which the eval gate's CI
+# invariant job has or needs.
+#
+# - `schedule`: a source can be rewritten at any time -- notably studyinthestates.dhs.gov and
+#   ice.gov, which DHS has said will be rewritten to reflect the fixed-period-of-admission final
+#   rule on and after Sept 15 2026 -- and a daily tick catches that within a day instead of whenever
+#   someone happens to run `python -m app.recrawl` by hand.
+# - `workflow_dispatch`: lets a person trigger a re-crawl on demand, e.g. right after a known rule
+#   change, without waiting for the next scheduled tick.
+"on":
+  schedule:
+    # 08:17 UTC, once a day. Not top-of-hour: GitHub throttles/delays jobs scheduled for the exact
+    # hour under load, since every other repository's cron tends to fire then too.
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    name: Re-crawl sources and report what changed
+    runs-on: ubuntu-latest
+    env:
+      # app/config.py's defaults for both of these are container-absolute paths (/app/data/...),
+      # meaningful only inside the orchestrator's own Docker image. A checkout on ubuntu-latest has
+      # neither path, so both must be pointed at the checkout explicitly -- the same way
+      # eval.yml's ci-invariant-gate job sets RAW_SNAPSHOT_DIR from ${{ github.workspace }} rather
+      # than relying on the container default.
+      SOURCES_MANIFEST_PATH: ${{ github.workspace }}/data/sources/sources.yaml
+      RAW_SNAPSHOT_DIR: ${{ github.workspace }}/data/sources/raw
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/orchestrator/pyproject.toml
+
+      # [freshness] pulls in LangGraph for the refresh graph itself (app/recrawl.py). Deliberately
+      # NOT [eval] or [eval-ci]: this job never runs `python -m eval.run`, only the refresh job, so
+      # it never needs ragas/langchain/openai/textstat at all.
+      - name: Install orchestrator + freshness dependencies (no eval, no eval-ci)
+        run: pip install -e "./services/orchestrator[dev,freshness]"
+
+      # secrets.DATABASE_URL is empty until Phase 8 stands up a hosted database this job can reach
+      # (there is no production database yet -- see ARCHITECTURE.md's "Deliberately not decided
+      # yet"). The two steps below are mutually exclusive on this output (`mode`): "dry-run" skips
+      # the crawl entirely (see the next step for why), "live" runs the real refresh.
+      #
+      # The secret is read into an env var here, never interpolated directly into the shell script
+      # (`${{ secrets.DATABASE_URL }}` inside `run:` would expand to raw script text before bash
+      # ever sees it, so a value containing a quote, backtick, or `$(...)` could break the script or
+      # execute as a command). Testing `$DATABASE_URL` as a shell variable instead avoids that.
+      - name: Decide whether a real database is configured
+        id: db
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "mode=dry-run" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=live" >> "$GITHUB_OUTPUT"
+          fi
+
+      # No DATABASE_URL secret yet -- do NOT fetch anything. data/sources/raw/ is gitignored (see
+      # .gitignore), so a fresh checkout on this runner has no snapshots at all: app/recrawl.py's
+      # `_diff_node` treats a missing snapshot as "nothing to diff against" and returns
+      # `status=meaningful, reason=no_existing_snapshot` for every source. A dry run here would
+      # therefore report all 14 sources as changed every single day regardless of whether anything
+      # actually changed -- a report that is actively wrong, not just unavailable, while still
+      # spending 14 real HTTP requests against government pages to produce it. So this step does
+      # nothing but explain that and exit 0, so the daily schedule does not show a false red X.
+      - name: No database configured yet -- the scheduled refresh is inert (Phase 8 not landed)
+        if: steps.db.outputs.mode == 'dry-run'
+        run: |
+          echo "No DATABASE_URL secret configured yet (Phase 8 has not stood up a hosted database)."
+          echo "Skipping the crawl entirely rather than running --dry-run: data/sources/raw/ is"
+          echo "gitignored, so this checkout has no snapshots to diff against, and every one of the"
+          echo "14 sources would read as status=meaningful/reason=no_existing_snapshot -- a report"
+          echo "claiming the whole corpus changed when nothing did, at the cost of 14 real requests"
+          echo "against government pages. This step is a deliberate no-op until a database exists."
+          exit 0
+
+      # Live path only. Without this guard, a live run against a checkout with no baseline
+      # snapshots would hit the exact same no_existing_snapshot path described above, but for
+      # real: it would re-index and re-embed all 14 sources as "meaningful", overwriting every
+      # `fetched_at` with today's date and destroying the freshness signal this phase exists to
+      # produce -- silently, since the job would otherwise exit 0. Fail loudly instead.
+      - name: Guard against a live run with no baseline snapshots
+        if: steps.db.outputs.mode == 'live'
+        run: |
+          if [ ! -d "$RAW_SNAPSHOT_DIR" ] || \
+             [ -z "$(find "$RAW_SNAPSHOT_DIR" -maxdepth 1 -name '*.md' -print -quit)" ]; then
+            echo "::error::RAW_SNAPSHOT_DIR ($RAW_SNAPSHOT_DIR) is missing or has no *.md snapshots."
+            echo "Refusing to run the live refresh: with no baseline to diff against, every source"
+            echo "would classify status=meaningful/reason=no_existing_snapshot, re-indexing and"
+            echo "re-embedding all 14 sources and resetting every fetched_at -- the expensive,"
+            echo "silent failure mode this guard exists to make impossible. Restore"
+            echo "data/sources/raw/ (e.g. from the production volume or a backup) before this job"
+            echo "can run live."
+            exit 1
+          fi
+
+      # Once Phase 8 stands up a hosted database and a hosted embedder, this step also needs
+      # EMBED_PROVIDER (and its model) set to that hosted provider -- app/providers/embeddings.py's
+      # HostedEmbedder is still an unimplemented seam today, so this branch cannot fully succeed
+      # against a real DATABASE_URL until that lands. Left here, rather than removed, so the secret
+      # can be added the moment Phase 8 is ready without a second edit to this file.
+      - name: Re-crawl (live)
+        if: steps.db.outputs.mode == 'live'
+        working-directory: services/orchestrator
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m app.recrawl --json > recrawl-report.json
+
+      - name: Upload the refresh report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recrawl-report
+          path: services/orchestrator/recrawl-report.json
+          if-no-files-found: ignore

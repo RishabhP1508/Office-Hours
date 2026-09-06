@@ -468,16 +468,39 @@ def _parse_iso_date(value) -> date | None:
     return dateutil_parser.parse(str(value)).date()
 
 
-async def _fetch_and_snapshot(
+@dataclass
+class FetchedPage:
+    """One manifest entry's page, fetched and normalized to markdown -- no snapshot file involved.
+
+    `resolved_url` follows the same rule the snapshot frontmatter always has: `None` when the fetch
+    landed on the same URL the manifest listed (no redirect happened), the landed-on URL otherwise.
+    """
+
+    resolved_url: str | None
+    title: str | None
+    page_last_updated: date | None
+    body_markdown: str
+
+
+async def fetch_page(
     client: httpx.AsyncClient,
     robots: RobotsCache,
     rate_limiter: HostRateLimiter,
     entry: dict,
-    existing_index: dict[str, Path],
-    raw_dir: Path,
-) -> Path | None:
+) -> FetchedPage | None:
+    """Fetch one manifest entry's URL and normalize it to markdown.
+
+    Returns `None` when robots.txt disallows fetching this URL -- a permanent, not a transient,
+    reason not to have a page. Raises whatever httpx.HTTPError (or `response.raise_for_status()`)
+    raises on a connection failure or a non-2xx status; callers (`_fetch_and_snapshot` here, and
+    app/recrawl.py's refresh graph) decide how to handle that.
+
+    Pulled out of `_fetch_and_snapshot` (Phase 5) so app/recrawl.py can reuse the exact same fetch
+    normalization the ingest CLI uses, instead of forking a second copy of it. `_fetch_and_snapshot`
+    itself is unchanged in behavior: it now calls this function and only does the snapshot-writing
+    part that follows.
+    """
     url = entry["url"]
-    topic = entry["topic"]
 
     host = urlsplit(url).netloc
     await rate_limiter.wait(host)
@@ -503,6 +526,29 @@ async def _fetch_and_snapshot(
     promote_definition_lists(container)
     body_markdown = html_to_markdown(container)
 
+    return FetchedPage(
+        resolved_url=resolved_url if resolved_url != url else None,
+        title=page_title,
+        page_last_updated=page_last_updated,
+        body_markdown=body_markdown,
+    )
+
+
+async def _fetch_and_snapshot(
+    client: httpx.AsyncClient,
+    robots: RobotsCache,
+    rate_limiter: HostRateLimiter,
+    entry: dict,
+    existing_index: dict[str, Path],
+    raw_dir: Path,
+) -> Path | None:
+    url = entry["url"]
+    topic = entry["topic"]
+
+    fetched = await fetch_page(client, robots, rate_limiter, entry)
+    if fetched is None:
+        return None
+
     snapshot_path = existing_index.get(url) or mint_snapshot_filename(topic, url, raw_dir)
     existing_frontmatter: dict = {}
     if snapshot_path.exists():
@@ -510,16 +556,18 @@ async def _fetch_and_snapshot(
 
     computed_frontmatter = {
         "source_url": url,
-        "resolved_url": resolved_url if resolved_url != url else None,
-        "title": page_title,
+        "resolved_url": fetched.resolved_url,
+        "title": fetched.title,
         "fetched_at": date.today().isoformat(),
-        "page_last_updated": page_last_updated.isoformat() if page_last_updated else None,
+        "page_last_updated": (
+            fetched.page_last_updated.isoformat() if fetched.page_last_updated else None
+        ),
         "topic": topic,
     }
     frontmatter = build_frontmatter(existing_frontmatter, computed_frontmatter)
 
     raw_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_path.write_text(render_snapshot(frontmatter, body_markdown), encoding="utf-8")
+    snapshot_path.write_text(render_snapshot(frontmatter, fetched.body_markdown), encoding="utf-8")
     return snapshot_path
 
 
@@ -530,8 +578,18 @@ async def _embed_and_store(
     resolved_url: str | None,
     page_last_updated: date | None,
     chunks: list[dict],
+    rule_effective_date: date | None = None,
+    now: datetime | None = None,
 ) -> None:
-    now = datetime.now(UTC)
+    """`rule_effective_date` is the curator annotation carried in a snapshot's own frontmatter
+    (e.g. `rule_effective_date: 2026-09-15` on both fixed_admission snapshots), never computed here
+    -- see infra/sql/init.sql's comment on the column. `now` defaults to the real current time; it
+    is an explicit parameter so app/recrawl.py::reindex_source (Phase 5) can pass one `now` value
+    for both `fetched_at` and `last_verified_at`, deterministically, instead of two separate calls
+    to datetime.now(UTC) that could disagree by a few microseconds.
+    """
+    if now is None:
+        now = datetime.now(UTC)
     texts = [chunk["text"] for chunk in chunks]
     vectors = await embedder.embed(texts)
 
@@ -543,8 +601,9 @@ async def _embed_and_store(
                     """
                     INSERT INTO documents
                         (content, source_url, resolved_url, section_heading, heading_level,
-                         page_last_updated, fetched_at, last_verified_at, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         page_last_updated, rule_effective_date, fetched_at, last_verified_at,
+                         embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         chunk["text"],
@@ -553,6 +612,7 @@ async def _embed_and_store(
                         chunk["heading"],
                         chunk["level"],
                         page_last_updated,
+                        rule_effective_date,
                         now,
                         now,
                         Vector(vector),
@@ -596,6 +656,7 @@ async def _ingest_from_manifest(
                 source_url=frontmatter["source_url"],
                 resolved_url=frontmatter.get("resolved_url"),
                 page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
+                rule_effective_date=_parse_iso_date(frontmatter.get("rule_effective_date")),
                 chunks=chunks,
             )
 
@@ -634,6 +695,7 @@ async def _ingest_from_snapshots(
             source_url=source_url,
             resolved_url=frontmatter.get("resolved_url"),
             page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
+            rule_effective_date=_parse_iso_date(frontmatter.get("rule_effective_date")),
             chunks=chunks,
         )
 

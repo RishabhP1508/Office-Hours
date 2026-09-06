@@ -8,17 +8,25 @@ personally should do, redirecting you to your DSO or a licensed immigration atto
 This is an unofficial tool, not affiliated with USCIS or DHS. Every answer carries that disclaimer.
 No queries are stored with any identifying information.
 
-## What's built so far (Phase 0)
+## What's built so far (Phase 5)
 
-One question flows end to end: a query is embedded, matched against a Postgres/pgvector corpus of
-14 USCIS, Study in the States, and ICE pages, answered by a local LLM grounded in the retrieved
-passages, and returned with citations. The retrieve and generate steps each produce their own
-OpenTelemetry span, visible as one trace in Grafana.
+A question goes through five checks. If it is too vague to search against, the system asks one
+clarifying question and never touches the database. A classifier then decides whether the question
+asks what the rules are or asks the system to make the asker's decision for them. Either way the
+question is retrieved for, using hybrid search over a Postgres/pgvector corpus of 14 USCIS, Study in
+the States, and ICE pages: a vector arm and a keyword arm fused with Reciprocal Rank Fusion in one
+SQL query. If nothing retrieved is close enough, the system says its sources do not cover the
+question and never calls the generator. The generator then answers from the retrieved passages, and
+before anything renders, every bracket citation is checked against what was actually retrieved. A
+citation pointing at a passage that does not exist blocks the answer entirely.
 
-There is no guardrail classifier yet (advice detection, citation verification, and freshness
-flagging land in Phase 4), no hybrid keyword search (Phase 3), and no eval CLI (Phase 1). The system
-prompt carries the "answer only from context, cite it, say when the sources don't cover it" rules on
-its own for now.
+Every response carries one of five labels saying which of those paths it took, so the eval reads the
+pipeline's own decision instead of guessing from the prose. The retrieve and generate steps each
+produce their own OpenTelemetry span, visible as one trace in Grafana.
+
+Phase 5 added the re-crawl job described under "Staying current" below, and freshness data on every
+answer. Still to come: the Next.js frontend (Phase 6), the Go gateway with Redis rate limiting
+(Phase 7), and deployment (Phase 8).
 
 ## Running it
 
@@ -66,6 +74,36 @@ what the image builds against:
 docker compose run --rm orchestrator pytest tests/test_chunking.py -v
 ```
 
+Some tests insert and delete rows in `documents`, so point `DATABASE_URL` at a scratch database
+before running the whole suite. Create one once, apply the schema, and load the small committed
+fixture corpus into it:
+
+```
+export TEST_DB="postgresql://officehours:officehours@postgres:5432/officehours_fixtures"
+
+docker compose exec postgres psql -U officehours -d postgres -c "CREATE DATABASE officehours_fixtures;"
+
+# infra/ is not mounted into the orchestrator container, so apply the schema from the host:
+docker exec -i office-hours-postgres-1 psql -U officehours -d officehours_fixtures -q < infra/sql/init.sql
+
+docker compose run --rm -e DATABASE_URL="$TEST_DB" \
+  -e INGEST_MODE=snapshot -e RAW_SNAPSHOT_DIR=/app/eval/fixtures/sources -e EMBED_PROVIDER=stub \
+  orchestrator python -m app.ingest
+
+docker compose run --rm -e DATABASE_URL="$TEST_DB" \
+  -e EMBED_PROVIDER=stub -e LLM_PROVIDER=stub -e NO_ANSWER_MAX_DISTANCE=2.0 \
+  -e RAW_SNAPSHOT_DIR=/app/eval/fixtures/sources \
+  orchestrator pytest -m "not full_corpus" -q
+```
+
+That last command prints `96 passed, 6 skipped, 11 deselected`. The 6 skips are the refresh-graph
+tests, which need the `[freshness]` extra the service image does not install.
+
+If you forget and run against the real corpus, the write tests refuse to run and tell you so, rather
+than writing to it. That guard fires when the target database holds a row for every URL in
+`data/sources/sources.yaml`. Tests marked `full_corpus` need the real 14-source corpus and a
+reachable Ollama, and are excluded above; the CI gate excludes them too.
+
 ## Required environment variables
 
 All of these are documented with dev defaults in `.env.example`. None of them are secrets in dev;
@@ -104,6 +142,63 @@ labels that contain them, and a couple of USCIS pages carry their only real sect
 h4 with no h2 at all. The chunker in `services/orchestrator/app/ingest.py` reads a heading with no
 body before the next heading as a group label rather than a content section, and assigns each
 chunk's parent from that label chain in document order, not from comparing heading level numbers.
+
+## Staying current
+
+Government pages change, and some of these rules have a published date on which they change. The
+re-crawl job in `services/orchestrator/app/recrawl.py` re-fetches every source in the manifest,
+compares each page to the snapshot that was actually indexed, and decides whether the difference
+matters:
+
+```bash
+pip install -e "./services/orchestrator[freshness]"
+python -m app.recrawl --dry-run     # fetch and classify, write nothing
+python -m app.recrawl               # apply the result
+```
+
+The comparison strips navigation, timestamps and boilerplate, then compares the remaining lines. An
+identical page is `unchanged`. Reordering, or a difference that survives only as capitalization,
+punctuation or markdown syntax, is `cosmetic`. Anything else is `meaningful`. The bias is
+deliberate: any real addition or removal of a non-boilerplate line counts as meaningful, because a
+re-index costs a few minutes and serving a stale rule costs someone their status. That also means a
+typo fix triggers a re-index it did not need, and a rule change hidden inside a line the boilerplate
+filter drops would be missed. `classify_change`'s docstring lists the failure modes.
+
+An `unchanged` or `cosmetic` page updates `last_verified_at` and nothing else, so a page checked this
+morning and found unchanged does not read as months stale. A `meaningful` page updates `fetched_at`
+and `page_last_updated` too, and its chunks are re-embedded and replaced. The snapshot on disk is
+only rewritten on a meaningful change, which keeps it equal to what is actually in the database.
+
+The job is a LangGraph state machine, one graph run per source, checkpointed to SQLite. A run that
+dies partway through resumes at the step it died on when restarted with the same run id, which
+defaults to the current UTC date. One source failing its fetch does not stop the others: it retries
+a bounded number of times, records `fetch_failed`, and the run continues.
+
+LangGraph pulls in a large dependency tree, and none of it may reach the code that serves `/query`
+or the code that runs the eval. It lives in its own `[freshness]` extra, `app/recrawl.py` imports it
+inside the function that builds the graph rather than at module level, and two tests in
+`services/orchestrator/tests/` assert that importing `app.main`, `app.pipeline`, `app.recrawl` or
+`eval.run` pulls in no module whose name begins with `langgraph` or `langchain`. See
+`docs/adr/0005-langgraph-for-the-refresh-pipeline.md`, which also says plainly what a plain Python
+loop over 14 sources would have done just as well.
+
+`.github/workflows/recrawl.yml` runs the job on a schedule. Like the eval workflow, pushing it is
+yours to do by hand.
+
+### Freshness on an answer
+
+Every answer carries a `freshness` block: the date it was generated, and for each source it drew
+on, when that page was last updated, last fetched, and last verified. Where a retrieved source
+states a rule with a known effective date, the answer also says so in its own text, with the date
+and a link. The live case is the DHS fixed-period-of-admission final rule, effective September 15
+2026, which changes the F-1 post-completion departure period from 60 days to 30. Asking today about
+the departure period returns the current 60-day rule and a sentence saying a rule takes effect on
+September 15 2026, so the answer differs before and after that date.
+
+Crawl dates stay out of the answer text on purpose. An effective date is stated by the source
+itself, so putting it in the answer adds nothing the citations do not already support. When this
+system last checked a page is a fact about this system, not about the source, so it belongs in the
+structured field where the interface can show it.
 
 ## CI eval gate
 

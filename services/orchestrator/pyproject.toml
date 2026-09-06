@@ -65,6 +65,24 @@ eval-ci = [
     "openai==3.6.0",
     "textstat==0.7.13",
 ]
+# Phase 5 scheduled refresh job (app/recrawl.py, runnable as `python -m app.recrawl`). LangGraph
+# drives the per-source fetch/diff/reindex state machine there, checkpointed to a local sqlite file
+# so a killed run resumes instead of re-fetching from scratch (see app/recrawl.py's module
+# docstring). This extra is installed ONLY by .github/workflows/recrawl.yml and by a developer
+# running `python -m app.recrawl` locally -- NEVER by services/orchestrator/Dockerfile (the service
+# image that serves /query) and NEVER by CI's invariant gate (.github/workflows/eval.yml's
+# `pull_request` job, which installs `[dev,eval-ci]` only). langgraph pulls in langchain-core,
+# langgraph-checkpoint, langgraph-prebuilt, langgraph-sdk, langchain-protocol, ormsgpack, orjson,
+# websockets, and xxhash as transitive dependencies; none of that may reach app/main.py or
+# app/pipeline.py's import graph, or eval/run.py's -- see
+# services/orchestrator/tests/test_freshness.py's dependency-isolation test and
+# services/orchestrator/tests/test_ci_eval_mode.py's serving-path guard for the tests that enforce
+# this. Versions pinned here were verified to install cleanly together on python:3.12-slim.
+freshness = [
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint-sqlite>=3.1,<4",
+    "aiosqlite>=0.20",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -80,6 +98,20 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+# `eval` and `app` are declared first-party explicitly, rather than left to ruff's isort to infer
+# from the directory layout, because that inference is not stable across the two layouts this repo
+# is linted in and the two disagree about the same file. Inside the orchestrator image, eval/ is
+# bind-mounted as a sibling of app/ and tests/ under the ruff root (docker-compose.yml mounts
+# ./eval to /app/eval), so `import eval.run` reads as first-party and belongs in its own group. In
+# a bare checkout, eval/ sits two directories above services/orchestrator/, so the same import
+# reads as third-party and belongs alphabetised alongside pytest. Those two orderings are mutually
+# exclusive, so tests/test_ci_eval_mode.py could not satisfy `ruff check` in both environments at
+# once, and which one was clean depended on where it was run. This setting fixes the
+# classification, so the ordering is the same everywhere. It disables no rule and loosens nothing;
+# I001 is still enforced.
+[tool.ruff.lint.isort]
+known-first-party = ["app", "eval"]
+
 [tool.black]
 line-length = 100
 target-version = ["py312"]
@@ -90,4 +122,5 @@ asyncio_mode = "auto"
 markers = [
     "live_stack: requires a live orchestrator (docker compose or a bare `uvicorn app.main:app`) reachable over HTTP, with a corpus already ingested",
     "full_corpus: requires data/sources/raw/ populated from the real 14-source manifest (data/sources/sources.yaml) via `python -m app.ingest` (INGEST_MODE=fetch); not satisfied by the small eval/fixtures/sources/ corpus the CI invariant gate ingests",
+    "freshness: requires the [freshness] extra (langgraph); skipped where it is not installed",
 ]

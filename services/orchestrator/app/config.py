@@ -164,6 +164,16 @@ class Settings(BaseSettings):
     # through to retrieval instead.
     CLARIFY_MIN_CONTENT_WORDS: int = 3
 
+    # Scheduled refresh job (Phase 5, app/recrawl.py, [freshness] extra only -- never installed by
+    # the service image or by CI's invariant gate). REFRESH_CHECKPOINT_PATH is where LangGraph's
+    # AsyncSqliteSaver persists per-source state, so a killed run resumes instead of re-fetching
+    # every source from scratch. REFRESH_MAX_FETCH_ATTEMPTS bounds the fetch node's own retry
+    # loop -- never an unbounded retry. REFRESH_RETRY_BACKOFF_SECONDS is the sleep between attempts;
+    # tests set this to 0 so retries are instant and deterministic.
+    REFRESH_CHECKPOINT_PATH: str = "/app/data/refresh-checkpoints.sqlite"
+    REFRESH_MAX_FETCH_ATTEMPTS: int = 3
+    REFRESH_RETRY_BACKOFF_SECONDS: float = 2.0
+
 
 @lru_cache
 def get_settings() -> Settings:

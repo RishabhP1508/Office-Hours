@@ -197,3 +197,49 @@ def test_importing_eval_run_never_imports_ragas_or_langchain():
         f"importing eval.run leaked a forbidden module: stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
     )
+
+
+# Phase 5: langgraph (installed only by the orchestrator's `[freshness]` extra, see
+# services/orchestrator/pyproject.toml) must never reach the serving path -- app/main.py and
+# app/pipeline.py, and everything they import. Checked with a prefix/predicate scan over
+# sys.modules (any module whose name starts with "langgraph" or "langchain", or that is exactly
+# "ragas" or "datasets"), not a fixed list, so a future "langgraph_something" or
+# "langchain_whatever" submodule is caught too, the same way _FORBIDDEN_CI_MODULES above already
+# covers the eval path. Both app.main and app.pipeline are checked, in separate subprocesses, since
+# app.main itself imports app.pipeline and a leak introduced in either module must be caught.
+def _leaked_langgraph_or_langchain_modules(import_line: str) -> list[str]:
+    # LANGGRAPH_OR_LANGCHAIN_PREDICATE_SRC is shared with test_freshness.py's app.recrawl
+    # import-isolation guard (conftest.py), so the two checks cannot independently drift into
+    # testing two different classes of "langgraph/langchain leaked."
+    from conftest import LANGGRAPH_OR_LANGCHAIN_PREDICATE_SRC
+
+    probe = (
+        f"{import_line}\n"
+        "import sys\n"
+        "def _forbidden(m):\n"
+        f"    return ({LANGGRAPH_OR_LANGCHAIN_PREDICATE_SRC}) or m in ('ragas', 'datasets')\n"
+        "leaked = sorted(m for m in sys.modules if _forbidden(m))\n"
+        "print('LEAKED:' + ','.join(leaked))\n"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert (
+        result.returncode == 0
+    ), f"probe itself failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    marker = "LEAKED:"
+    line = next(line for line in result.stdout.splitlines() if line.startswith(marker))
+    leaked = line[len(marker) :]
+    return [name for name in leaked.split(",") if name]
+
+
+@pytest.mark.parametrize("import_line", ["import app.main", "import app.pipeline"])
+def test_serving_path_never_imports_langgraph_or_langchain_or_ragas_or_datasets(import_line):
+    """Importing app.main (which imports app.pipeline, app.db, the providers, and every guardrail
+    including app.guardrails.freshness) or app.pipeline directly must never pull in langgraph,
+    langchain, ragas, or datasets -- none of those belong in the image that serves /query. This is
+    the class-of-module guard CLAUDE.md's "assert absence broadly" principle asks for: it would
+    catch a langgraph-adjacent package (langgraph-checkpoint, langgraph-sdk, ...) or a
+    langchain-adjacent one (langchain-core, langchain-community, ...) just as well as it catches
+    the two named packages themselves.
+    """
+    leaked = _leaked_langgraph_or_langchain_modules(import_line)
+    assert not leaked, f"{import_line!r} leaked forbidden module(s) into the serving path: {leaked}"
