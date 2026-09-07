@@ -21,7 +21,7 @@
 # `app` below is a placeholder -- Fly app names are globally unique across all Fly accounts, so
 # whoever deploys this picks their own (e.g. `fly apps create office-hours-orchestrator-<handle>`)
 # and edits this line to match before the first deploy.
-app = "office-hours-orchestrator"
+app = "oh-orchestrator-rp"
 primary_region = "iad"
 
 # NOTE: this table must stay ABOVE [env]/[http_service]/[[vm]] with nothing but comments between
@@ -127,7 +127,7 @@ primary_region = "iad"
   # "/v1/traces" or "/v1/metrics" yourself; both this service and office-hours-gateway append that
   # suffix themselves, using the identical rule, from this same base value. Get the real value from
   # Grafana Cloud's own "OTLP" integration page for your stack.
-  OTEL_EXPORTER_OTLP_ENDPOINT = "https://otlp-gateway-<region>.grafana.net/otlp"
+  OTEL_EXPORTER_OTLP_ENDPOINT = "https://otlp-gateway-prod-us-east-2.grafana.net/otlp"
   # Inert for THIS project's exporter classes (opentelemetry-exporter-otlp-proto-http is already
   # protobuf-over-http unconditionally; this env var only matters to the generic
   # "opentelemetry-exporter-otlp" auto-selecting package, which this project does not use) -- set
@@ -137,7 +137,7 @@ primary_region = "iad"
   # Langfuse: cloud.langfuse.com (EU) or us.cloud.langfuse.com (US) -- pick whichever region the
   # Langfuse project was actually created in.
   LANGFUSE_HOST = "https://us.cloud.langfuse.com"
-  LANGFUSE_PUBLIC_KEY = "pk-lf-your-public-key-here"
+  LANGFUSE_PUBLIC_KEY = "pk-lf-4b386122-b6c3-415e-b085-a7d4f7e75001"
 
 [http_service]
   internal_port = 8000

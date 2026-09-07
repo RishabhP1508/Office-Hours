@@ -10,7 +10,7 @@
 #
 # `app` below is a placeholder -- Fly app names are globally unique, so whoever deploys this picks
 # their own (e.g. `fly apps create office-hours-gateway-<handle>`) and edits this line to match.
-app = "office-hours-gateway"
+app = "oh-gateway-rp"
 primary_region = "iad"
 
 # --- Required secrets (set with `fly secrets set NAME=value -a office-hours-gateway`, NEVER
@@ -50,7 +50,7 @@ primary_region = "iad"
   # actually set to and deployed as. Fly private networking (6PN) lets one app reach another over
   # plain HTTP at http://<app-name>.internal:<port> without leaving Fly's network, which is why
   # this is http:// even in production, not https://.
-  ORCHESTRATOR_URL = "http://<orchestrator-app-name>.internal:8000"
+  ORCHESTRATOR_URL = "http://oh-orchestrator-rp.internal:8000"
   ALLOWED_ORIGINS = "https://office-hours.vercel.app"
   RATE_LIMIT_BUCKET_CAPACITY = "20"
   RATE_LIMIT_REFILL_PER_SECOND = "1"
@@ -65,7 +65,7 @@ primary_region = "iad"
   # --- internal/middleware/tracing.go's own "THE URL RULE" comment derives the same final
   # --- "<this>/v1/traces" as app/telemetry.py derives on the other service. Never append
   # --- "/v1/traces" yourself; this service's tracing.go appends it.
-  OTEL_EXPORTER_OTLP_ENDPOINT = "https://otlp-gateway-<region>.grafana.net/otlp"
+  OTEL_EXPORTER_OTLP_ENDPOINT = "https://otlp-gateway-prod-us-east-2.grafana.net/otlp"
   # Inert for this service's exporter package (otlptracehttp is already protobuf-over-http
   # unconditionally) -- set anyway for consistency with Grafana Cloud's own setup instructions.
   OTEL_EXPORTER_OTLP_PROTOCOL = "http/protobuf"
