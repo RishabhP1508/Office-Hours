@@ -39,7 +39,17 @@ async def _configure(conn) -> None:
 
 
 def make_pool(database_url: str) -> AsyncConnectionPool:
-    return AsyncConnectionPool(database_url, open=False, configure=_configure)
+    return AsyncConnectionPool(
+        database_url,
+        open=False,
+        configure=_configure,
+        # Neon's pooler drops idle server connections, so a pooled connection can be dead by the time
+        # it is handed out. check runs a cheap liveness probe first and discards a dead one; max_idle
+        # recycles below the pooler's own idle timeout so it usually never comes to that.
+        check=AsyncConnectionPool.check_connection,
+        max_idle=180.0,
+        max_lifetime=1800.0,
+    )
 
 
 # Single-CTE hybrid retrieval: a semantic arm and a keyword arm, each ranked independently, fused
