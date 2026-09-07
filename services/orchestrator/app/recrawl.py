@@ -274,11 +274,6 @@ def classify_change(old_body: str, new_body: str) -> ChangeVerdict:
     )
 
 
-def _frontmatter_date_iso(frontmatter: dict, key: str) -> str | None:
-    parsed = _parse_iso_date(frontmatter.get(key))
-    return parsed.isoformat() if parsed else None
-
-
 # ---------------------------------------------------------------------------------------------
 # Golden-set impact (Phase 8 round 2): which eval/golden.jsonl rows a meaningfully-changed source
 # might affect. READ-ONLY -- this section never writes, edits, or reorders eval/golden.jsonl. It
@@ -408,12 +403,15 @@ async def touch_last_verified(
     """Bookkeeping only: moves `sources.last_verified_at` (and `last_success_at`, and clears any
     prior failure bookkeeping -- a source that was previously failing but is now reachable again
     and unchanged is exactly as healthy as one that never failed) and syncs
-    `documents.rule_effective_date`. Never touches `sources.fetched_at`/`page_last_updated`, or
-    `documents.content`/`embedding` -- see the WHY THE SPLIT comment above. `rule_effective_date` is
-    synced here (even though nothing else changed) because it is a curator annotation carried in
-    the snapshot's own frontmatter, not fetched page content, so keeping the table's copy current is
-    bookkeeping in exactly the sense `last_verified_at` is. Both writes happen in one transaction.
-    Returns the number of `documents` rows whose `rule_effective_date` was synced.
+    `documents.rule_effective_date` and `sources.rule_effective_date`. Never touches
+    `sources.fetched_at`/`page_last_updated`/`last_indexed_body`, or `documents.content`/
+    `embedding` -- see the WHY THE SPLIT comment above, and infra/sql/init.sql's comment on
+    `last_indexed_body`: an unchanged/cosmetic verdict means nothing is being re-indexed, so the
+    body app/recrawl.py::_diff_node will next compare against must stay exactly what it already was.
+    `rule_effective_date` is synced here (even though nothing else changed) because it is a curator
+    annotation, not fetched page content, so keeping both tables' copies current is bookkeeping in
+    exactly the sense `last_verified_at` is. All writes happen in one transaction. Returns the
+    number of `documents` rows whose `rule_effective_date` was synced.
     """
     async with conn.transaction():
         async with conn.cursor() as cur:
@@ -425,10 +423,11 @@ async def touch_last_verified(
                     consecutive_failures = 0,
                     last_error = NULL,
                     last_http_status = NULL,
-                    status = 'ok'
+                    status = 'ok',
+                    rule_effective_date = %s
                 WHERE source_url = %s
                 """,
-                (now, now, source_url),
+                (now, now, rule_effective_date, source_url),
             )
             await cur.execute(
                 "UPDATE documents SET rule_effective_date = %s WHERE source_url = %s",
@@ -500,12 +499,21 @@ async def reindex_source(
     resolved_url: str | None,
     page_last_updated: date | None,
     rule_effective_date: date | None,
+    body: str,
     chunks: list[dict],
     now: datetime,
 ) -> int:
     """A meaningful change: delete this source's old rows and insert freshly embedded chunks, all
     in one transaction, setting `fetched_at = last_verified_at = now` (this source was both
-    re-fetched and re-checked right now) plus the new `page_last_updated`/`rule_effective_date`.
+    re-fetched and re-checked right now) plus the new `page_last_updated`/`rule_effective_date`/
+    `last_indexed_body`.
+
+    `body` is the freshly fetched raw markdown this call is indexing -- the SAME text
+    `_chunk_node` just wrote to the snapshot file and chunked (`state["body"]`, never
+    reconstructed from `chunks`) -- so `sources.last_indexed_body` ends this call holding exactly
+    what the next recrawl's `_diff_node` needs to compare its own next fetch against. See
+    app/ingest.py::_embed_and_store's own docstring for why a chunk's own `text` cannot stand in
+    for this.
 
     Reuses app.ingest._embed_and_store instead of forking a second copy of the INSERT -- the same
     delete-then-insert-in-one-transaction shape `python -m app.ingest` itself uses. `mark_changed`
@@ -519,6 +527,7 @@ async def reindex_source(
         source_url=source_url,
         resolved_url=resolved_url,
         page_last_updated=page_last_updated,
+        body=body,
         rule_effective_date=rule_effective_date,
         chunks=chunks,
         now=now,
@@ -690,34 +699,84 @@ def _after_fetch(state: RefreshState) -> str:
     return "record_failure"
 
 
+async def _load_diff_baseline(
+    conn: psycopg.AsyncConnection, source_url: str
+) -> tuple[str | None, date | None, bool]:
+    """The three facts `_diff_node` needs to decide what it is looking at: the body it should diff
+    the freshly fetched page against (`sources.last_indexed_body`), the curator annotation to carry
+    forward (`sources.rule_effective_date`), and whether `documents` already holds chunks for this
+    source_url -- the signal that tells "genuinely new source" apart from "backfill has not run"
+    when the body comes back NULL (see `_diff_node`'s own docstring). Returns
+    `(None, None, has_existing_chunks)` when no `sources` row exists at all yet.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT last_indexed_body, rule_effective_date FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        source_row = await cur.fetchone()
+        await cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE source_url = %s)",
+            (source_url,),
+        )
+        (has_existing_chunks,) = await cur.fetchone()
+
+    if source_row is None:
+        return None, None, has_existing_chunks
+    last_indexed_body, rule_effective_date = source_row
+    return last_indexed_body, rule_effective_date, has_existing_chunks
+
+
 async def _diff_node(deps: RefreshDeps, state: RefreshState) -> dict:
-    """Compare the freshly fetched body against whatever snapshot currently sits on disk for this
-    source (always read from the REAL raw_dir, dry-run or not -- dry-run only forbids writes).
-    Also carries forward `rule_effective_date` from the existing snapshot's frontmatter: it is a
-    curator annotation, not something re-derived from the fetched page.
+    """Compare the freshly fetched body against `sources.last_indexed_body` -- the database, never a
+    snapshot file on disk (see infra/sql/init.sql's comment on that column and
+    docs/adr/0014-stateless-recrawl-diff.md for why: a snapshot file is gitignored and does not
+    survive between runs on a stateless runner, but every environment this job runs in already has
+    the database). Always read, dry-run or not -- dry-run only forbids writes. Also carries forward
+    `sources.rule_effective_date`, the curator annotation, unchanged from whatever it already was.
+
+    A NULL `last_indexed_body` is ambiguous on its own -- it means EITHER "this source has never
+    been indexed before" (a genuinely new manifest entry) OR "this source was indexed before this
+    column existed, and the one-time backfill (app/backfill_source_bodies.py) has not been run
+    against this database yet". Those two cases must never be treated the same: the first is a
+    real first-time index (proceed exactly as `no_existing_snapshot` always has); the second, if
+    silently treated as the first, would re-index and re-embed a source whose content has not
+    actually changed and reset its `fetched_at` -- for every already-ingested source, the very
+    first time this job runs against a freshly migrated database. `has_existing_chunks` (whether
+    `documents` already holds a row for this source_url) is what tells them apart: a genuinely new
+    source has never been chunked into `documents` either, while a source only missing its backfill
+    already has. This raises rather than returning a special verdict, so it fails loudly through the
+    same per-source isolation `run_refresh` already gives every other failure (see that function's
+    own per-source try/except): the source is reported `fetch_failed` with a reason naming the real
+    cause, the run goes red for it, and none of this source's freshness clocks move.
     """
     trail = [*state["node_trail"], "diff"]
-    existing_index = load_existing_snapshot_index(deps.raw_dir)
-    existing_path = existing_index.get(state["source_url"])
+    source_url = state["source_url"]
 
-    if existing_path is None:
-        old_frontmatter: dict = {}
-        old_body: str | None = None
+    async with deps.conn_factory() as conn:
+        last_indexed_body, rule_effective_date, has_existing_chunks = await _load_diff_baseline(
+            conn, source_url
+        )
+
+    if last_indexed_body is not None:
+        verdict = classify_change(last_indexed_body, state["body"])
+    elif has_existing_chunks:
+        raise RuntimeError(
+            f"{source_url}: sources.last_indexed_body is NULL but `documents` already holds "
+            "chunks for this source. This is the unsafe post-migration, pre-backfill state, not "
+            "a genuinely new source -- refusing to silently treat it as a first-time index, which "
+            "would reset fetched_at and re-embed content that has not actually changed. Run "
+            "`python -m app.backfill_source_bodies` against this database, then retry."
+        )
     else:
-        old_frontmatter, old_body = load_snapshot(existing_path)
-
-    rule_effective_date = _frontmatter_date_iso(old_frontmatter, "rule_effective_date")
-
-    if old_body is None:
-        # No existing snapshot at all for this source (a manifest entry ingest.py never saw) --
-        # there is nothing to diff against, so it is treated as a full first-time index.
+        # No existing baseline AND no chunks in `documents` -- a genuinely new source (a manifest
+        # entry never seen before). There is nothing to diff against, so it is treated as a full
+        # first-time index.
         verdict = ChangeVerdict(status="meaningful", reason="no_existing_snapshot")
-    else:
-        verdict = classify_change(old_body, state["body"])
 
     return {
         "verdict": asdict(verdict),
-        "rule_effective_date": rule_effective_date,
+        "rule_effective_date": rule_effective_date.isoformat() if rule_effective_date else None,
         "node_trail": trail,
     }
 
@@ -803,6 +862,7 @@ async def _reindex_node(deps: RefreshDeps, state: RefreshState) -> dict:
             resolved_url=state.get("resolved_url"),
             page_last_updated=page_last_updated,
             rule_effective_date=rule_effective_date,
+            body=state["body"],
             chunks=chunks,
             now=now,
         )
