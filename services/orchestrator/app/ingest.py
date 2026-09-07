@@ -577,6 +577,7 @@ async def _embed_and_store(
     source_url: str,
     resolved_url: str | None,
     page_last_updated: date | None,
+    body: str,
     chunks: list[dict],
     rule_effective_date: date | None = None,
     now: datetime | None = None,
@@ -588,6 +589,18 @@ async def _embed_and_store(
     is an explicit parameter so app/recrawl.py::reindex_source (Phase 5) can pass one `now` value
     for both `fetched_at` and `last_verified_at`, deterministically, instead of two separate calls
     to datetime.now(UTC) that could disagree by a few microseconds.
+
+    `body` is the raw markdown this source was just indexed from -- the same text a snapshot file
+    holds, BEFORE chunking (never a chunk's own `text`, which chunk_markdown prefixes with a
+    breadcrumb line and is therefore lossy to reconstruct a body from -- see
+    docs/adr/0014-stateless-recrawl-diff.md). Stored into `sources.last_indexed_body` so
+    app/recrawl.py::_diff_node's next comparison for this source_url has a baseline in the database
+    instead of a snapshot file on disk (see infra/sql/init.sql's comment on that column for why).
+    Written on every call to this function -- a first-time ingest and a meaningful re-index alike
+    -- because both are exactly the cases where "what is currently indexed" actually changes; an
+    unchanged/cosmetic re-crawl never calls this function at all (see
+    app/recrawl.py::touch_last_verified), so `last_indexed_body` correctly stays put on those paths,
+    the same way `fetched_at` does.
 
     Phase 7: `documents.source_url` is a foreign key into `sources`, so that row has to exist
     before any chunk referencing it can be inserted -- the upsert below runs FIRST, inside the same
@@ -619,9 +632,9 @@ async def _embed_and_store(
                 INSERT INTO sources
                     (source_url, resolved_url, page_last_updated, fetched_at, last_verified_at,
                      last_changed_at, last_success_at, change_count, consecutive_failures,
-                     last_error, last_http_status, status)
+                     last_error, last_http_status, status, last_indexed_body, rule_effective_date)
                 VALUES (%(source_url)s, %(resolved_url)s, %(page_last_updated)s, %(now)s, %(now)s,
-                        %(now)s, %(now)s, 0, 0, NULL, NULL, 'ok')
+                        %(now)s, %(now)s, 0, 0, NULL, NULL, 'ok', %(body)s, %(rule_effective_date)s)
                 ON CONFLICT (source_url) DO UPDATE SET
                     resolved_url = EXCLUDED.resolved_url,
                     page_last_updated = EXCLUDED.page_last_updated,
@@ -635,7 +648,9 @@ async def _embed_and_store(
                     last_changed_at = CASE WHEN %(mark_changed)s THEN EXCLUDED.last_changed_at
                                             ELSE sources.last_changed_at END,
                     change_count = sources.change_count
-                        + CASE WHEN %(mark_changed)s THEN 1 ELSE 0 END
+                        + CASE WHEN %(mark_changed)s THEN 1 ELSE 0 END,
+                    last_indexed_body = EXCLUDED.last_indexed_body,
+                    rule_effective_date = EXCLUDED.rule_effective_date
                 """,
                 {
                     "source_url": source_url,
@@ -643,6 +658,8 @@ async def _embed_and_store(
                     "page_last_updated": page_last_updated,
                     "now": now,
                     "mark_changed": mark_changed,
+                    "body": body,
+                    "rule_effective_date": rule_effective_date,
                 },
             )
 
@@ -702,6 +719,7 @@ async def _ingest_from_manifest(
                 source_url=frontmatter["source_url"],
                 resolved_url=frontmatter.get("resolved_url"),
                 page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
+                body=body,
                 rule_effective_date=_parse_iso_date(frontmatter.get("rule_effective_date")),
                 chunks=chunks,
             )
@@ -741,6 +759,7 @@ async def _ingest_from_snapshots(
             source_url=source_url,
             resolved_url=frontmatter.get("resolved_url"),
             page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
+            body=body,
             rule_effective_date=_parse_iso_date(frontmatter.get("rule_effective_date")),
             chunks=chunks,
         )

@@ -79,6 +79,47 @@ COMMENT ON TABLE sources IS
     'failure history `documents` had no row to attach a fetch failure to at all. See each column''s '
     'own comment for why it could not be reconstructed from anything else stored here.';
 
+-- Stateless recrawl (docs/adr/0014-stateless-recrawl-diff.md): the scheduled refresh job
+-- (app/recrawl.py) used to diff a freshly-fetched page against a snapshot FILE in
+-- data/sources/raw/, which is gitignored -- a fresh checkout (a GitHub Actions runner, or
+-- production with no persistent volume) has no such file, so every source read as
+-- "meaningful, no_existing_snapshot" and the job could not run there at all without destroying
+-- the corpus's freshness history. These two columns move the diff's baseline into the database,
+-- which every environment this job runs in already has, so the runner needs nothing left behind
+-- by a previous run.
+--
+-- ADD COLUMN IF NOT EXISTS keeps this file idempotent (re-running it against the already-migrated
+-- live database is a no-op for these two lines, same as every other ALTER COLUMN in this file).
+-- Both are NULL on every row that existed before this migration -- see
+-- app/backfill_source_bodies.py for the one-time, idempotent backfill that must run against
+-- production BEFORE the refresh job runs again, and app/recrawl.py::_diff_node for how it refuses
+-- to proceed on a source where the backfill has evidently not happened yet.
+ALTER TABLE sources
+    -- The exact body app/recrawl.py::classify_change last compared THIS source against -- i.e.
+    -- the same raw markdown app/ingest.py's snapshot file would have held, before frontmatter,
+    -- never a reconstruction from `documents` chunks (a chunk's stored text is prefixed with a
+    -- breadcrumb line -- see chunk_markdown -- so concatenating chunks back into a "body" is
+    -- lossy in exactly the way that makes the line-based differ mis-classify every chunk boundary
+    -- as a change; measured at 12,574 characters of reconstructed text against the real snapshot's
+    -- 12,321, see the ADR). Written by app/ingest.py::_embed_and_store on every path that indexes
+    -- a source (first ingest and a meaningful re-index alike), so it always reflects exactly what
+    -- is currently embedded in `documents` for this source_url. NEVER written on an unchanged or
+    -- cosmetic verdict (app/recrawl.py::touch_last_verified) -- exactly the same reason
+    -- `fetched_at` does not move on those paths either: this column's meaning is "the body
+    -- currently indexed", not "the body most recently fetched".
+    ADD COLUMN IF NOT EXISTS last_indexed_body TEXT,
+    -- A mirror of the curator annotation app/recrawl.py::_diff_node used to read out of the
+    -- PREVIOUS snapshot file's own YAML frontmatter (see documents.rule_effective_date's own
+    -- comment below for what the annotation itself means) so the stateless differ has somewhere
+    -- to read it from without a file. This does NOT replace documents.rule_effective_date, which
+    -- stays the per-CHUNK value actually applied to citations and answers -- this column is the
+    -- single per-SOURCE value app/recrawl.py::reindex_source/touch_last_verified apply uniformly
+    -- to every one of that source's chunks, which mirrors exactly what those two functions already
+    -- did before this column existed (both only ever accepted one `rule_effective_date` for the
+    -- whole source, never one per chunk); it exists so that value survives between recrawl runs
+    -- without a file to carry it in.
+    ADD COLUMN IF NOT EXISTS rule_effective_date DATE;
+
 CREATE TABLE IF NOT EXISTS documents (
     id                 BIGSERIAL PRIMARY KEY,
     content            TEXT NOT NULL,
@@ -134,7 +175,13 @@ CREATE INDEX IF NOT EXISTS documents_embedding_hnsw ON documents USING hnsw (emb
 -- that moved, this is a per-CHUNK annotation, not a per-SOURCE one -- a single source page can (and
 -- the fixed-admission FAQ does) carry many chunks, and a future source could in principle state more
 -- than one dated rule across different sections of the same page. Collapsing it to `sources` would
--- lose that per-chunk granularity for no benefit this phase needs.
+-- lose that per-chunk granularity for no benefit this phase needs. `sources.rule_effective_date`
+-- (added below, for the stateless recrawl diff -- docs/adr/0014-stateless-recrawl-diff.md) does NOT
+-- reverse this: it is a separate, later addition holding the single value the refresh job applies
+-- uniformly to every chunk of one source (which is all app/recrawl.py has ever done -- it has never
+-- carried more than one `rule_effective_date` per source), kept only so that value survives between
+-- recrawl runs without a snapshot file to read it from. THIS column stays the one citations and
+-- answers actually read.
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS rule_effective_date DATE;
 
 -- Phase 7 migration: on a fresh database, `documents` above is already created in its final shape

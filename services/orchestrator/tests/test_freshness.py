@@ -50,6 +50,7 @@ from app.guardrails.freshness import (
 )
 from app.ingest import (
     FetchedPage,
+    _embed_and_store,
     load_snapshot,
     mint_snapshot_filename,
     render_snapshot,
@@ -813,12 +814,22 @@ async def _insert_test_row(
     page_last_updated: date | None = None,
     heading: str = "Old Heading",
     content: str = "old content",
+    last_indexed_body: str | None = None,
+    rule_effective_date: date | None = None,
 ) -> int:
     """Phase 7: `resolved_url`/`page_last_updated`/`fetched_at`/`last_verified_at` moved off
     `documents` onto `sources` (the FK requires a `sources` row to exist before any `documents` row
     can reference it, so the upsert below runs first). Initializes the same "healthy, just-crawled"
     shape `_embed_and_store`'s own upsert does: last_success_at/last_changed_at := fetched_at,
     change_count/consecutive_failures := 0, status := 'ok'.
+
+    Stateless-recrawl columns (docs/adr/0014-stateless-recrawl-diff.md): `last_indexed_body`
+    defaults to None -- a `sources` row with real `documents` chunks (which this helper always
+    creates) and a NULL `last_indexed_body` is exactly the post-migration, pre-backfill state
+    app/recrawl.py::_diff_node refuses to silently treat as a first-time index (see
+    test_graph_diff_raises_loudly_when_backfill_has_not_run below). Tests that need `_diff_node` to
+    actually diff against a real prior body (every other graph test that reaches the diff at all)
+    pass `last_indexed_body=` explicitly.
     """
     async with conn.transaction():
         async with conn.cursor() as cur:
@@ -827,8 +838,8 @@ async def _insert_test_row(
                 INSERT INTO sources
                     (source_url, resolved_url, page_last_updated, fetched_at, last_verified_at,
                      last_changed_at, last_success_at, change_count, consecutive_failures,
-                     last_error, last_http_status, status)
-                VALUES (%s, NULL, %s, %s, %s, %s, %s, 0, 0, NULL, NULL, 'ok')
+                     last_error, last_http_status, status, last_indexed_body, rule_effective_date)
+                VALUES (%s, NULL, %s, %s, %s, %s, %s, 0, 0, NULL, NULL, 'ok', %s, %s)
                 ON CONFLICT (source_url) DO UPDATE SET
                     resolved_url = EXCLUDED.resolved_url,
                     page_last_updated = EXCLUDED.page_last_updated,
@@ -840,7 +851,9 @@ async def _insert_test_row(
                     consecutive_failures = 0,
                     last_error = NULL,
                     last_http_status = NULL,
-                    status = 'ok'
+                    status = 'ok',
+                    last_indexed_body = EXCLUDED.last_indexed_body,
+                    rule_effective_date = EXCLUDED.rule_effective_date
                 """,
                 (
                     source_url,
@@ -849,6 +862,8 @@ async def _insert_test_row(
                     fetched_at,
                     fetched_at,
                     fetched_at,
+                    last_indexed_body,
+                    rule_effective_date,
                 ),
             )
             await cur.execute("DELETE FROM documents WHERE source_url = %s", (source_url,))
@@ -889,8 +904,13 @@ async def test_touch_last_verified_moves_last_verified_and_leaves_everything_els
     old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
     old_page_last_updated = date(2026, 1, 1)
 
+    old_body = "old content"
     row_id = await _insert_test_row(
-        conn, source_url, fetched_at=old_time, page_last_updated=old_page_last_updated
+        conn,
+        source_url,
+        fetched_at=old_time,
+        page_last_updated=old_page_last_updated,
+        last_indexed_body=old_body,
     )
 
     new_now = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
@@ -914,21 +934,27 @@ async def test_touch_last_verified_moves_last_verified_and_leaves_everything_els
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT fetched_at, last_verified_at, page_last_updated, last_success_at, "
-            "consecutive_failures, last_error, last_http_status, status "
-            "FROM sources WHERE source_url = %s",
+            "consecutive_failures, last_error, last_http_status, status, last_indexed_body, "
+            "rule_effective_date FROM sources WHERE source_url = %s",
             (source_url,),
         )
         source_row = await cur.fetchone()
 
-    # fetched_at/page_last_updated never move -- touch_last_verified is bookkeeping only.
+    # fetched_at/page_last_updated/last_indexed_body never move -- touch_last_verified is
+    # bookkeeping only (see infra/sql/init.sql's comment on last_indexed_body: nothing was
+    # re-indexed, so the next diff's baseline must stay exactly what it already was).
     assert source_row["fetched_at"] == old_time
     assert source_row["page_last_updated"] == old_page_last_updated
+    assert source_row["last_indexed_body"] == old_body
     assert source_row["last_verified_at"] == new_now
     assert source_row["last_success_at"] == new_now
     assert source_row["consecutive_failures"] == 0
     assert source_row["last_error"] is None
     assert source_row["last_http_status"] is None
     assert source_row["status"] == "ok"
+    # The curator annotation DOES sync onto `sources`, mirroring what already happens on
+    # `documents` (both asserted above) -- see touch_last_verified's own docstring.
+    assert source_row["rule_effective_date"] == new_rule_effective_date
 
     await _delete_test_rows(conn, source_url)
 
@@ -956,13 +982,14 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
     new_now = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
     new_page_last_updated = date(2026, 9, 1)
     new_rule_effective_date = date(2026, 9, 15)
+    new_body = "New Heading\n\nSome new content."
     chunks = [
         {
             "heading": "New Heading",
             "level": 2,
             "parent": None,
             "breadcrumb": "New Heading",
-            "text": "New Heading\n\nSome new content.",
+            "text": new_body,
         }
     ]
 
@@ -973,6 +1000,7 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
         resolved_url=None,
         page_last_updated=new_page_last_updated,
         rule_effective_date=new_rule_effective_date,
+        body=new_body,
         chunks=chunks,
         now=new_now,
     )
@@ -995,7 +1023,8 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT fetched_at, last_verified_at, page_last_updated, last_changed_at, "
-            "change_count FROM sources WHERE source_url = %s",
+            "change_count, last_indexed_body, rule_effective_date "
+            "FROM sources WHERE source_url = %s",
             (source_url,),
         )
         source_row = await cur.fetchone()
@@ -1005,6 +1034,10 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
     # reindex_source always passes mark_changed=True -- last_changed_at/change_count must move.
     assert source_row["last_changed_at"] == new_now
     assert source_row["change_count"] == 1
+    # DoD 4: the freshly indexed body and curator annotation land on `sources` too, not just on
+    # `documents` -- this is what the NEXT recrawl's stateless _diff_node reads.
+    assert source_row["last_indexed_body"] == new_body
+    assert source_row["rule_effective_date"] == new_rule_effective_date
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute("SELECT id FROM documents WHERE source_url = %s", (other_source_url,))
@@ -1079,6 +1112,7 @@ async def test_reindex_source_embedder_failure_leaves_existing_chunks_intact(con
             resolved_url=None,
             page_last_updated=None,
             rule_effective_date=None,
+            body="New Heading\n\nSome new content.",
             chunks=chunks,
             now=datetime(2026, 9, 5, 12, 0, tzinfo=UTC),
         )
@@ -1125,8 +1159,13 @@ async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_a
     """
     source_url = "https://example.gov/freshness-test-reindex-wrong-dimension"
     old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    old_body = "old content"
     old_row_id = await _insert_test_row(
-        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+        conn,
+        source_url,
+        fetched_at=old_time,
+        page_last_updated=date(2026, 1, 1),
+        last_indexed_body=old_body,
     )
 
     async with conn.cursor(row_factory=dict_row) as cur:
@@ -1139,8 +1178,8 @@ async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_a
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT fetched_at, last_verified_at, page_last_updated, change_count "
-            "FROM sources WHERE source_url = %s",
+            "SELECT fetched_at, last_verified_at, page_last_updated, change_count, "
+            "last_indexed_body FROM sources WHERE source_url = %s",
             (source_url,),
         )
         before_source = await cur.fetchone()
@@ -1163,6 +1202,7 @@ async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_a
             resolved_url=None,
             page_last_updated=date(2026, 9, 1),
             rule_effective_date=None,
+            body="New Heading\n\nSome new content.",
             chunks=chunks,
             now=datetime(2026, 9, 5, 12, 0, tzinfo=UTC),
         )
@@ -1178,14 +1218,68 @@ async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_a
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT fetched_at, last_verified_at, page_last_updated, change_count "
-            "FROM sources WHERE source_url = %s",
+            "SELECT fetched_at, last_verified_at, page_last_updated, change_count, "
+            "last_indexed_body FROM sources WHERE source_url = %s",
             (source_url,),
         )
         after_source = await cur.fetchone()
     assert (
         after_source == before_source
     ), "the sources upsert that ran before the failed INSERT must roll back too"
+    assert (
+        after_source["last_indexed_body"] == old_body
+    ), "a failed reindex must never leave the NEW body committed, rolled-back diff baseline or not"
+
+    await _delete_test_rows(conn, source_url)
+
+
+async def test_embed_and_store_first_index_writes_last_indexed_body_and_rule_effective_date(conn):
+    """DoD 4's other half: `app/ingest.py::_embed_and_store` (the function BOTH a first-time
+    `python -m app.ingest` and app/recrawl.py::reindex_source's meaningful-change path funnel
+    through) must write `sources.last_indexed_body`/`rule_effective_date` on a genuinely first-time
+    index -- a brand-new source_url with no prior `sources` row at all -- not just on a re-index of
+    an already-known source (already proven by
+    test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_updated above).
+    """
+    source_url = "https://example.gov/freshness-test-first-index-body"
+    body = "# Test Page\n\n## Section\n\nSome first-time content.\n"
+    rule_effective_date = date(2026, 9, 15)
+    chunks = [
+        {
+            "heading": "Section",
+            "level": 2,
+            "parent": None,
+            "breadcrumb": "Test Page > Section",
+            "text": "Test Page > Section\n\nSome first-time content.",
+        }
+    ]
+
+    await _embed_and_store(
+        conn,
+        StubEmbedder(dim=768),
+        source_url=source_url,
+        resolved_url=None,
+        page_last_updated=date(2026, 1, 1),
+        body=body,
+        rule_effective_date=rule_effective_date,
+        chunks=chunks,
+    )
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT last_indexed_body, rule_effective_date FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        source_row = await cur.fetchone()
+    assert source_row["last_indexed_body"] == body
+    assert source_row["rule_effective_date"] == rule_effective_date
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT rule_effective_date FROM documents WHERE source_url = %s", (source_url,)
+        )
+        doc_row = await cur.fetchone()
+    assert doc_row["rule_effective_date"] == rule_effective_date
 
     await _delete_test_rows(conn, source_url)
 
@@ -1950,15 +2044,20 @@ async def test_graph_meaningful_change_reindexes_and_rewrites_the_snapshot(
     topic = "freshness_test"
     old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 
+    old_body = "# Test Page\n\n## Section\n\nThe extension is 24 months.\n"
     snapshot_path = _write_test_snapshot(
         tmp_path,
         source_url=source_url,
         topic=topic,
         title="Test Page",
-        body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
+        body=old_body,
     )
     old_row_id = await _insert_test_row(
-        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+        conn,
+        source_url,
+        fetched_at=old_time,
+        page_last_updated=date(2026, 1, 1),
+        last_indexed_body=old_body,
     )
 
     async def fetcher(entry):
@@ -1999,9 +2098,18 @@ async def test_graph_meaningful_change_reindexes_and_rewrites_the_snapshot(
     assert all(r["id"] != old_row_id for r in rows)
 
     async with conn.cursor(row_factory=dict_row) as cur:
-        await cur.execute("SELECT fetched_at FROM sources WHERE source_url = %s", (source_url,))
+        await cur.execute(
+            "SELECT fetched_at, last_indexed_body FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
         source_row = await cur.fetchone()
     assert source_row["fetched_at"] > old_time
+    # The freshly fetched body -- never the old one, and never a chunk's own (breadcrumb-prefixed)
+    # text -- is what the NEXT recrawl's diff must compare against (docs/adr/0014).
+    assert (
+        source_row["last_indexed_body"]
+        == "# Test Page\n\n## Section\n\nThe extension is 36 months.\n"
+    )
 
     await _delete_test_rows(conn, source_url)
 
@@ -2029,7 +2137,11 @@ async def test_graph_meaningful_change_carries_verdict_evidence_through_source_r
         body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
     )
     await _insert_test_row(
-        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+        conn,
+        source_url,
+        fetched_at=old_time,
+        page_last_updated=date(2026, 1, 1),
+        last_indexed_body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
     )
 
     async def fetcher(entry):
@@ -2121,7 +2233,11 @@ async def test_graph_meaningful_change_reports_exact_golden_impact_indices(
         body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
     )
     await _insert_test_row(
-        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+        conn,
+        source_url,
+        fetched_at=old_time,
+        page_last_updated=date(2026, 1, 1),
+        last_indexed_body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
     )
 
     async def fetcher(entry):
@@ -2197,7 +2313,11 @@ async def test_graph_meaningful_change_to_an_uncited_source_reports_empty_impact
         body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
     )
     await _insert_test_row(
-        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+        conn,
+        source_url,
+        fetched_at=old_time,
+        page_last_updated=date(2026, 1, 1),
+        last_indexed_body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
     )
 
     async def fetcher(entry):
@@ -2257,7 +2377,11 @@ async def test_graph_cosmetic_change_only_touches_last_verified(tmp_path, conn, 
     )
     old_snapshot_bytes = snapshot_path.read_bytes()
     old_row_id = await _insert_test_row(
-        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+        conn,
+        source_url,
+        fetched_at=old_time,
+        page_last_updated=date(2026, 1, 1),
+        last_indexed_body=old_body,
     )
 
     async def fetcher(entry):
@@ -2298,12 +2422,244 @@ async def test_graph_cosmetic_change_only_touches_last_verified(tmp_path, conn, 
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT fetched_at, last_verified_at FROM sources WHERE source_url = %s",
+            "SELECT fetched_at, last_verified_at, last_indexed_body FROM sources "
+            "WHERE source_url = %s",
             (source_url,),
         )
         source_row = await cur.fetchone()
     assert source_row["fetched_at"] == old_time
     assert source_row["last_verified_at"] > old_time
+    # A cosmetic verdict never re-indexes, so the body the NEXT recrawl diffs against must stay
+    # exactly what it already was -- never the differently-ordered text this run actually fetched.
+    assert source_row["last_indexed_body"] == old_body
+
+    await _delete_test_rows(conn, source_url)
+
+
+# =================================================================================================
+# Stateless recrawl (docs/adr/0014-stateless-recrawl-diff.md): _diff_node reads its baseline from
+# `sources.last_indexed_body`, never from a snapshot file. This is the production scenario the
+# whole change exists for -- a fresh checkout, or a stateless production host, has no
+# data/sources/raw/ at all.
+# =================================================================================================
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_stateless_run_classifies_unchanged_with_no_raw_dir_at_all(
+    tmp_path, conn, database_url
+):
+    """The production scenario this whole change exists for: raw_dir is never created at all (a
+    fresh checkout of data/sources/raw/, which is gitignored -- see .github/workflows/recrawl.yml),
+    and the database already holds each source's previous body. Every source whose freshly
+    fetched content matches that stored body must classify "unchanged", not "meaningful" -- an
+    absent raw_dir must carry no information at all about whether content changed, because
+    _diff_node never reads it for that purpose any more.
+    """
+    urls = [f"https://example.gov/stateless-run-{i}" for i in range(3)]
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    bodies = {
+        url: f"# Stateless Page {i}\n\n## Section\n\nContent for stateless source {i}.\n"
+        for i, url in enumerate(urls)
+    }
+    manifest = [
+        {"url": u, "topic": topic, "title": f"Stateless Page {i}"} for i, u in enumerate(urls)
+    ]
+
+    for url in urls:
+        await _insert_test_row(
+            conn,
+            url,
+            fetched_at=old_time,
+            page_last_updated=date(2026, 1, 1),
+            last_indexed_body=bodies[url],
+        )
+
+    absent_raw_dir = tmp_path / "checkout-with-no-raw-snapshots"
+    assert not absent_raw_dir.exists()
+
+    async def fetcher(entry):
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown=bodies[entry["url"]],
+        )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=manifest,
+        raw_dir=absent_raw_dir,
+        run_id="test-run-stateless",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    assert len(report.results) == 3
+    for result in report.results:
+        assert result.status == "unchanged", (result.source_url, result.status, result.reason)
+        assert result.reason == "identical_after_normalization"
+
+    # The unchanged path never invokes _chunk_node, so nothing ever writes to raw_dir -- proving
+    # this run genuinely never depended on, or touched, the filesystem for its diff.
+    assert not absent_raw_dir.exists()
+
+    await _delete_test_rows(conn, *urls)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_meaningful_change_stores_new_body_and_a_later_stateless_run_reports_unchanged(
+    tmp_path, conn, database_url
+):
+    """DoD 4 end to end: a meaningful change stores the new body on `sources` (proven directly in
+    test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_updated already), and a
+    SECOND, independent recrawl run -- a different run_id/checkpoint (a fresh graph invocation, not
+    a resume) and a raw_dir that is once again completely absent -- must read that stored body back
+    and report "unchanged" against it, never "meaningful" again.
+    """
+    source_url = "https://example.gov/stateless-body-write-then-rerun"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    old_body = "# Test Page\n\n## Section\n\nThe extension is 24 months.\n"
+    new_body = "# Test Page\n\n## Section\n\nThe extension is 36 months.\n"
+
+    await _insert_test_row(
+        conn,
+        source_url,
+        fetched_at=old_time,
+        page_last_updated=date(2026, 1, 1),
+        last_indexed_body=old_body,
+    )
+
+    async def fetcher(entry):
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown=new_body,
+        )
+
+    first_raw_dir = tmp_path / "raw-first-run"  # never pre-populated
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=first_raw_dir,
+        run_id="test-run-body-write-1",
+        checkpoint_path=str(tmp_path / "checkpoint-1.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+    assert report.results[0].status == "meaningful"
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT last_indexed_body FROM sources WHERE source_url = %s", (source_url,)
+        )
+        row = await cur.fetchone()
+    assert row["last_indexed_body"] == new_body
+
+    async def fetcher_same(entry):
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown=new_body,
+        )
+
+    second_raw_dir = tmp_path / "raw-second-run"  # absent again -- a fresh, stateless checkout
+    report2 = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=second_raw_dir,
+        run_id="test-run-body-write-2",  # different run_id/checkpoint -> a fresh graph invocation
+        checkpoint_path=str(tmp_path / "checkpoint-2.sqlite"),
+        fetcher=fetcher_same,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+    assert report2.results[0].status == "unchanged"
+    assert report2.results[0].reason == "identical_after_normalization"
+
+    await _delete_test_rows(conn, source_url)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_diff_raises_loudly_when_backfill_has_not_run_for_an_existing_source(
+    tmp_path, conn, database_url
+):
+    """DoD 2's unsafe case: a source that already has chunks in `documents` (the signature of a
+    real, previously-ingested source) but whose `sources.last_indexed_body` is still NULL --
+    exactly the state every pre-existing row is in immediately after the schema migration in
+    infra/sql/init.sql, before `python -m app.backfill_source_bodies` has been run against it. This
+    must never be silently treated the same as a genuinely new source: doing so would reset
+    fetched_at and re-embed content that has not actually changed, for every already-ingested
+    source, the very first time the refresh job runs after the migration. It must fail loudly
+    instead -- surfaced through the same per-source isolation every other failure already gets
+    (run_refresh's own per-source try/except), never swallowed into a silent "meaningful" verdict.
+    """
+    source_url = "https://example.gov/stateless-unsafe-backfill-missing"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    # Deliberately NOT passing last_indexed_body -- this reproduces the exact post-migration,
+    # pre-backfill state: a `sources` row with real `documents` chunks and a NULL body.
+    await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+    )
+
+    async def fetcher(entry):
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown="# Test Page\n\n## Section\n\nSome content.\n",
+        )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=tmp_path,
+        run_id="test-run-unsafe-backfill",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+    )
+
+    # run_refresh isolates one source's failure from the others (its own per-source try/except) --
+    # so this must not raise out of run_refresh itself, but the source must be reported failed,
+    # loudly, with a reason naming the real cause, never silently as "meaningful".
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "fetch_failed"
+    assert "backfill" in (result.reason or "").lower()
+    assert result.status != "meaningful"
+    assert report.exit_code() == 1
+
+    # fetched_at/last_verified_at must NOT have moved -- the whole point is that this source's
+    # freshness history survives untouched until a human runs the backfill.
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fetched_at, last_verified_at FROM sources WHERE source_url = %s",
+            (source_url,),
+        )
+        row = await cur.fetchone()
+    assert row["fetched_at"] == old_time
+    assert row["last_verified_at"] == old_time
 
     await _delete_test_rows(conn, source_url)
 

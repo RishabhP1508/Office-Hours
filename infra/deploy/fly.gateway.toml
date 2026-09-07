@@ -51,7 +51,7 @@ primary_region = "iad"
   # plain HTTP at http://<app-name>.internal:<port> without leaving Fly's network, which is why
   # this is http:// even in production, not https://.
   ORCHESTRATOR_URL = "http://oh-orchestrator-rp.internal:8000"
-  ALLOWED_ORIGINS = "https://office-hours.vercel.app"
+  ALLOWED_ORIGINS = "https://office-hours-gray.vercel.app"
   RATE_LIMIT_BUCKET_CAPACITY = "20"
   RATE_LIMIT_REFILL_PER_SECOND = "1"
   UPSTREAM_TIMEOUT_SECONDS = "15"

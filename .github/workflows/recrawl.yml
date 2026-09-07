@@ -52,10 +52,10 @@ jobs:
       - name: Install orchestrator + freshness dependencies (no eval, no eval-ci)
         run: pip install -e "./services/orchestrator[dev,freshness]"
 
-      # secrets.DATABASE_URL is empty until Phase 8 stands up a hosted database this job can reach
-      # (there is no production database yet -- see ARCHITECTURE.md's "Deliberately not decided
-      # yet"). The two steps below are mutually exclusive on this output (`mode`): "dry-run" skips
-      # the crawl entirely (see the next step for why), "live" runs the real refresh.
+      # secrets.DATABASE_URL is unset wherever no hosted database secret has been configured for
+      # this repository (e.g. a fork, or a checkout before the secret is added). The two steps
+      # below are mutually exclusive on this output (`mode`): "dry-run" skips the crawl entirely
+      # (see the next step for why), "live" runs the real refresh.
       #
       # The secret is read into an env var here, never interpolated directly into the shell script
       # (`${{ secrets.DATABASE_URL }}` inside `run:` would expand to raw script text before bash
@@ -72,44 +72,22 @@ jobs:
             echo "mode=live" >> "$GITHUB_OUTPUT"
           fi
 
-      # No DATABASE_URL secret yet -- do NOT fetch anything. data/sources/raw/ is gitignored (see
-      # .gitignore), so a fresh checkout on this runner has no snapshots at all: app/recrawl.py's
-      # `_diff_node` treats a missing snapshot as "nothing to diff against" and returns
-      # `status=meaningful, reason=no_existing_snapshot` for every source. A dry run here would
-      # therefore report all 14 sources as changed every single day regardless of whether anything
-      # actually changed -- a report that is actively wrong, not just unavailable, while still
-      # spending 14 real HTTP requests against government pages to produce it. So this step does
-      # nothing but explain that and exit 0, so the daily schedule does not show a false red X.
+      # No DATABASE_URL secret yet -- do NOT fetch anything. Without a database there is nowhere
+      # to read a diff baseline from, nowhere to write a result to, and nothing for the human-
+      # readable report to describe -- so this step does nothing but explain that and exit 0,
+      # rather than burn 14 real HTTP requests against government pages for a report with no
+      # database to persist into. This is NOT about data/sources/raw/ being gitignored: the diff
+      # itself is stateless now (app/recrawl.py::_diff_node reads its baseline from
+      # `sources.last_indexed_body`, never from a snapshot file -- see
+      # docs/adr/0014-stateless-recrawl-diff.md), so an empty/absent raw_dir on its own is no
+      # longer a reason to skip anything once a database exists.
       - name: No database configured yet -- the scheduled refresh is inert (Phase 8 not landed)
         if: steps.db.outputs.mode == 'dry-run'
         run: |
-          echo "No DATABASE_URL secret configured yet (Phase 8 has not stood up a hosted database)."
-          echo "Skipping the crawl entirely rather than running --dry-run: data/sources/raw/ is"
-          echo "gitignored, so this checkout has no snapshots to diff against, and every one of the"
-          echo "14 sources would read as status=meaningful/reason=no_existing_snapshot -- a report"
-          echo "claiming the whole corpus changed when nothing did, at the cost of 14 real requests"
-          echo "against government pages. This step is a deliberate no-op until a database exists."
+          echo "No DATABASE_URL secret configured yet."
+          echo "Skipping the crawl entirely: there is nowhere to read a diff baseline from or write"
+          echo "a result to. This step is a deliberate no-op until a database exists."
           exit 0
-
-      # Live path only. Without this guard, a live run against a checkout with no baseline
-      # snapshots would hit the exact same no_existing_snapshot path described above, but for
-      # real: it would re-index and re-embed all 14 sources as "meaningful", overwriting every
-      # `fetched_at` with today's date and destroying the freshness signal this phase exists to
-      # produce -- silently, since the job would otherwise exit 0. Fail loudly instead.
-      - name: Guard against a live run with no baseline snapshots
-        if: steps.db.outputs.mode == 'live'
-        run: |
-          if [ ! -d "$RAW_SNAPSHOT_DIR" ] || \
-             [ -z "$(find "$RAW_SNAPSHOT_DIR" -maxdepth 1 -name '*.md' -print -quit)" ]; then
-            echo "::error::RAW_SNAPSHOT_DIR ($RAW_SNAPSHOT_DIR) is missing or has no *.md snapshots."
-            echo "Refusing to run the live refresh: with no baseline to diff against, every source"
-            echo "would classify status=meaningful/reason=no_existing_snapshot, re-indexing and"
-            echo "re-embedding all 14 sources and resetting every fetched_at -- the expensive,"
-            echo "silent failure mode this guard exists to make impossible. Restore"
-            echo "data/sources/raw/ (e.g. from the production volume or a backup) before this job"
-            echo "can run live."
-            exit 1
-          fi
 
       # Once Phase 8 stands up a hosted database and a hosted embedder, this step also needs
       # EMBED_PROVIDER (and its model) set to that hosted provider -- app/providers/embeddings.py's
@@ -139,8 +117,8 @@ jobs:
       # could not be checked, see docs/adr/0009), and GitHub Actions skips every later step by
       # default once one has failed UNLESS its `if:` says otherwise -- exactly the case this report
       # most needs to be visible for. `steps.recrawl.outcome != 'skipped'` keeps this from running
-      # when the step above never ran at all (mode == 'dry-run', or the baseline-snapshot guard
-      # failed first). `|| true` on the python call: this step is purely informational (the step
+      # when the step above never ran at all (mode == 'dry-run'). `|| true` on the python call:
+      # this step is purely informational (the step
       # above already decided the job's real exit code), so its own exit code must never duplicate
       # or override that -- it exists only to put the human-readable table (which names every
       # meaningful change AND, at the top, unmissably, WHICH of the two red reasons applies if any
