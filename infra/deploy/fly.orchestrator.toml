@@ -94,7 +94,7 @@ primary_region = "iad"
   # A hosted provider needs nowhere near the 600s local default (see app/config.py's own comment
   # on why that default is so high for the local reasoning model).
   LLM_TIMEOUT_SECONDS = "60.0"
-
+  UVICORN_HOST = "::"
   # Production embedding provider (Phase 8 round 8): GGUFEmbedder, loading nomic-embed-text's own
   # GGUF file in-process (see the [build.args]/secrets comments above and
   # docs/adr/0013-in-process-gguf-embeddings.md). EMBED_GGUF_PATH matches exactly where

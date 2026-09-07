@@ -73,7 +73,7 @@ primary_region = "iad"
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = "off"
   auto_start_machines = true
   # 1: same reasoning as fly.orchestrator.toml's own comment -- this shared-cpu-1x/256MB machine
   # stays running always, at roughly $2/mo, rather than scaling to zero. The gateway is the very
