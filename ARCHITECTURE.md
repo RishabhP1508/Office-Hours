@@ -209,6 +209,37 @@ Where a check can be exact, it is programmatic instead of judged.
 Why: a model scoring its own output prefers its own output. Every check moved from judgment to
 mechanism is a check that cannot drift.
 
+### Production generates on Ollama Cloud and falls back to NVIDIA **[P8]**
+
+Primary is `gpt-oss:120b` on Ollama Cloud; the fallback, tried once on an error, timeout, 5xx or
+429, is `openai/gpt-oss-20b` on NVIDIA. Both are the `gpt-oss` family, and the judge is Nemotron, so
+the judge never grades its own family on either path. `eval/run.py` refuses to start if any
+generator in the resolved chain shares the judge's family, so the requirement is enforced rather
+than merely documented.
+
+Why not a Nemotron fallback, which NVIDIA also serves: failover would silently put the judge and the
+generator in the same family, in production, with nothing failing loudly.
+
+### Production embeds in-process from Ollama's own GGUF file **[P8]**
+
+The same `nomic-embed-text` GGUF Ollama serves, loaded in-process through llama-cpp-python. No
+embedding API, no second vendor, no extra machine.
+
+Why: production has no GPU, and neither Ollama Cloud nor NVIDIA serves `nomic-embed-text`. The 221
+stored vectors are nomic 768-dimension, and `NO_ANSWER_MAX_DISTANCE` sits 0.063 above its nearest
+off-topic control, so re-embedding onto a different model would have meant re-deriving a
+safety-critical threshold on a knife edge. Running the identical weights in the identical engine
+avoids that entirely: measured against 25 real stored vectors, the in-process embedder reproduces
+them at a minimum cosine of 0.99999412, and five test queries retrieve the identical chunk set in
+the identical order.
+
+The non-obvious part, which is why this needed measuring rather than reasoning: identical weights in
+an identical engine are NOT sufficient. llama.cpp's default `n_batch=512` silently splits longer
+inputs and returns different vectors, and it did so for 5 of those 25 chunks. `n_batch` and
+`n_ubatch` are derived from one `n_ctx` setting so they cannot disagree, and the embedder raises
+rather than truncating when an input exceeds the budget. Recorded in
+`docs/adr/0013-in-process-gguf-embeddings.md`.
+
 ### No fine-tuning **[all phases]**
 
 Why: these rules change on published dates. Retrieval picks up a corpus change the day it is ingested.
@@ -278,9 +309,44 @@ re-verified instead of the whole file.
 
 ## Deliberately not decided yet
 
-- The hosted LLM and embedding providers for production. The interfaces are in place; the choice gets
-  made when the eval gate runs against production in Phase 8.
 - Whether the embedding model name becomes a column on `documents`. Phase 0 single-sources it through
-  an environment variable. If Phase 3 needs to compare two embedding models over one corpus, that
-  column is how to do it.
-- Where the backend is hosted. `infra/deploy/` gets its file in Phase 8.
+  an environment variable. If a later phase needs to compare two embedding models over one corpus,
+  that column is how to do it.
+
+Both of the other entries that used to sit here are now decided, in Phase 8. The production LLM and
+embedding providers are settled above, under "Models and providers". The backend is hosted on Fly in
+`iad` with the frontend on Vercel, Postgres on Neon and Redis on Upstash; `infra/deploy/` holds a
+`fly.*.toml` per service, and the README's deploy guide is the step-by-step.
+
+## Open experiments
+
+These are measurable questions with a known method and no answer yet. They are not defects, and
+nothing here is blocking. Each one says what to run and what result would justify acting on it.
+
+### Task-instruction prefixes for nomic-embed are unused, and probably cost retrieval quality **[open, found in P8]**
+
+The corpus and every query are embedded as raw text, with none of the `search_query:` and
+`search_document:` prefixes the nomic-embed model card calls for. This was measured, not assumed:
+Ollama's Modelfile carries `TEMPLATE {{ .Prompt }}`, a bare passthrough, and embedding the same
+string three ways and comparing against real Ollama output gives raw at cosine 0.99999980 /
+0.99999715 / 0.99999980, `search_query:` at 0.970 / 0.982 / 0.976, and `search_document:` at 0.909 /
+0.969 / 0.859. Ollama applies no prefix, so neither does this project.
+
+Why this is not a defect: the corpus and the query omit the prefixes together, so both sit in the
+same space and retrieval is internally consistent. The cost is quality left unclaimed, not a wrong
+answer to a user.
+
+Why it is not simply fixed: adopting the prefixes changes every vector. That means re-embedding all
+221 chunks and re-deriving `NO_ANSWER_MAX_DISTANCE` from scratch. The re-embed is cheap. The
+re-derivation is the risk, because 0.50 was chosen from seven off-topic control queries and sits
+0.063 above the nearest one (car insurance, 0.4370), and that margin is what keeps off-topic
+questions from being answered confidently.
+
+The experiment: embed the corpus with `search_document:` and queries with `search_query:` into a
+scratch database, re-derive the threshold from the same seven controls by the same method recorded
+in `services/orchestrator/app/config.py`, then run the full eval against both databases and
+compare. Adopt only if
+`context_precision` and `answer_relevancy` both improve AND the re-derived threshold keeps a margin
+over its nearest off-topic control at least as large as today's 0.063. If the margin narrows, the
+retrieval gain is not worth it: a confidently answered off-topic immigration question is a worse
+failure than a slightly weaker ranking. Never tune either number against `eval/golden.jsonl`.

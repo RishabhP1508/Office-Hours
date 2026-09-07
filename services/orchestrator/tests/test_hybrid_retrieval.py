@@ -156,3 +156,59 @@ def test_retrieval_top_k_defaults_to_five():
     (eval/results/20260830T183110Z.json) it is being compared against.
     """
     assert Settings().RETRIEVAL_TOP_K == 5
+
+
+# =================================================================================================
+# Phase 8 round 5: retrieval is a SAFETY guardrail, not optional infrastructure, and must never be
+# wrapped the way app/usage.py and app/cache.py's optional-infrastructure functions now are (see
+# both modules' own docstrings, "OPTIONAL INFRASTRUCTURE, NEVER FATAL"). A database error here must
+# keep propagating out of hybrid_search, through app/pipeline.py, to app/main.py's existing 502
+# path -- ARCHITECTURE.md's "say when you do not know" and "cite and verify" both depend on
+# retrieval actually having run, so a database error here must never be silently swallowed into an
+# empty or fabricated result the way it would be reasonable to swallow a failed usage counter.
+# =================================================================================================
+
+
+async def test_hybrid_search_propagates_a_database_error_rather_than_degrading():
+    """Proved against a pool that can never successfully connect (a database name guaranteed not
+    to exist on this Postgres server -- never the shared corpus database every other test in this
+    file uses, so this cannot affect them), with a short pool `timeout` constructed directly here
+    (NOT a change to app/db.py::make_pool, which does not expose one) so this test fails fast
+    instead of waiting out the default 30-second pool timeout.
+
+    hybrid_search itself contains no try/except at all -- unlike app/usage.py's record_query/
+    budget_exceeded/record_generation_call or app/cache.py's corpus_version/lookup/store, all of
+    which now catch a database error and degrade. This test's real assertion is behavioral, not
+    textual: hybrid_search must actually raise here, proving there is nothing in its call path
+    catching this and returning an empty/fabricated result instead.
+    """
+    from pgvector.psycopg import register_vector_async
+    from psycopg_pool import AsyncConnectionPool, PoolTimeout
+
+    settings = get_settings()
+    base_url = os.environ.get("DATABASE_URL", settings.DATABASE_URL)
+    # Swap only the database name in the URL for one that cannot exist, keeping host/port/user/
+    # password exactly as configured -- this is what makes every connection attempt fail with a
+    # real, immediate "database does not exist" error rather than a slow network timeout.
+    broken_url = base_url.rsplit("/", 1)[0] + "/officehours_guardrail_fatal_test_does_not_exist"
+
+    async def _configure(conn) -> None:
+        await register_vector_async(conn)
+
+    broken_pool = AsyncConnectionPool(
+        broken_url, open=False, configure=_configure, timeout=2, min_size=1, max_size=2
+    )
+    await broken_pool.open(wait=False)
+    try:
+        # PoolTimeout, specifically: every connection attempt to a nonexistent database fails
+        # immediately, and the pool keeps retrying (rather than surfacing that immediate failure
+        # directly) until its own `timeout` elapses. Whichever concrete exception a real broken
+        # table would raise (psycopg.errors.UndefinedTable in the three optional-infrastructure
+        # tests above), the point this test proves is the same either way: hybrid_search has no
+        # try/except of its own to turn ANY of these into a degraded, non-raising result.
+        with pytest.raises(PoolTimeout):
+            await hybrid_search(
+                broken_pool, [0.0] * 768, "test question", k=5, rrf_k=60, candidate_pool=20
+            )
+    finally:
+        await broken_pool.close()

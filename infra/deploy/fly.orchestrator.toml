@@ -1,0 +1,181 @@
+# Fly.io app config for services/orchestrator (Python/FastAPI). CLAUDE.md's own repository layout
+# lists a single `infra/deploy/fly.toml`; this project deploys two independent services
+# (orchestrator + gateway), so it gets two clearly-named files instead --
+# fly.orchestrator.toml and fly.gateway.toml, each its own `fly apps create` / `fly deploy`.
+#
+# DEPLOY FROM THE REPOSITORY ROOT, passing services/orchestrator as the directory argument:
+#   fly deploy services/orchestrator --config infra/deploy/fly.orchestrator.toml
+# Fly's `dockerfile` build option does not change the Docker build context, which defaults to
+# wherever `fly deploy` is invoked from (https://fly.io/docs/reference/configuration/, "Specify a
+# Dockerfile": "This option will not change the Docker context path... If you want the Dockerfile
+# to use its containing directory as the context root, use `fly deploy <directory>`"). Passing
+# `services/orchestrator` as the directory makes BOTH the build context and the Dockerfile lookup
+# resolve to services/orchestrator/ -- exactly what services/orchestrator/Dockerfile already
+# assumes (its COPY paths are the same ones docker-compose.yml's `build: context:
+# ./services/orchestrator` already uses). flyctl finds `Dockerfile` in that directory by its own
+# default, with no `dockerfile =` line needed here. [build.args] below IS needed, though: it is
+# what makes this production build install the base runtime dependencies plus the one real
+# embedding provider it needs (no ragas, no langchain, no langgraph, no datasets, no textstat --
+# see services/orchestrator/Dockerfile's INSTALL_EXTRAS comment).
+#
+# `app` below is a placeholder -- Fly app names are globally unique across all Fly accounts, so
+# whoever deploys this picks their own (e.g. `fly apps create office-hours-orchestrator-<handle>`)
+# and edits this line to match before the first deploy.
+app = "office-hours-orchestrator"
+primary_region = "iad"
+
+# NOTE: this table must stay ABOVE [env]/[http_service]/[[vm]] with nothing but comments between
+# `primary_region` and here -- TOML has no "end of table" marker, so any bare `key = value` line
+# appearing AFTER a table header belongs to that table (or its last-opened sub-table) until the
+# next header. `app`/`primary_region` above are root keys precisely because nothing opened a table
+# before them.
+[build]
+  [build.args]
+    # "gguf" alone (not "dev,eval,gguf", the local dev default) -- this is what keeps ragas,
+    # langchain, langgraph, and datasets out of the deployed image while still installing
+    # llama-cpp-python, the one extra dependency production's real embedding provider
+    # (GGUFEmbedder, see [env] below) actually needs. Confirmed empty otherwise: an image built
+    # with this exact value has `importlib.util.find_spec` return None for langgraph, langchain,
+    # langchain_core, ragas, datasets, and textstat.
+    INSTALL_EXTRAS = "gguf"
+
+# --- Required secrets (set with `fly secrets set NAME=value -a office-hours-orchestrator`,
+# NEVER written to this file) ---
+#   DATABASE_URL          hosted Postgres with pgvector (e.g. Fly Postgres, Neon, Supabase),
+#                         `postgresql://user:pass@host:5432/dbname`
+#   OLLAMA_API_KEY        Ollama Cloud API key (primary generator, see [env] below)
+#   LLM_FALLBACK_API_KEY  NVIDIA API key (fallback generator, see [env] below)
+#   SESSION_HASH_SALT     HMAC key for GET /usage's anonymous session hash
+#                         (app/usage.py::hash_session_identifier). MUST be set to the EXACT SAME
+#                         value as office-hours-gateway's own SESSION_HASH_SALT secret
+#                         (fly.gateway.toml) -- see that file's own comment and
+#                         app/main.py::_client_session_hash for why. Settings.SESSION_HASH_SALT's
+#                         own code default is a placeholder fine only for local dev; leaving this
+#                         unset here means the deployed service silently falls back to that
+#                         well-known, non-secret placeholder in production.
+#   OTEL_EXPORTER_OTLP_HEADERS   Phase 8 round 4, production observability (Grafana Cloud free
+#                         tier). Standard OTLP env var, read automatically by the Python SDK with
+#                         NO code change needed (confirmed: OTLPSpanExporter/OTLPMetricExporter
+#                         both apply it even when `endpoint` is passed explicitly -- see
+#                         app/telemetry.py) -- format `Authorization=Basic <base64 of
+#                         instanceID:token>`, from Grafana Cloud's own OTLP integration page.
+#                         Secret because it carries the auth token.
+#   LANGFUSE_SECRET_KEY   Phase 8 round 4, Langfuse free tier (`sk-lf-...`). See [env] below for
+#                         LANGFUSE_HOST/LANGFUSE_PUBLIC_KEY, which are not secret the way this is.
+#
+
+# EMBED_PROVIDER/EMBED_GGUF_* ARE set below, in [env]: production's real embedding provider is
+# GGUFEmbedder (Phase 8 round 8, docs/adr/0013-in-process-gguf-embeddings.md), loading
+# nomic-embed-text's own GGUF file in-process via llama-cpp-python -- no API, no vendor, no third
+# machine. Neither Ollama Cloud nor NVIDIA serves nomic-embed-text, and re-embedding the corpus on
+# a different model was rejected (the 221 stored vectors are nomic-embed-text 768-dim, and
+# NO_ANSWER_MAX_DISTANCE=0.50 already sits knife-edge against a 0.4370 off-topic control -- moving
+# to a different embedding space would mean re-deriving that threshold with no way to do so
+# safely). The GGUF file itself is baked into the image at build time (see
+# services/orchestrator/Dockerfile), never downloaded at container start.
+#
+# JUDGE_API_KEY is NOT set here: the eval judge (eval/judge.py) is invoked by `python -m eval.run`
+# by hand or in CI (.github/workflows/eval.yml), never by the deployed FastAPI service at request
+# time, so it has no business being a secret on the serving app.
+
+[env]
+  # Production LLM failover chain (Phase 8). PRIMARY: Ollama Cloud, speaking the same /api/chat
+  # shape as local Ollama (app/providers/llm.py::OllamaLLM), so LLM_PROVIDER stays "ollama" --
+  # only the base URL, OLLAMA_API_KEY (a secret, above), and OLLAMA_CLOUD differ from local dev.
+  # FALLBACK: NVIDIA's OpenAI-compatible endpoint (app/providers/llm.py::OpenAICompatLLM), tried
+  # once if Ollama Cloud errors, times out, or returns 5xx/429 (app/providers/llm.py::FallbackLLM).
+  LLM_PROVIDER = "ollama"
+  LLM_MODEL = "gpt-oss:120b"
+  OLLAMA_BASE_URL = "https://ollama.com"
+  OLLAMA_CLOUD = "true"
+  LLM_FALLBACK_PROVIDER = "nvidia"
+  LLM_FALLBACK_MODEL = "openai/gpt-oss-20b"
+  LLM_FALLBACK_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+  # A hosted provider needs nowhere near the 600s local default (see app/config.py's own comment
+  # on why that default is so high for the local reasoning model).
+  LLM_TIMEOUT_SECONDS = "60.0"
+
+  # Production embedding provider (Phase 8 round 8): GGUFEmbedder, loading nomic-embed-text's own
+  # GGUF file in-process (see the [build.args]/secrets comments above and
+  # docs/adr/0013-in-process-gguf-embeddings.md). EMBED_GGUF_PATH matches exactly where
+  # services/orchestrator/Dockerfile's `COPY models ./models` puts the file inside the image.
+  # EMBED_GGUF_N_CTX=2048 and EMBED_GGUF_THREADS=1 are the measured serving config: 351MB loaded /
+  # 358MB peak, 16.2ms median query embed -- see app/config.py's own comment on
+  # Settings.EMBED_GGUF_N_CTX for the full derivation, in particular why n_batch/n_ubatch must
+  # never be set separately from n_ctx.
+  EMBED_PROVIDER = "gguf"
+  EMBED_MODEL = "nomic-embed-text"
+  EMBED_GGUF_PATH = "/app/models/nomic-embed-text-f16.gguf"
+  EMBED_GGUF_N_CTX = "2048"
+  EMBED_GGUF_THREADS = "1"
+
+  ALLOWED_ORIGINS = "https://office-hours.vercel.app"
+  # Without this, `fly logs` would never show which provider actually served a request (the
+  # llm.primary_failed / llm.served_by lines app/providers/llm.py::FallbackLLM emits) -- see
+  # Settings.LOG_LEVEL's own comment in app/config.py.
+  LOG_LEVEL = "INFO"
+
+  # --- Production observability (Phase 8 round 4): Grafana Cloud (OTLP) + Langfuse, both free
+  # --- tier, neither an extra Fly machine. Off/inert unless the corresponding secret is also set
+  # --- (see the secrets comment above) -- app/telemetry.py always exports somewhere (it has no
+  # --- "disabled" state), but a dangling exporter with no reachable endpoint at all just retries
+  # --- with backoff and drops spans; Langfuse specifically is off by default (absent
+  # --- LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY = disabled, see app/langfuse_telemetry.py).
+  #
+  # THE URL RULE (see app/telemetry.py's own comment for the full reasoning): this is the BASE
+  # OTLP URL only, e.g. "https://otlp-gateway-prod-us-east-0.grafana.net/otlp" -- NEVER append
+  # "/v1/traces" or "/v1/metrics" yourself; both this service and office-hours-gateway append that
+  # suffix themselves, using the identical rule, from this same base value. Get the real value from
+  # Grafana Cloud's own "OTLP" integration page for your stack.
+  OTEL_EXPORTER_OTLP_ENDPOINT = "https://otlp-gateway-<region>.grafana.net/otlp"
+  # Inert for THIS project's exporter classes (opentelemetry-exporter-otlp-proto-http is already
+  # protobuf-over-http unconditionally; this env var only matters to the generic
+  # "opentelemetry-exporter-otlp" auto-selecting package, which this project does not use) -- set
+  # anyway because Grafana Cloud's own setup instructions list it as required regardless of SDK,
+  # and it costs nothing to be consistent with them.
+  OTEL_EXPORTER_OTLP_PROTOCOL = "http/protobuf"
+  # Langfuse: cloud.langfuse.com (EU) or us.cloud.langfuse.com (US) -- pick whichever region the
+  # Langfuse project was actually created in.
+  LANGFUSE_HOST = "https://us.cloud.langfuse.com"
+  LANGFUSE_PUBLIC_KEY = "pk-lf-your-public-key-here"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # 1: this shared-cpu-1x/1024MB machine stays running always, at Fly's iad on-demand pricing of
+  # $5.70/mo for 1GB (256MB is $1.94/mo, 512MB is $3.19/mo -- see the [[vm]] memory comment below
+  # for why this moved from 512MB to 1024MB), rather than scaling to zero. The alternative
+  # (min_machines_running = 0) is cheaper only when the machine is actually idle enough to hit
+  # zero, but it trades that for a cold start on the first request after any idle period (image
+  # pull if not cached, Python process start, DB pool open) -- and the whole point of paying for
+  # Fly instead of a free scale-to-zero host was to not have that cold start. Chosen deliberately
+  # over scale-to-zero for that reason, not left at the default.
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[[vm]]
+  # shared-cpu-1x with 1024MB (Phase 8 round 8: raised from 512MB). The orchestrator holds an
+  # httpx client, a psycopg connection pool, and the OpenTelemetry SDK in memory; 512MB was already
+  # tight for FastAPI plus those dependencies. GGUFEmbedder (this service's own real embedding
+  # provider now, see [env] above) adds a measured 358MB peak on top of that at its serving config
+  # (EMBED_GGUF_N_CTX=2048, EMBED_GGUF_THREADS=1) -- 512MB would leave next to nothing for the rest
+  # of the process, so this moves to the next Fly size up rather than trim the margin to zero.
+  #
+  # Cost, iad on-demand pricing: 256MB $1.94/mo, 512MB $3.19/mo, 1GB $5.70/mo. This machine alone
+  # goes from $3.19 to $5.70/mo; combined with the gateway's own 256MB machine (fly.gateway.toml,
+  # $1.94/mo, unchanged), the whole stack moves from $5.13 to $7.64/mo. The alternative considered
+  # -- a third, separate Fly machine dedicated to embeddings -- was rejected partly on cost: even at
+  # the smallest usable size (512MB, since it would carry the same ~358MB peak) that is $3.19/mo on
+  # top of the ORIGINAL $5.13/mo stack, $10.83/mo total, for a second service, a second deploy
+  # target, and a network hop the in-process approach has no need of. See
+  # docs/adr/0013-in-process-gguf-embeddings.md.
+  size = "shared-cpu-1x"
+  memory = "1024mb"

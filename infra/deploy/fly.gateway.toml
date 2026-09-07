@@ -1,0 +1,96 @@
+# Fly.io app config for services/gateway (Go/chi). See fly.orchestrator.toml's own header comment
+# for why this project has two fly.*.toml files instead of the single `fly.toml` CLAUDE.md's
+# repository layout lists.
+#
+# DEPLOY FROM THE REPOSITORY ROOT, passing services/gateway as the directory argument:
+#   fly deploy services/gateway --config infra/deploy/fly.gateway.toml
+# (Same reasoning as fly.orchestrator.toml: this makes Fly's build context AND its default
+# Dockerfile lookup resolve to services/gateway/, matching the existing
+# services/gateway/Dockerfile as-is -- no [build] section needed.)
+#
+# `app` below is a placeholder -- Fly app names are globally unique, so whoever deploys this picks
+# their own (e.g. `fly apps create office-hours-gateway-<handle>`) and edits this line to match.
+app = "office-hours-gateway"
+primary_region = "iad"
+
+# --- Required secrets (set with `fly secrets set NAME=value -a office-hours-gateway`, NEVER
+# written to this file) ---
+#   REDIS_URL   Upstash Redis, `rediss://default:<password>@<host>:6379` -- the `rediss://` scheme
+#               is what turns TLS on for the token-bucket rate limiter (see
+#               services/gateway/cmd/gateway/main.go and internal/config/config_test.go's TLS
+#               parsing test). A password lives in this URL, which is exactly why it is a secret
+#               and not an [env] value below.
+#   SESSION_HASH_SALT   Phase 8 round 4: MUST be set to the EXACT SAME value as
+#               office-hours-orchestrator's own SESSION_HASH_SALT secret (fly.orchestrator.toml's
+#               own secrets list) -- see services/gateway/internal/middleware/session.go and
+#               services/orchestrator/app/main.py::_client_session_hash. This gateway hashes each
+#               caller's own address with this salt and forwards ONLY the hash
+#               (X-Office-Hours-Session-Hash) to the orchestrator, so GET /usage's
+#               distinct_sessions count is real without a raw client address ever crossing this
+#               boundary. A mismatched salt between the two services does not break per-path
+#               distinct-session counting; it only loses cross-path consistency (a client hashing
+#               to the same session whether it hits the orchestrator through this gateway or
+#               directly). Secret, not [env], for the same reason it is a secret on the
+#               orchestrator: it is a key an attacker should not get to choose or read.
+#   OTEL_EXPORTER_OTLP_HEADERS   Phase 8 round 4, production observability (Grafana Cloud free
+#               tier) -- MUST be the SAME value as office-hours-orchestrator's own copy (see that
+#               file's own comment), so both services' spans land in the same Grafana Cloud
+#               tenant: cross-language trace propagation (Phase 7, W3C traceparent) is independent
+#               of the export destination, but ONLY holds together end to end if both halves of
+#               one trace actually export to the same place. Standard OTLP env var, read
+#               automatically by the Go SDK the same way the Python SDK does (no code change).
+#
+# ORCHESTRATOR_URL is NOT a secret (an internal Fly private-networking hostname, e.g.
+# http://office-hours-orchestrator.internal:8000, or the orchestrator app's public URL) -- it goes
+# in [env] below once the orchestrator app's real name is known after its own first deploy.
+
+[env]
+  GATEWAY_LISTEN_ADDR = ":8080"
+  # Placeholder: replace <orchestrator-app-name> with whatever fly.orchestrator.toml's `app` was
+  # actually set to and deployed as. Fly private networking (6PN) lets one app reach another over
+  # plain HTTP at http://<app-name>.internal:<port> without leaving Fly's network, which is why
+  # this is http:// even in production, not https://.
+  ORCHESTRATOR_URL = "http://<orchestrator-app-name>.internal:8000"
+  ALLOWED_ORIGINS = "https://office-hours.vercel.app"
+  RATE_LIMIT_BUCKET_CAPACITY = "20"
+  RATE_LIMIT_REFILL_PER_SECOND = "1"
+  UPSTREAM_TIMEOUT_SECONDS = "15"
+  # Empty (the default): no reverse proxy sits between Fly's edge and this gateway that the rate
+  # limiter should trust an X-Forwarded-For header from. See internal/config/config.go's own
+  # comment on why an untrusted X-Forwarded-For must never be honored.
+  TRUSTED_PROXY_CIDRS = ""
+
+  # --- Production observability (Phase 8 round 4): same Grafana Cloud OTLP endpoint the
+  # --- orchestrator exports to (fly.orchestrator.toml) -- MUST be the identical base URL, so
+  # --- internal/middleware/tracing.go's own "THE URL RULE" comment derives the same final
+  # --- "<this>/v1/traces" as app/telemetry.py derives on the other service. Never append
+  # --- "/v1/traces" yourself; this service's tracing.go appends it.
+  OTEL_EXPORTER_OTLP_ENDPOINT = "https://otlp-gateway-<region>.grafana.net/otlp"
+  # Inert for this service's exporter package (otlptracehttp is already protobuf-over-http
+  # unconditionally) -- set anyway for consistency with Grafana Cloud's own setup instructions.
+  OTEL_EXPORTER_OTLP_PROTOCOL = "http/protobuf"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # 1: same reasoning as fly.orchestrator.toml's own comment -- this shared-cpu-1x/256MB machine
+  # stays running always, at roughly $2/mo, rather than scaling to zero. The gateway is the very
+  # first hop from the browser, so a cold start here is the one a user notices first, and the whole
+  # point of paying for Fly instead of a free scale-to-zero host was to not have one.
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "5s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[[vm]]
+  # Free-tier-sized: shared-cpu-1x with 256MB. The gateway is a single static Go binary handling
+  # connection limiting and proxying -- no ORM, no template engine, no large in-memory cache -- so
+  # it needs meaningfully less headroom than the orchestrator.
+  size = "shared-cpu-1x"
+  memory = "256mb"

@@ -85,8 +85,10 @@ from pathlib import Path
 import httpx
 
 from app.config import get_settings
+from app.providers.llm import assert_no_generator_judge_family_collision
 from eval.judge import EmptyAnswerError
 from eval.metrics import reading_grade_level
+from eval.telemetry import emit_run_metrics
 
 # Only EmptyAnswerError is imported from eval.judge at module scope: it is a plain exception class
 # with no import-time cost, and both modes need it (an empty/whitespace-only answer is recorded as
@@ -121,7 +123,12 @@ ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://localhost:8000")
 # or RAGAS (faithfulness, answer_relevancy, context_precision) -- see the module docstring's CI mode
 # section. Printed as "SKIPPED (CI mode)" and excluded from CI's gating and from the baseline
 # comparison entirely; never coerced to a value.
-CI_SKIPPED_METRICS = ("faithfulness", "answer_relevancy", "context_precision", "comprehensibility")
+CI_SKIPPED_METRICS = (
+    "faithfulness",
+    "answer_relevancy",
+    "context_precision",
+    "comprehensibility",
+)
 
 # Maps each of the five app/schemas.py::ResponseType members to the same two-value vocabulary
 # eval/judge.py::classify_refusal uses ("REFUSAL" or "ANSWER"), so false_refusal_rate and
@@ -340,7 +347,9 @@ _QUERY_TIMEOUT_SECONDS = 600.0  # the local dev generator can take several minut
 
 def query_orchestrator(client: httpx.Client, question: str) -> dict:
     response = client.post(
-        f"{ORCHESTRATOR_URL}/query", json={"question": question}, timeout=_QUERY_TIMEOUT_SECONDS
+        f"{ORCHESTRATOR_URL}/query",
+        json={"question": question},
+        timeout=_QUERY_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     return response.json()
@@ -617,6 +626,20 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
     ci_mode = resolve_ci_mode(sys.argv[1:])
     settings = get_settings()
 
+    # MUST run before a single judge call or generation call, in EVERY mode (not just full mode):
+    # this is the enforcement point for ARCHITECTURE.md's "the eval judge is a hosted model from a
+    # different family than the generator". It checks the REAL, resolved settings (get_settings()
+    # reads the real environment: OS env vars and any real .env file), never a fixture, so a genuine
+    # misconfiguration -- an LLM_FALLBACK_MODEL set to a same-family model in .env or in
+    # `fly secrets` -- is caught here, loudly and before it can happen, rather than silently
+    # corrupting the one metric this project's eval gate exists to protect. Deliberately left
+    # UNCAUGHT: a ModelFamilyCollisionError crashing with its own message (which names every
+    # colliding model and family) is the loudest, least ambiguous failure available, and matches
+    # this file's existing precedent for other invariant violations (load_golden_set's row-count
+    # check, load_baselines' missing-file check) -- see app/providers/llm.py's
+    # assert_no_generator_judge_family_collision docstring.
+    assert_no_generator_judge_family_collision(settings)
+
     if ci_mode:
         print("=" * 78)
         print("=== CI INVARIANT GATE (EVAL_MODE=ci / --ci) ===")
@@ -734,7 +757,9 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
 
             contexts = [c["content"] for c in response["contexts"]]
             citation_stats = analyze_citations(
-                answer_text, num_contexts=len(contexts), num_citations=num_citations_returned
+                answer_text,
+                num_contexts=len(contexts),
+                num_citations=num_citations_returned,
             )
 
             if ci_mode:
@@ -1315,7 +1340,7 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
         },
         "latency": latency_stats,
         "determinism_check": {
-            "row_index": determinism_row["index"] if determinism_row is not None else None,
+            "row_index": (determinism_row["index"] if determinism_row is not None else None),
             "row": determinism_row["question"] if determinism_row is not None else None,
             "score_1": first,
             "score_2": second,
@@ -1326,6 +1351,18 @@ def main() -> int:  # noqa: C901 - the per-row error handling adds branches by n
     with results_path.open("w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
     print(f"\nWrote results to {results_path}")
+
+    # Phase 8 round 3: a report-only side channel for the observability dashboard's "faithfulness
+    # trend" panel -- runs strictly AFTER overall_pass is already decided, reads only the
+    # already-computed aggregate_stats, and can never change this return value. See
+    # eval/telemetry.py's own module docstring for the full reasoning.
+    emit_run_metrics(
+        otlp_endpoint=settings.OTEL_EXPORTER_OTLP_ENDPOINT,
+        service_name=settings.OTEL_SERVICE_NAME,
+        ci_mode=ci_mode,
+        mode_label="ci" if ci_mode else "full",
+        aggregate_stats=aggregate_stats,
+    )
 
     return 0 if overall_pass else 1
 

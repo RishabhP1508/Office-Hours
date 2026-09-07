@@ -44,6 +44,21 @@ type Config struct {
 	// middleware is untouched; it still answers direct callers, e.g. curl during development).
 	AllowedOrigins []string
 
+	// SessionHashSalt keys the HMAC-SHA256 hash internal/middleware/session.go computes from each
+	// request's own client address, forwarded to the orchestrator as the X-Office-Hours-Session-Hash
+	// header (services/orchestrator/app/main.py::_client_session_hash reads it) so GET /usage's
+	// distinct_sessions count is real even though every request's own TCP peer, from the
+	// orchestrator's point of view, is this gateway rather than the original caller (Phase 8 round
+	// 4). SHOULD be the SAME value as the orchestrator's own SESSION_HASH_SALT (app/config.py) --
+	// that is what makes a client hash to the same session whether it reaches the orchestrator
+	// through this gateway or directly; a mismatch does not break per-path distinct-session
+	// counting, it only loses that cross-path consistency (see session.go's own doc comment). The
+	// default below matches Settings.SESSION_HASH_SALT's own dev-only default exactly, so a fresh
+	// `docker compose up` on both services already agrees out of the box; production MUST override
+	// this to a real, random secret on BOTH services, the same as every other secret in this
+	// project.
+	SessionHashSalt string
+
 	// TrustedProxyCIDRs is who the rate limiter (internal/middleware/ratelimit.go's clientIP) will
 	// believe an X-Forwarded-For header from. Defaults to EMPTY: with nothing configured, the
 	// header is never trusted and every request is keyed on its own TCP peer address, which is the
@@ -74,6 +89,9 @@ const (
 	defaultAllowedOrigins        = "http://localhost:3000"
 	defaultOTLPEndpoint          = "http://localhost:4318"
 	defaultServiceName           = "office-hours-gateway"
+	// Matches services/orchestrator/app/config.py's Settings.SESSION_HASH_SALT dev-only default
+	// exactly -- see SessionHashSalt's own comment above for why that match matters.
+	defaultSessionHashSalt = "office-hours-dev-salt-change-in-production"
 )
 
 // Load reads Config from the process environment, applying the defaults above wherever a variable
@@ -87,6 +105,7 @@ func Load() Config {
 		RateLimitRefillPerSecond: envPositiveFloatOr("RATE_LIMIT_REFILL_PER_SECOND", defaultRateLimitRefillPerSec),
 		UpstreamTimeout:          envTimeoutSecondsOr("UPSTREAM_TIMEOUT_SECONDS", defaultUpstreamTimeout),
 		AllowedOrigins:           splitOrigins(envOr("ALLOWED_ORIGINS", defaultAllowedOrigins)),
+		SessionHashSalt:          envOr("SESSION_HASH_SALT", defaultSessionHashSalt),
 		TrustedProxyCIDRs:        parseTrustedProxyCIDRs(envOr("TRUSTED_PROXY_CIDRS", "")),
 		OTLPEndpoint:             envOr("OTEL_EXPORTER_OTLP_ENDPOINT", defaultOTLPEndpoint),
 		ServiceName:              envOr("OTEL_SERVICE_NAME", defaultServiceName),

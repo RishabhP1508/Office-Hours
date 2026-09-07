@@ -74,6 +74,10 @@ func main() {
 	router.Route("/v1", func(v1 chi.Router) {
 		v1.Use(middleware.RateLimitMiddleware(limiter, cfg.TrustedProxyCIDRs))
 		v1.Use(middleware.PIIMiddleware(middleware.NewRegexRedactor()))
+		// Phase 8 round 4: stamps every forwarded request with an opaque, salted hash of the
+		// caller's own address (see internal/middleware/session.go) so the orchestrator's GET
+		// /usage distinct_sessions count is real behind this gateway, not stuck at 1 forever.
+		v1.Use(middleware.SessionHashMiddleware(cfg.SessionHashSalt, cfg.TrustedProxyCIDRs))
 
 		v1.With(middleware.Timeout(cfg.UpstreamTimeout)).Post("/query", func(w http.ResponseWriter, r *http.Request) {
 			p.ProxyJSON(w, r, "/query")

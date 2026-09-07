@@ -18,6 +18,21 @@ the answer text, and never append a trailing "Source URLs:" list -- the interfac
 citations separately from the answer. `strip_source_list_block` below is the belt-and-braces
 backstop for a model that appends one anyway.
 
+**Citation markup must be a plain ASCII bracket, never the model's own native citation format**
+(Phase 8 round 4). gpt-oss:120b (the Phase 8 production generator) frequently cites in its own
+training-format markup instead of the bracket convention above, e.g. "...work permit【1†L2-L5】."
+instead of "...work permit [1].". `app/guardrails/citations.py::parse_cited_indices` only ever
+recognizes "[N]", so an answer using ONLY that native markup reads as carrying zero citations at
+all and was wrongly BLOCKED_UNVERIFIED despite the model genuinely grounding its answer in the
+numbered context passage it named. Measured over 15 real hosted generations on the 5 questions this
+caused to be blocked: 9 used "[N]", 6 used the "【N†...】" form, and ZERO produced no citation at
+all -- the model always cites something, the project just could not always read it. Rule 2 below
+now says explicitly not to use that form; `normalize_native_citation_markup` further down is the
+belt-and-braces backstop that rewrites it to "[N]" BEFORE verification runs, for a model that uses
+it anyway (see that function's own docstring for exactly what it does and does not do -- in
+particular, it never invents a citation that was not there, and an out-of-range N still gets
+rejected exactly as an out-of-range "[N]" already was).
+
 **This module still carries two rules a guardrail also enforces, on purpose, not by oversight:**
 rule 5 (never give advice) and rule 3 (say plainly when the sources do not cover it) were NOT
 retired when the Phase 4 guardrails landed -- this docstring used to say the prompt "grows in
@@ -40,6 +55,7 @@ prompt is the sanctioned way to bring that down under CLAUDE.md's eval carve-out
 the rubric are never touched to move the number.
 """
 
+import hashlib
 import re
 
 SYSTEM_PROMPT = """You are Office Hours, an assistant that answers factual questions about F-1, \
@@ -49,10 +65,11 @@ Rules you must follow:
 1. Answer ONLY using the context passages given to you below. Do not use outside knowledge, \
 and do not guess.
 2. For every factual claim, cite the passage's bracket number, exactly as given in the context, \
-for example [2]. Cite only a number that appears in the context below, and never invent one. \
-Never paste a URL into your answer text, and never add a "Source URLs:" list, a "Sources:" \
-section, or any similar trailing list of links at the end of your answer -- the interface renders \
-citations separately from your answer text.
+for example [2]. Use a plain ASCII bracket like [2] -- never a full-width bracket citation like \
+【1†source】, and never any other citation format. Cite only a number that appears in the context \
+below, and never invent one. Never paste a URL into your answer text, and never add a \
+"Source URLs:" list, a "Sources:" section, or any similar trailing list of links at the end of \
+your answer -- the interface renders citations separately from your answer text.
 3. If the context does not answer the question, say plainly that your sources do not cover it. Do \
 not stretch an unrelated or partial passage into a confident answer.
 4. If the context contains both a current rule and a dated replacement for it (for example, an \
@@ -74,10 +91,11 @@ The reader is asking you to resolve their own personal decision, predict how the
 case will turn out, or estimate their own odds or chances. You must not do any of that. Instead:
 
 1. State the general rule that bears on their question, using ONLY the context passages given \
-below, with a bracket citation for each claim, for example [2]. Cite only a number that appears \
-in the context, and never invent one. Never paste a URL into your answer text, and never add a \
-"Source URLs:" list, a "Sources:" section, or any similar trailing list -- the interface renders \
-citations separately from your answer text.
+below, with a bracket citation for each claim, for example [2]. Use a plain ASCII bracket like \
+[2] -- never a full-width bracket citation like 【1†source】, and never any other citation format. \
+Cite only a number that appears in the context, and never invent one. Never paste a URL into your \
+answer text, and never add a "Source URLs:" list, a "Sources:" section, or any similar trailing \
+list -- the interface renders citations separately from your answer text.
 2. Do NOT tell the reader which option to choose. Do NOT predict how their case will be decided. \
 Do NOT estimate their odds or chances.
 3. End by directing them to their DSO (designated school official) or a licensed immigration \
@@ -116,6 +134,33 @@ def strip_source_list_block(answer_text: str) -> str:
     return answer_text[: match.start()].rstrip()
 
 
+# Phase 8 round 4: gpt-oss's own native citation markup, "【N†...】" (a full-width 【 】 bracket
+# pair, a literal dagger "†", then a line/section reference this project has no use for) -- OpenAI's
+# own "cite context passage N" convention, spelled with a different pair of brackets than this
+# project's own "[N]" (see this module's own docstring, "Citation markup must be a plain ASCII
+# bracket..."). The bare "【N】" form (no "†...") is matched too, in case a model ever omits the
+# dagger part; N is captured either way and is ALWAYS the same 1-based index format_context above
+# numbers its passages with.
+_NATIVE_CITATION_RE = re.compile(r"【\s*(\d+)\s*(?:†[^】]*)?】")
+
+
+def normalize_native_citation_markup(answer_text: str) -> str:
+    """Rewrite every "【N†...】" (or bare "【N】") span in `answer_text` to this project's own "[N]"
+    bracket convention, so `app/guardrails/citations.py::verify_citations` can read a citation the
+    model genuinely made, just in a markup it does not otherwise recognize.
+
+    What this function does NOT do, and must never be made to do: manufacture a citation from
+    nothing, or change whether a citation passes verification. It only rewrites the SHAPE of a span
+    that already names a specific numeric index -- text with no "【...】" markup at all passes
+    through byte-for-byte unchanged (an answer with genuinely no citation still has none after this
+    runs), and an out-of-range N (one `verify_citations` would reject as hallucinated for the
+    project's own "[N]" convention) still translates to the same out-of-range "[N]" and is still
+    rejected -- this function has no opinion on whether N is a valid index, only on what shape the
+    model spelled it in.
+    """
+    return _NATIVE_CITATION_RE.sub(lambda m: f"[{m.group(1)}]", answer_text)
+
+
 def format_context(chunks: list[dict]) -> str:
     """Render retrieved chunks into the context block the model sees.
 
@@ -130,3 +175,19 @@ def format_context(chunks: list[dict]) -> str:
 
 def build_user_prompt(question: str, chunks: list[dict]) -> str:
     return USER_PROMPT_TEMPLATE.format(context=format_context(chunks), question=question)
+
+
+# Phase 8 round 4: a stable "which exact prompt text produced this trace" identifier for Langfuse
+# (app/langfuse_telemetry.py), so a trace can be tied to the exact prompt version that produced it
+# without a hand-maintained version number someone has to remember to bump (see this project's
+# never-fine-tune, always-re-ingest philosophy applied here to prompts instead of the corpus: the
+# TEXT is the source of truth, so the version is derived FROM the text, not tracked alongside it).
+# A short SHA-256 prefix of the prompt string itself -- changes if and only if the prompt text
+# changes (this file's own item-2 citation-format rule above changes both prompts' hashes the
+# moment it lands), and is recomputed at import time, never hardcoded or bumped by hand.
+def _prompt_version(prompt_text: str) -> str:
+    return hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:12]
+
+
+SYSTEM_PROMPT_VERSION = _prompt_version(SYSTEM_PROMPT)
+REFUSAL_SYSTEM_PROMPT_VERSION = _prompt_version(REFUSAL_SYSTEM_PROMPT)

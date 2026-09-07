@@ -43,7 +43,11 @@ from psycopg.rows import dict_row
 
 from app.config import Settings, get_settings
 from app.db import RetrievedChunk, hybrid_search, make_pool
-from app.guardrails.freshness import build_freshness, freshness_notice_text, source_health_state
+from app.guardrails.freshness import (
+    build_freshness,
+    freshness_notice_text,
+    source_health_state,
+)
 from app.ingest import (
     FetchedPage,
     load_snapshot,
@@ -54,10 +58,13 @@ from app.pipeline import answer_question
 from app.providers.embeddings import OllamaEmbedder, StubEmbedder
 from app.providers.llm import LLM, StubLLM
 from app.recrawl import (
+    GoldenImpact,
     RefreshReport,
     SourceResult,
     _short_source_label,
     classify_change,
+    golden_impact_for_source,
+    load_golden_source_urls,
     make_conn_factory,
     normalize_for_diff,
     record_source_failure,
@@ -395,7 +402,9 @@ def test_render_table_status_column_lines_up_for_the_longest_manifest_url():
     table = report.render_table()
 
     source_width = max(
-        len("source"), len(_short_source_label(longest_url)), len(_short_source_label(shortest_url))
+        len("source"),
+        len(_short_source_label(longest_url)),
+        len(_short_source_label(shortest_url)),
     )
     expected_status_col = source_width + 1
 
@@ -411,6 +420,296 @@ def test_render_table_status_column_lines_up_for_the_longest_manifest_url():
     assert "some old line" not in table
     assert "Counts:" in table
     assert "HTTP fetches this run: 2" in table
+
+
+# =================================================================================================
+# PURE: golden-set impact reporting (Phase 8 round 2, B1/B2 -- no DB, no langgraph). Read-only:
+# every test in this section only ever reads a golden.jsonl-shaped file, real or synthetic; none
+# writes to or edits eval/golden.jsonl.
+# =================================================================================================
+
+# Independently-computed ground truth (Phase 8 round 2 brief) for THIS project's real
+# eval/golden.jsonl: which of its 14 manifest sources are cited by which golden row indices
+# (0-based, matching golden.jsonl's own line order). The 8 sources absent from this dict are cited
+# by no golden row at all -- see _UNCITED_REAL_SOURCES below.
+_EXPECTED_GOLDEN_IMPACT_BY_SOURCE = {
+    "https://www.uscis.gov/working-in-the-united-states/students-and-exchange-visitors/"
+    "optional-practical-training-extension-for-stem-students-stem-opt": [
+        0,
+        1,
+        4,
+        11,
+        12,
+        18,
+        19,
+        20,
+    ],
+    "https://www.uscis.gov/working-in-the-united-states/students-and-exchange-visitors/"
+    "optional-practical-training-opt-for-f-1-students": [2, 3, 9, 10, 18],
+    "https://www.uscis.gov/working-in-the-united-states/temporary-workers/"
+    "h-1b-specialty-occupations/h-1b-electronic-registration-process": [5, 6, 14, 15],
+    "https://www.uscis.gov/working-in-the-united-states/temporary-workers/"
+    "h-1b-specialty-occupations/h-1b-cap-season": [7, 13, 16],
+    "https://www.uscis.gov/working-in-the-united-states/h-1b-specialty-occupations": [
+        8,
+        17,
+    ],
+    "https://studyinthestates.dhs.gov/sevis-help-hub/student-records/fm-student-employment/"
+    "f-1-optional-practical-training-opt": [19],
+}
+
+_UNCITED_REAL_SOURCES = [
+    "https://www.uscis.gov/working-in-the-united-states/temporary-workers/"
+    "h-1b-specialty-occupations/extension-of-post-completion-optional-practical-training-opt-and-"
+    "f-1-status-for-eligible-students",
+    "https://studyinthestates.dhs.gov/students/complete/h-1b-status-and-the-cap-gap-extension",
+    "https://studyinthestates.dhs.gov/students/maintaining-status",
+    "https://studyinthestates.dhs.gov/students/study/full-course-of-study",
+    "https://studyinthestates.dhs.gov/students/study/traveling-as-an-international-student",
+    "https://www.ice.gov/sevis/travel",
+    "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-"
+    "and-an-extension-of-stay-procedure-faq",
+    "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-"
+    "and-an-extension-of-stay-procedure-quick",
+]
+
+# eval/golden.jsonl relative to this test file: tests -> orchestrator -> services -> repo root.
+_REAL_GOLDEN_PATH = Path(__file__).resolve().parents[3] / "eval" / "golden.jsonl"
+
+
+def test_golden_impact_reproduces_the_real_golden_jsonl_ground_truth():
+    """Reproduces, exactly, the independently-computed ground truth for the real, hand-authored
+    eval/golden.jsonl (21 rows): which manifest sources each row cites, matched by source_url.
+    Read-only -- this loads golden.jsonl through load_golden_source_urls and never writes to it.
+    """
+    golden_rows = load_golden_source_urls(_REAL_GOLDEN_PATH)
+    assert golden_rows is not None
+    assert len(golden_rows) == 21
+
+    for source_url, expected_indices in _EXPECTED_GOLDEN_IMPACT_BY_SOURCE.items():
+        impact = golden_impact_for_source(
+            golden_rows,
+            golden_path=_REAL_GOLDEN_PATH,
+            source_url=source_url,
+            resolved_url=None,
+        )
+        assert impact.available is True
+        assert impact.affected_indices == expected_indices, source_url
+
+    # The negative case: a meaningful change to one of the 8 sources no golden row cites reports an
+    # empty affected list -- not a crash, not a false positive.
+    for source_url in _UNCITED_REAL_SOURCES:
+        impact = golden_impact_for_source(
+            golden_rows,
+            golden_path=_REAL_GOLDEN_PATH,
+            source_url=source_url,
+            resolved_url=None,
+        )
+        assert impact.available is True
+        assert impact.affected_indices == [], source_url
+
+
+def test_golden_impact_for_source_matches_resolved_url_not_only_manifest_url():
+    """One manifest entry redirects (traveling-as-an-international-student ->
+    traveling-as-an-f-or-m-student), so a golden row could cite either form. Matching on
+    source_url alone would silently miss a row that cites only the resolved form.
+    """
+    golden_rows = [
+        {"https://example.gov/old-name"},  # cites the pre-redirect manifest URL
+        {"https://example.gov/new-name"},  # cites the POST-redirect URL only
+        {"https://example.gov/unrelated"},
+    ]
+
+    both = golden_impact_for_source(
+        golden_rows,
+        golden_path=Path("unused"),
+        source_url="https://example.gov/old-name",
+        resolved_url="https://example.gov/new-name",
+    )
+    assert both.available is True
+    assert both.affected_indices == [0, 1]
+
+    manifest_url_only = golden_impact_for_source(
+        golden_rows,
+        golden_path=Path("unused"),
+        source_url="https://example.gov/old-name",
+        resolved_url=None,
+    )
+    assert manifest_url_only.affected_indices == [0]  # row 1 would be silently missed
+
+
+def test_load_golden_source_urls_returns_none_when_file_missing(tmp_path):
+    assert load_golden_source_urls(tmp_path / "does-not-exist.jsonl") is None
+
+
+def test_load_golden_source_urls_returns_none_on_malformed_json(tmp_path):
+    path = tmp_path / "malformed.jsonl"
+    path.write_text('{"source_urls": ["https://x"]}\nNOT JSON\n', encoding="utf-8")
+    assert load_golden_source_urls(path) is None
+
+
+def test_load_golden_source_urls_returns_none_when_source_urls_field_is_missing_or_malformed(
+    tmp_path,
+):
+    missing_field = tmp_path / "missing-field.jsonl"
+    missing_field.write_text(json.dumps({"question": "no source_urls here"}), encoding="utf-8")
+    assert load_golden_source_urls(missing_field) is None
+
+    wrong_type = tmp_path / "wrong-type.jsonl"
+    wrong_type.write_text(json.dumps({"source_urls": "not-a-list"}), encoding="utf-8")
+    assert load_golden_source_urls(wrong_type) is None
+
+
+def test_load_golden_source_urls_skips_blank_lines_and_preserves_order(tmp_path):
+    path = tmp_path / "well-formed.jsonl"
+    path.write_text(
+        json.dumps({"source_urls": ["https://a"]})
+        + "\n\n"
+        + json.dumps({"source_urls": ["https://b", "https://c"]}),
+        encoding="utf-8",
+    )
+    rows = load_golden_source_urls(path)
+    assert rows == [{"https://a"}, {"https://b", "https://c"}]
+
+
+def test_golden_impact_for_source_reports_unavailable_never_a_silent_zero(tmp_path):
+    """golden_rows=None (the file could not be read/parsed) must report available=False with a
+    non-empty note, NEVER an empty affected_indices list that looks identical to "checked, nothing
+    affected" -- that indistinguishability is the exact failure this feature exists to prevent.
+    """
+    missing_path = tmp_path / "does-not-exist.jsonl"
+    impact = golden_impact_for_source(
+        None,
+        golden_path=missing_path,
+        source_url="https://example.gov/x",
+        resolved_url=None,
+    )
+    assert impact.available is False
+    assert impact.affected_indices == []
+    assert impact.note is not None
+    assert "unavailable" in impact.note.lower()
+
+
+# =================================================================================================
+# PURE: RefreshReport.exit_code / render_table / to_dict with golden_impact (Phase 8 round 2, B2)
+# =================================================================================================
+
+
+def test_exit_code_is_green_when_meaningful_change_is_not_cited_by_any_golden_row():
+    result = _make_source_result(
+        status="meaningful",
+        golden_impact=GoldenImpact(available=True, affected_indices=[], note=None),
+    )
+    report = RefreshReport(run_id="t", results=[result], http_fetches_this_run=1)
+    assert report.exit_code() == 0
+
+
+def test_exit_code_is_red_when_meaningful_change_is_cited_by_golden_rows():
+    result = _make_source_result(
+        status="meaningful",
+        golden_impact=GoldenImpact(available=True, affected_indices=[3, 5], note=None),
+    )
+    report = RefreshReport(run_id="t", results=[result], http_fetches_this_run=1)
+    assert report.exit_code() == 1
+
+
+def test_exit_code_is_red_when_golden_set_is_unavailable_for_a_meaningful_change():
+    result = _make_source_result(
+        status="meaningful",
+        golden_impact=GoldenImpact(
+            available=False, affected_indices=[], note="golden set unavailable: ..."
+        ),
+    )
+    report = RefreshReport(run_id="t", results=[result], http_fetches_this_run=1)
+    assert report.exit_code() == 1
+
+
+def test_exit_code_still_red_on_fetch_failed_alone_unchanged_from_before():
+    result = _make_source_result(
+        status="fetch_failed", reason="max_attempts_exceeded", golden_impact=None
+    )
+    report = RefreshReport(run_id="t", results=[result], http_fetches_this_run=1)
+    assert report.exit_code() == 1
+
+
+def test_render_table_banner_names_both_red_reasons_when_both_apply():
+    broken = _make_source_result(
+        source_url="https://example.gov/broken",
+        status="fetch_failed",
+        reason="max_attempts_exceeded",
+        golden_impact=None,
+    )
+    golden_hit = _make_source_result(
+        source_url="https://example.gov/golden-hit",
+        status="meaningful",
+        golden_impact=GoldenImpact(available=True, affected_indices=[2], note=None),
+    )
+    report = RefreshReport(run_id="t", results=[broken, golden_hit], http_fetches_this_run=2)
+
+    table = report.render_table()
+    lines = table.split("\n")
+    banner_lines = lines[: lines.index("")]
+    banner_text = "\n".join(banner_lines)
+
+    assert "RED RUN" in banner_text
+    assert "BROKEN" in banner_text
+    assert "example.gov/broken" in banner_text
+    assert "golden" in banner_text.lower()
+    assert "example.gov/golden-hit" in banner_text
+
+    # The row itself also carries the golden verdict (distinguished from the banner detail line
+    # above, which also mentions this same shortened label and even the word "meaningful", by
+    # requiring the line to actually START with the source label -- only the table row does).
+    hit_line = next(line for line in lines if line.startswith("example.gov/golden-hit"))
+    assert "rows [2]" in hit_line
+    assert "AFFECTED" in hit_line
+
+
+def test_render_table_shows_golden_none_cited_and_no_banner_on_a_green_meaningful_change():
+    result = _make_source_result(
+        source_url="https://example.gov/green-meaningful",
+        status="meaningful",
+        golden_impact=GoldenImpact(available=True, affected_indices=[], note=None),
+    )
+    report = RefreshReport(run_id="t", results=[result], http_fetches_this_run=1)
+
+    table = report.render_table()
+    assert "RED RUN" not in table
+    row_line = next(line for line in table.split("\n") if "green-meaningful" in line)
+    assert "golden: none cited" in row_line
+
+
+def test_to_dict_red_reasons_lists_the_right_source_urls_and_stays_empty_when_green():
+    broken = _make_source_result(
+        source_url="https://example.gov/broken2",
+        status="fetch_failed",
+        reason="max_attempts_exceeded",
+        golden_impact=None,
+    )
+    golden_hit = _make_source_result(
+        source_url="https://example.gov/golden-hit2",
+        status="meaningful",
+        golden_impact=GoldenImpact(available=True, affected_indices=[0], note=None),
+    )
+    clean = _make_source_result(
+        source_url="https://example.gov/clean",
+        status="meaningful",
+        golden_impact=GoldenImpact(available=True, affected_indices=[], note=None),
+    )
+    report = RefreshReport(run_id="t", results=[broken, golden_hit, clean], http_fetches_this_run=3)
+
+    payload = report.to_dict()
+    assert payload["exit_code"] == 1
+    assert payload["red_reasons"]["broken_sources"] == ["https://example.gov/broken2"]
+    assert payload["red_reasons"]["golden_review_sources"] == ["https://example.gov/golden-hit2"]
+
+    green_report = RefreshReport(run_id="t", results=[clean], http_fetches_this_run=1)
+    green_payload = green_report.to_dict()
+    assert green_payload["exit_code"] == 0
+    assert green_payload["red_reasons"] == {
+        "broken_sources": [],
+        "golden_review_sources": [],
+    }
 
 
 # =================================================================================================
@@ -543,7 +842,14 @@ async def _insert_test_row(
                     last_http_status = NULL,
                     status = 'ok'
                 """,
-                (source_url, page_last_updated, fetched_at, fetched_at, fetched_at, fetched_at),
+                (
+                    source_url,
+                    page_last_updated,
+                    fetched_at,
+                    fetched_at,
+                    fetched_at,
+                    fetched_at,
+                ),
             )
             await cur.execute("DELETE FROM documents WHERE source_url = %s", (source_url,))
             await cur.execute(
@@ -627,7 +933,9 @@ async def test_touch_last_verified_moves_last_verified_and_leaves_everything_els
     await _delete_test_rows(conn, source_url)
 
 
-async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_updated(conn):
+async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_updated(
+    conn,
+):
     source_url = "https://example.gov/freshness-test-reindex"
     other_source_url = "https://example.gov/freshness-test-reindex-other"
     old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -747,7 +1055,8 @@ async def test_reindex_source_embedder_failure_leaves_existing_chunks_intact(con
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id", (source_url,)
+            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id",
+            (source_url,),
         )
         before_rows = await cur.fetchall()
     assert [r["id"] for r in before_rows] == [old_row_id]
@@ -776,7 +1085,8 @@ async def test_reindex_source_embedder_failure_leaves_existing_chunks_intact(con
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id", (source_url,)
+            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id",
+            (source_url,),
         )
         after_rows = await cur.fetchall()
     assert after_rows == before_rows
@@ -821,7 +1131,8 @@ async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_a
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id", (source_url,)
+            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id",
+            (source_url,),
         )
         before_rows = await cur.fetchall()
     assert [r["id"] for r in before_rows] == [old_row_id]
@@ -859,7 +1170,8 @@ async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_a
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id", (source_url,)
+            "SELECT id, content FROM documents WHERE source_url = %s ORDER BY id",
+            (source_url,),
         )
         after_rows = await cur.fetchall()
     assert after_rows == before_rows, "the DELETE that ran before the failed INSERT must roll back"
@@ -886,12 +1198,14 @@ async def test_no_foreign_key_touching_documents_is_on_delete_cascade(conn):
     to replace them.
     """
     async with conn.cursor(row_factory=dict_row) as cur:
-        await cur.execute("""
+        await cur.execute(
+            """
             SELECT conname, confdeltype
             FROM pg_constraint
             WHERE contype = 'f'
               AND (conrelid = 'documents'::regclass OR confrelid = 'documents'::regclass)
-            """)
+            """
+        )
         rows = await cur.fetchall()
 
     assert rows, "expected at least one foreign key referencing or defined on `documents`"
@@ -971,7 +1285,9 @@ def test_destructive_documents_statements_only_live_in_embed_and_store():
     )
 
 
-async def test_record_source_failure_never_advances_verification_or_success_clocks(conn):
+async def test_record_source_failure_never_advances_verification_or_success_clocks(
+    conn,
+):
     """DoD 2: record_source_failure must NEVER write last_verified_at/last_success_at/fetched_at/
     last_changed_at/change_count -- a failing source's verification clock must not silently
     advance. Captures every one of those columns before the call and asserts them byte-identical
@@ -1020,7 +1336,9 @@ async def test_record_source_failure_never_advances_verification_or_success_cloc
     await _delete_test_rows(conn, source_url)
 
 
-async def test_record_source_failure_robots_disallowed_does_not_increment_failures(conn):
+async def test_record_source_failure_robots_disallowed_does_not_increment_failures(
+    conn,
+):
     """The other branch of record_source_failure: status="robots_disallowed" moves last_error/
     status but deliberately does NOT increment consecutive_failures (a robots disallow is a
     permanent curation condition, not a fetch failure to count)."""
@@ -1028,7 +1346,11 @@ async def test_record_source_failure_robots_disallowed_does_not_increment_failur
     await _insert_test_row(conn, source_url, fetched_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
 
     await record_source_failure(
-        conn, source_url, error="robots_disallowed", http_status=None, status="robots_disallowed"
+        conn,
+        source_url,
+        error="robots_disallowed",
+        http_status=None,
+        status="robots_disallowed",
     )
 
     async with conn.cursor(row_factory=dict_row) as cur:
@@ -1062,8 +1384,18 @@ _HEALTH_NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
         (3, "ok", _HEALTH_NOW, "broken"),  # boundary: 3 failures is broken
         (5, "ok", _HEALTH_NOW, "broken"),  # well past the threshold
         (0, "robots_disallowed", _HEALTH_NOW, "broken"),  # permanent, immediate
-        (0, "ok", _HEALTH_NOW - timedelta(days=7), "ok"),  # boundary: exactly 7 days is still ok
-        (0, "ok", _HEALTH_NOW - timedelta(days=7, seconds=1), "broken"),  # just past 7 days
+        (
+            0,
+            "ok",
+            _HEALTH_NOW - timedelta(days=7),
+            "ok",
+        ),  # boundary: exactly 7 days is still ok
+        (
+            0,
+            "ok",
+            _HEALTH_NOW - timedelta(days=7, seconds=1),
+            "broken",
+        ),  # just past 7 days
         (0, "ok", _HEALTH_NOW - timedelta(days=30), "broken"),
         (0, "ok", None, "broken"),  # never once succeeded
     ],
@@ -1355,7 +1687,11 @@ async def test_pipeline_appends_notice_reason_top_ranked_for_an_uncited_dated_to
     fake_llm = FixedAnswerLLM("The current rule is stated here [2].")
 
     response = await answer_question(
-        _QUESTION, pool=ExplodingPool(), embedder=embedder, llm=fake_llm, settings=settings
+        _QUESTION,
+        pool=ExplodingPool(),
+        embedder=embedder,
+        llm=fake_llm,
+        settings=settings,
     )
 
     assert response.response_type == ResponseType.ANSWER.value
@@ -1386,7 +1722,11 @@ async def test_pipeline_appends_notice_reason_cited_for_a_non_top_dated_chunk_th
     fake_llm = FixedAnswerLLM("As the second source states [2], the rule changes soon.")
 
     response = await answer_question(
-        _QUESTION, pool=ExplodingPool(), embedder=embedder, llm=fake_llm, settings=settings
+        _QUESTION,
+        pool=ExplodingPool(),
+        embedder=embedder,
+        llm=fake_llm,
+        settings=settings,
     )
 
     assert response.response_type == ResponseType.ANSWER.value
@@ -1419,7 +1759,11 @@ async def test_pipeline_appends_no_notice_for_a_dated_chunk_neither_top_ranked_n
     fake_llm = FixedAnswerLLM(fixed_text)
 
     response = await answer_question(
-        _QUESTION, pool=ExplodingPool(), embedder=embedder, llm=fake_llm, settings=settings
+        _QUESTION,
+        pool=ExplodingPool(),
+        embedder=embedder,
+        llm=fake_llm,
+        settings=settings,
     )
 
     assert response.response_type == ResponseType.ANSWER.value
@@ -1444,7 +1788,11 @@ async def test_pipeline_appends_no_notice_when_no_retrieved_chunk_carries_a_date
     fake_llm = FixedAnswerLLM(fixed_text)
 
     response = await answer_question(
-        _QUESTION, pool=ExplodingPool(), embedder=embedder, llm=fake_llm, settings=settings
+        _QUESTION,
+        pool=ExplodingPool(),
+        embedder=embedder,
+        llm=fake_llm,
+        settings=settings,
     )
 
     assert response.response_type == ResponseType.ANSWER.value
@@ -1489,7 +1837,12 @@ async def test_hybrid_search_carries_rule_effective_date_through(pool):
     question = "What is the Admit Until Date and how is it determined?"
     [embedding] = await real_embedder.embed([question])
     results = await hybrid_search(
-        pool, embedding, question, k=settings.RETRIEVAL_TOP_K, rrf_k=60, candidate_pool=20
+        pool,
+        embedding,
+        question,
+        k=settings.RETRIEVAL_TOP_K,
+        rrf_k=60,
+        candidate_pool=20,
     )
     assert any(r.rule_effective_date == date(2026, 9, 15) for r in results), (
         f"expected at least one retrieved chunk to carry rule_effective_date=2026-09-15, got "
@@ -1531,7 +1884,12 @@ async def test_pipeline_freshness_notice_fires_via_top_ranked_on_the_live_corpus
     async def notices_for(question: str) -> list:
         [embedding] = await real_embedder.embed([question])
         chunks = await hybrid_search(
-            pool, embedding, question, k=settings.RETRIEVAL_TOP_K, rrf_k=60, candidate_pool=20
+            pool,
+            embedding,
+            question,
+            k=settings.RETRIEVAL_TOP_K,
+            rrf_k=60,
+            candidate_pool=20,
         )
         freshness = build_freshness(chunks, today=datetime.now(UTC).date(), cited_indices=set())
         return freshness.notices
@@ -1732,6 +2090,156 @@ async def test_graph_meaningful_change_carries_verdict_evidence_through_source_r
     assert resumed_result.highlights == result.highlights
     assert resumed_result.added == result.added
     assert resumed_result.removed == result.removed
+
+    await _delete_test_rows(conn, source_url)
+
+
+def _write_golden_jsonl(path: Path, rows: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_meaningful_change_reports_exact_golden_impact_indices(
+    tmp_path, conn, database_url
+):
+    """B1, driven through the real run_refresh pipeline (not just the pure function): a meaningful
+    change to a source cited by two golden rows -- one citing the manifest URL, one citing only the
+    URL the fetch actually redirected to -- reports BOTH indices, and the run goes red for it
+    (docs/adr/0009).
+    """
+    source_url = "https://example.gov/freshness-graph-golden-impact"
+    resolved_url = "https://example.gov/freshness-graph-golden-impact-resolved"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    _write_test_snapshot(
+        tmp_path,
+        source_url=source_url,
+        topic=topic,
+        title="Test Page",
+        body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
+    )
+    await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+    )
+
+    async def fetcher(entry):
+        return FetchedPage(
+            resolved_url=resolved_url,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown="# Test Page\n\n## Section\n\nThe extension is 36 months.\n",
+        )
+
+    golden_path = tmp_path / "golden-impact-test.jsonl"
+    _write_golden_jsonl(
+        golden_path,
+        [
+            {"question": "cites the manifest url", "source_urls": [source_url]},
+            {
+                "question": "cites something unrelated",
+                "source_urls": ["https://example.gov/x"],
+            },
+            {"question": "cites the RESOLVED url only", "source_urls": [resolved_url]},
+        ],
+    )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=tmp_path,
+        run_id="test-run-golden-impact",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+        golden_path=golden_path,
+    )
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "meaningful"
+    assert result.golden_impact is not None
+    assert result.golden_impact.available is True
+    # Row 0 cites the manifest url, row 2 cites only the resolved url the fetch landed on -- BOTH
+    # must be caught, not just the manifest-url match.
+    assert result.golden_impact.affected_indices == [0, 2]
+
+    assert report.exit_code() == 1  # golden rows are affected -> red, per docs/adr/0009
+    payload = report.to_dict()
+    assert payload["red_reasons"]["golden_review_sources"] == [source_url]
+    assert payload["red_reasons"]["broken_sources"] == []
+
+    await _delete_test_rows(conn, source_url)
+
+
+@requires_langgraph
+@pytest.mark.freshness
+async def test_graph_meaningful_change_to_an_uncited_source_reports_empty_impact_and_stays_green(
+    tmp_path, conn, database_url
+):
+    """B1/B2 negative case, driven through the real run_refresh pipeline: a meaningful change to a
+    source NO golden row cites reports an empty affected list -- not a crash, not a false positive
+    -- and the run stays green (docs/adr/0009: nothing needs a human here).
+    """
+    source_url = "https://example.gov/freshness-graph-golden-uncited"
+    topic = "freshness_test"
+    old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    _write_test_snapshot(
+        tmp_path,
+        source_url=source_url,
+        topic=topic,
+        title="Test Page",
+        body="# Test Page\n\n## Section\n\nThe extension is 24 months.\n",
+    )
+    await _insert_test_row(
+        conn, source_url, fetched_at=old_time, page_last_updated=date(2026, 1, 1)
+    )
+
+    async def fetcher(entry):
+        return FetchedPage(
+            resolved_url=None,
+            title=entry.get("title"),
+            page_last_updated=date(2026, 2, 1),
+            body_markdown="# Test Page\n\n## Section\n\nThe extension is 36 months.\n",
+        )
+
+    golden_path = tmp_path / "golden-impact-negative.jsonl"
+    _write_golden_jsonl(
+        golden_path,
+        [
+            {
+                "question": "cites something else entirely",
+                "source_urls": ["https://example.gov/x"],
+            }
+        ],
+    )
+
+    report = await run_refresh(
+        settings=get_settings(),
+        manifest=[{"url": source_url, "topic": topic, "title": "Test Page"}],
+        raw_dir=tmp_path,
+        run_id="test-run-golden-uncited",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite"),
+        fetcher=fetcher,
+        conn_factory=make_conn_factory(database_url),
+        embedder=StubEmbedder(dim=768),
+        max_attempts=3,
+        backoff_seconds=0,
+        golden_path=golden_path,
+    )
+
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "meaningful"
+    assert result.golden_impact is not None
+    assert result.golden_impact.available is True
+    assert result.golden_impact.affected_indices == []
+    assert report.exit_code() == 0  # nothing needs a human -- see docs/adr/0009
 
     await _delete_test_rows(conn, source_url)
 

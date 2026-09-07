@@ -78,7 +78,11 @@ import textstat
 
 from app.config import Settings
 from app.providers.embeddings import OllamaEmbedder
-from eval.judge import RETRYABLE_JUDGE_ERRORS, get_shared_rate_limiter, validate_judge_settings
+from eval.judge import (
+    RETRYABLE_JUDGE_ERRORS,
+    get_shared_rate_limiter,
+    validate_judge_settings,
+)
 
 # ragas, langchain-core, and langchain-openai are imported lazily, inside the functions that
 # actually run RAGAS (build_ragas_llm, build_ragas_embeddings, run_ragas_metrics), NOT at module

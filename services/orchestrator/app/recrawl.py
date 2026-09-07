@@ -280,6 +280,106 @@ def _frontmatter_date_iso(frontmatter: dict, key: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------------------------
+# Golden-set impact (Phase 8 round 2): which eval/golden.jsonl rows a meaningfully-changed source
+# might affect. READ-ONLY -- this section never writes, edits, or reorders eval/golden.jsonl. It
+# only reads its `source_urls` field, once per run_refresh call, to answer "which golden rows cite
+# this source" for a source whose content just changed. Whether a row's ground_truth_answer still
+# agrees with the new content is a question only a human (or a full eval run) can answer; this
+# exists so that question gets asked, for the right rows, instead of a stale golden row silently
+# reading as a retrieval regression in the next eval run -- USCIS changes a rule, the system
+# correctly answers with the new rule, and the eval scores that row WRONG because golden.jsonl
+# still holds the old answer.
+#
+# WHY THIS LIVES HERE, NOT IN eval/: importing anything from the eval package (even
+# eval.run.load_golden_set) would pull app/recrawl.py's module-level import graph into a package
+# this module has no business depending on just to read one field off a JSONL file --
+# app/recrawl.py's own module docstring already establishes exactly this isolation for langgraph,
+# and the same discipline applies here. load_golden_source_urls below duplicates a few lines of
+# eval/run.py::load_golden_set's file-reading logic rather than importing it.
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclass
+class GoldenImpact:
+    """Which golden rows cite a source whose refresh verdict was "meaningful".
+
+    `available` is False ONLY when eval/golden.jsonl itself could not be read or parsed at all
+    (missing, unreadable, invalid JSON, or a row with a missing/malformed `source_urls`) -- in that
+    case `affected_indices` is ALWAYS empty and `note` explains why. This is deliberate: a caller
+    must never be able to mistake "we could not check" for "we checked and nothing was affected",
+    which is the exact silent-zero failure this feature exists to prevent. When `available` is
+    True, `affected_indices` is the real (possibly empty) answer and `note` is None.
+    """
+
+    available: bool
+    affected_indices: list[int] = field(default_factory=list)
+    note: str | None = None
+
+
+def load_golden_source_urls(golden_path: Path) -> list[set[str]] | None:
+    """Every golden row's own `source_urls` as a set, indexed by the row's 0-based position in
+    eval/golden.jsonl -- or None if the file could not be read/parsed at all: missing, unreadable,
+    invalid JSON on any line, or a row whose `source_urls` is not a list. Blank lines are skipped
+    (the file has no trailing newline by design, and iterating a file's lines still yields the
+    final one -- the same convention eval/run.py::load_golden_set uses).
+
+    Never raises: every failure mode here is reported through the None return, which callers turn
+    into GoldenImpact(available=False, ...) rather than letting an exception abort a whole refresh
+    run over a problem with a file this module only ever reads for reporting.
+    """
+    try:
+        text = golden_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rows: list[set[str]] = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        source_urls = row.get("source_urls") if isinstance(row, dict) else None
+        if not isinstance(source_urls, list):
+            return None
+        rows.append(set(source_urls))
+    return rows
+
+
+def golden_impact_for_source(
+    golden_rows: list[set[str]] | None,
+    *,
+    golden_path: Path,
+    source_url: str,
+    resolved_url: str | None,
+) -> GoldenImpact:
+    """Which golden row indices cite `source_url` OR `resolved_url` -- matching on BOTH, never
+    `source_url` alone, because one manifest entry redirects
+    (traveling-as-an-international-student -> traveling-as-an-f-or-m-student) and a golden row
+    could cite either the manifest form or the post-redirect form the fetch actually landed on; a
+    source_url-only match would silently miss a golden row citing the resolved form.
+
+    `golden_rows` is `load_golden_source_urls`'s output, passed in rather than re-read here so one
+    refresh run reads eval/golden.jsonl exactly once no matter how many sources changed.
+    """
+    if golden_rows is None:
+        return GoldenImpact(
+            available=False,
+            affected_indices=[],
+            note=(
+                f"golden set unavailable: could not read/parse {golden_path} -- affected golden "
+                "rows are UNKNOWN, not zero. Review this source's citations by hand."
+            ),
+        )
+    targets = {source_url}
+    if resolved_url:
+        targets.add(resolved_url)
+    affected = [i for i, urls in enumerate(golden_rows) if urls & targets]
+    return GoldenImpact(available=True, affected_indices=affected, note=None)
+
+
+# ---------------------------------------------------------------------------------------------
 # DB bookkeeping. Importable without langgraph; each function takes a connection directly.
 #
 # WHY THE SPLIT: an unchanged or cosmetic re-crawl updates `sources.last_verified_at` (plus
@@ -533,7 +633,11 @@ async def _fetch_node(deps: RefreshDeps, state: RefreshState) -> dict:
     , None), ..., None)` so this never raises on an exception shaped without a `.response` at all.
     """
     attempts = state["attempts"] + 1
-    entry = {"url": state["source_url"], "topic": state["topic"], "title": state.get("title")}
+    entry = {
+        "url": state["source_url"],
+        "topic": state["topic"],
+        "title": state.get("title"),
+    }
     trail = [*state["node_trail"], "fetch"]
 
     try:
@@ -723,7 +827,10 @@ async def _verify_only_node(deps: RefreshDeps, state: RefreshState) -> dict:
         rule_effective_date = _parse_iso_date(state.get("rule_effective_date"))
         async with deps.conn_factory() as conn:
             await touch_last_verified(
-                conn, state["source_url"], now=now, rule_effective_date=rule_effective_date
+                conn,
+                state["source_url"],
+                now=now,
+                rule_effective_date=rule_effective_date,
             )
 
     return {
@@ -840,7 +947,13 @@ def _verdict_evidence(verdict: dict | None) -> dict:
     `None`, and the per-source exception handler in `_drive` never builds a verdict dict either.
     """
     if not verdict:
-        return {"added": [], "removed": [], "added_count": 0, "removed_count": 0, "highlights": []}
+        return {
+            "added": [],
+            "removed": [],
+            "added_count": 0,
+            "removed_count": 0,
+            "highlights": [],
+        }
     return {
         "added": verdict.get("added", []),
         "removed": verdict.get("removed", []),
@@ -880,6 +993,13 @@ class SourceResult:
     added_count: int = 0
     removed_count: int = 0
     highlights: list[str] = field(default_factory=list)
+    # Golden-set impact (Phase 8 round 2, see GoldenImpact/golden_impact_for_source above). None
+    # for any status other than "meaningful" -- there is nothing to report for a source that did
+    # not change, and this is what lets a caller tell "not applicable" apart from "checked, zero
+    # affected" (GoldenImpact.affected_indices == []), which look identical if collapsed into one
+    # field. Always populated (never left None) for a "meaningful" source -- see run_refresh's
+    # `_drive`, which computes it for both a freshly-run and a resumed source.
+    golden_impact: GoldenImpact | None = None
 
 
 @dataclass
@@ -894,14 +1014,61 @@ class RefreshReport:
             counts[result.status] = counts.get(result.status, 0) + 1
         return counts
 
+    def _broken_sources(self) -> list[SourceResult]:
+        """Sources this run could not even fetch. Kept as its own method (not inlined into
+        exit_code) so render_table/to_dict can name them explicitly -- red must say WHICH of its
+        two possible meanings applies, not just that something is wrong (see B2/exit_code below).
+        """
+        return [r for r in self.results if r.status == "fetch_failed"]
+
+    def _golden_review_sources(self) -> list[SourceResult]:
+        """Meaningfully-changed sources a human should look at because eval/golden.jsonl might now
+        be wrong about them: either golden rows actually cite the source, or the golden set could
+        not be read at all (an unknown impact is never treated as a zero impact -- see
+        GoldenImpact's own docstring). A meaningful change to a source no golden row cites is
+        excluded here on purpose: nothing needs a human to do anything, the corpus was correctly
+        re-indexed.
+        """
+        return [
+            r
+            for r in self.results
+            if r.status == "meaningful"
+            and r.golden_impact is not None
+            and (not r.golden_impact.available or r.golden_impact.affected_indices)
+        ]
+
     def exit_code(self) -> int:
-        return 1 if any(r.status == "fetch_failed" for r in self.results) else 0
+        """Non-zero ("red") means a human must act, and it now carries two DIFFERENT reasons that
+        never collapse into one meaning (see render_table/to_dict, which both say explicitly which
+        one applies):
+
+        1. A source is broken (fetch_failed) -- unchanged from before this round.
+        2. A meaningfully-changed source is one golden rows cite, or one whose golden impact could
+           not even be checked -- added this round (see _golden_review_sources).
+
+        A meaningful change to a source NO golden row cites stays green: the corpus was correctly
+        re-indexed and nothing needs a human. This is the deliberate choice recorded in
+        docs/adr/0009 -- see that ADR for why "any meaningful change goes red" was rejected (it
+        would have made the Sept 15 2026 fixed-admission rewrite (studyinthestates/ice.gov, cited
+        by no golden row) fire red on a day nothing was wrong, training the reader to ignore red).
+        """
+        return 1 if (self._broken_sources() or self._golden_review_sources()) else 0
 
     def to_dict(self) -> dict:
+        broken = self._broken_sources()
+        golden_review = self._golden_review_sources()
         return {
             "run_id": self.run_id,
             "http_fetches_this_run": self.http_fetches_this_run,
             "counts": self.counts(),
+            "exit_code": self.exit_code(),
+            # Explicit, machine-readable statement of WHICH meaning(s) a non-zero exit_code carries
+            # this run -- never left implicit in the counts alone. Both lists are empty on a green
+            # run.
+            "red_reasons": {
+                "broken_sources": [r.source_url for r in broken],
+                "golden_review_sources": [r.source_url for r in golden_review],
+            },
             "results": [asdict(r) for r in self.results],
         }
 
@@ -912,10 +1079,35 @@ class RefreshReport:
         characters. Every row's `status` token lands at the same column regardless of label length.
 
         For any source that is not `unchanged`, the row also carries `+added/-removed` line counts
-        and `highlights` (if any) as trailing text, so a change is visible at a glance. Sample
+        and `highlights` (if any) as trailing text, so a change is visible at a glance -- EVERY
+        meaningful change is shown here, even on an otherwise-green run: the reader needs to see
+        it, they just don't need to be paged about it unless golden rows are actually at stake (see
+        docs/adr/0009). A "meaningful" row also carries its golden-impact verdict: which golden row
+        indices cite it, that none do, or that the golden set could not be checked at all. Sample
         added/removed lines are never printed here -- that is what `--json` is for.
+
+        If this run is red, an unmissable banner naming WHICH of the two possible reasons applies
+        (a broken source, a golden-review source, or both) is printed FIRST, before anything else.
         """
-        lines = [f"Refresh run {self.run_id}", ""]
+        lines: list[str] = []
+        broken = self._broken_sources()
+        golden_review = self._golden_review_sources()
+        if broken or golden_review:
+            lines.append("*** RED RUN: a human must act ***")
+            if broken:
+                lines.append(
+                    f"  {len(broken)} source(s) BROKEN (fetch_failed): "
+                    + ", ".join(_short_source_label(r.source_url) for r in broken)
+                )
+            if golden_review:
+                lines.append(
+                    f"  {len(golden_review)} source(s) with a meaningful change eval/golden.jsonl "
+                    "needs review for (cited by golden rows, or golden set unavailable): "
+                    + ", ".join(_short_source_label(r.source_url) for r in golden_review)
+                )
+            lines.append("")
+        lines.append(f"Refresh run {self.run_id}")
+        lines.append("")
         labels = {r.source_url: _short_source_label(r.source_url) for r in self.results}
         source_width = max([len("source")] + [len(label) for label in labels.values()])
         header = (
@@ -934,6 +1126,14 @@ class RefreshReport:
                 row += f"  +{r.added_count}/-{r.removed_count}"
                 if r.highlights:
                     row += "  " + ", ".join(r.highlights)
+                if r.golden_impact is not None:
+                    gi = r.golden_impact
+                    if not gi.available:
+                        row += "  golden: UNAVAILABLE"
+                    elif gi.affected_indices:
+                        row += f"  golden: rows {gi.affected_indices} AFFECTED"
+                    else:
+                        row += "  golden: none cited"
             lines.append(row)
         lines.append("")
         counts = self.counts()
@@ -960,6 +1160,7 @@ async def run_refresh(
     embedder: Embedder | None = None,
     max_attempts: int | None = None,
     backoff_seconds: float | None = None,
+    golden_path: str | Path | None = None,
 ) -> RefreshReport:
     """Iterate the manifest, running (or resuming) one refresh graph invocation per source.
 
@@ -979,7 +1180,13 @@ async def run_refresh(
     `fetcher`, `conn_factory`, and `embedder` are all overridable so tests can drive this with no
     network and no real database; production (main() below) leaves them unset and this function
     builds real ones (an httpx client + robots/rate-limiter for the default fetcher, a psycopg
-    connection factory, and the configured embedder).
+    connection factory, and the configured embedder). `golden_path` is the same kind of override,
+    for `eval/golden.jsonl` -- defaults to `settings.GOLDEN_SET_PATH`.
+
+    `eval/golden.jsonl` is read AT MOST once per call (see `load_golden_source_urls` below), never
+    once per source: whether it could be read at all (missing, unreadable, malformed) is decided
+    once, up front, and every source's golden-impact verdict (for a "meaningful" source only) reads
+    from that one result.
     """
     resolved_run_id = run_id or _today_utc_iso()
     raw_dir_path = Path(raw_dir) if raw_dir is not None else Path(settings.RAW_SNAPSHOT_DIR)
@@ -989,6 +1196,9 @@ async def run_refresh(
     )
     resolved_backoff = (
         backoff_seconds if backoff_seconds is not None else settings.REFRESH_RETRY_BACKOFF_SECONDS
+    )
+    resolved_golden_path = (
+        Path(golden_path) if golden_path is not None else Path(settings.GOLDEN_SET_PATH)
     )
 
     manifest_entries = (
@@ -1001,6 +1211,24 @@ async def run_refresh(
     resolved_conn_factory = conn_factory or make_conn_factory(settings.DATABASE_URL)
     resolved_embedder = embedder if embedder is not None else get_embedder(settings)
 
+    # Read once for the whole run (never once per source) -- see the docstring above.
+    golden_rows = load_golden_source_urls(resolved_golden_path)
+
+    def _golden_impact(
+        status: str, source_url: str, resolved_url: str | None
+    ) -> GoldenImpact | None:
+        """None for any status other than "meaningful" -- there is nothing to check for a source
+        that did not meaningfully change (see SourceResult.golden_impact's own comment).
+        """
+        if status != "meaningful":
+            return None
+        return golden_impact_for_source(
+            golden_rows,
+            golden_path=resolved_golden_path,
+            source_url=source_url,
+            resolved_url=resolved_url,
+        )
+
     fetch_count = {"n": 0}
 
     async def _counting_fetcher(inner: Callable[[dict], Awaitable], entry: dict):
@@ -1009,7 +1237,9 @@ async def run_refresh(
 
     results: list[SourceResult] = []
 
-    async def _drive(active_fetcher: Callable[[dict], Awaitable[FetchedPage | None]]) -> None:
+    async def _drive(
+        active_fetcher: Callable[[dict], Awaitable[FetchedPage | None]],
+    ) -> None:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
         deps = RefreshDeps(
@@ -1046,6 +1276,11 @@ async def run_refresh(
                                 chunks_indexed=snapshot.values.get("chunks_indexed", 0),
                                 attempts=snapshot.values.get("attempts", 0),
                                 node_trail=list(snapshot.values.get("node_trail", [])),
+                                golden_impact=_golden_impact(
+                                    snapshot.values["status"],
+                                    source_url,
+                                    snapshot.values.get("resolved_url"),
+                                ),
                                 **_verdict_evidence(snapshot.values.get("verdict")),
                             )
                         )
@@ -1055,7 +1290,8 @@ async def run_refresh(
                         final_state = await graph.ainvoke(None, config)
                     else:
                         final_state = await graph.ainvoke(
-                            _initial_state(entry, resolved_run_id, resolved_max_attempts), config
+                            _initial_state(entry, resolved_run_id, resolved_max_attempts),
+                            config,
                         )
 
                     results.append(
@@ -1068,6 +1304,11 @@ async def run_refresh(
                             chunks_indexed=final_state.get("chunks_indexed", 0),
                             attempts=final_state.get("attempts", 0),
                             node_trail=list(final_state.get("node_trail", [])),
+                            golden_impact=_golden_impact(
+                                final_state["status"],
+                                source_url,
+                                final_state.get("resolved_url"),
+                            ),
                             **_verdict_evidence(final_state.get("verdict")),
                         )
                     )
