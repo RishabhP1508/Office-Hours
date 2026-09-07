@@ -20,6 +20,14 @@ dependencies = [
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp-proto-http>=1.27",
     "opentelemetry-instrumentation-fastapi>=0.48b0",
+    # Phase 8 round 4 (app/langfuse_telemetry.py): checked for dependency weight before adding --
+    # langfuse 4.15.1's own PyPI metadata lists only httpx, pydantic, backoff, wrapt, packaging,
+    # opentelemetry-api/sdk/exporter-otlp-proto-http, and typing-extensions as its own
+    # dependencies. None of langchain, langgraph, ragas, or datasets; the three opentelemetry
+    # packages are ones this project already depends on above. Off by default (empty
+    # LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY); see docs/reports/phase-8.md for the production
+    # image size measured after adding this.
+    "langfuse>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +35,16 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
-    "black>=24.10",
+    # Pinned EXACTLY, not "black>=24.10" (the prior, open-ended constraint): black's stable style
+    # changes between releases (that is the whole point of its yearly "stable style" migrations),
+    # so an unpinned floor resolves to whatever the latest release is on the day someone runs
+    # `pip install`, and that release can reformat files a previous, older black release already
+    # left "all done, unchanged" -- confirmed directly: a fresh `pip install -e ".[dev]"` in a
+    # clean python:3.12-slim container resolved black>=24.10 to 26.5.1, and running `black app
+    # tests eval` under 26.5.1 reformatted 17 files nobody had touched, none of which black 24.10.0
+    # (installed instead, same command, same inputs) found anything to change in. An exact pin is
+    # what makes `black --check` reproducible across machines, CI runs, and time.
+    "black==24.10.0",
 ]
 # Phase 1 eval harness (eval/run.py, judge.py, metrics.py). This puts eval-only dependencies in the
 # service image (see Dockerfile: `pip install -e ".[dev,eval]"`); noted in docs/reports/phase-1.md.
@@ -82,6 +99,26 @@ freshness = [
     "langgraph>=1.2,<2",
     "langgraph-checkpoint-sqlite>=3.1,<4",
     "aiosqlite>=0.20",
+]
+# Phase 8 round 8 (app/providers/embeddings.py::GGUFEmbedder, docs/adr/0013-in-process-gguf-
+# embeddings.md): production's real embedding provider, loading nomic-embed-text's own GGUF file
+# in-process instead of calling a hosted API (neither Ollama Cloud nor NVIDIA serves
+# nomic-embed-text). A separate extra, not a base dependency, so the CI invariant gate
+# (.github/workflows/eval.yml's `pull_request` job, which installs `[dev,eval-ci]` only -- never
+# this one) stays exactly as fast and dependency-light as before this existed: no compiler, no
+# 24MB wheel it does not need, since EMBED_PROVIDER=stub there never constructs a GGUFEmbedder at
+# all. Installed via services/orchestrator/Dockerfile's INSTALL_EXTRAS -- "dev,eval,gguf" by
+# default (so `docker compose build`'s dev image can run this project's own equivalence test, see
+# tests/test_gguf_embedder.py) and "gguf" alone in production (infra/deploy/fly.orchestrator.toml),
+# which is what keeps ragas/langchain/langgraph/datasets/textstat out of the deployed image.
+# 0.3.35 is pinned exactly (not ">="): the CPU wheel index below only ever publishes one prebuilt
+# wheel per released version, and an open-ended floor could resolve to a newer release with no
+# prebuilt wheel yet, forcing a from-source build this project has deliberately avoided needing a
+# compiler for. Installed with `--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
+# (see Dockerfile), a prebuilt manylinux2014_x86_64 wheel confirmed to install and run on
+# python:3.12-slim with no build toolchain at all.
+gguf = [
+    "llama-cpp-python==0.3.35",
 ]
 
 [build-system]

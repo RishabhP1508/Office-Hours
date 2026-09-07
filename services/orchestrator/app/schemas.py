@@ -182,3 +182,14 @@ class SourcesStatus(BaseModel):
     freshness_state: Literal["current", "recent", "stale", "unknown"]
     broken_source_count: int
     broken_sources: list[BrokenSource]
+
+
+class UsageCounts(BaseModel):
+    """GET /usage (Phase 8 round 3): total queries handled and distinct anonymous sessions seen,
+    both persisted in Postgres (app/usage.py) so a restart never resets either number. Carries no
+    identifier of any kind -- see app/usage.py::hash_session_identifier for what "session" means
+    here and why the count cannot be turned back into who asked.
+    """
+
+    total_queries: int
+    distinct_sessions: int

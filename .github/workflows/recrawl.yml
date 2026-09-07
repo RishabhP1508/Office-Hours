@@ -32,6 +32,9 @@ jobs:
       # than relying on the container default.
       SOURCES_MANIFEST_PATH: ${{ github.workspace }}/data/sources/sources.yaml
       RAW_SNAPSHOT_DIR: ${{ github.workspace }}/data/sources/raw
+      # Golden-set impact reporting (Phase 8 round 2, app/recrawl.py) -- read-only, same
+      # checkout-relative override as the two paths above.
+      GOLDEN_SET_PATH: ${{ github.workspace }}/eval/golden.jsonl
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
@@ -113,12 +116,45 @@ jobs:
       # HostedEmbedder is still an unimplemented seam today, so this branch cannot fully succeed
       # against a real DATABASE_URL until that lands. Left here, rather than removed, so the secret
       # can be added the moment Phase 8 is ready without a second edit to this file.
+      # This step's exit code is what decides whether the JOB fails -- see app/recrawl.py::
+      # RefreshReport.exit_code (a broken source, OR a meaningful change to a source golden rows
+      # cite / whose golden impact could not be checked -- docs/adr/0009). The JSON it writes here
+      # is the artifact uploaded below, unconditionally, so a red run is always fully diagnosable
+      # from the Actions UI without re-running anything.
       - name: Re-crawl (live)
+        id: recrawl
         if: steps.db.outputs.mode == 'live'
         working-directory: services/orchestrator
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m app.recrawl --json > recrawl-report.json
+
+      # Same run_id as the step above (both default to today's UTC date -- app/recrawl.py::
+      # run_refresh's own docstring), so every source is already terminal in the checkpoint file
+      # and this SECOND invocation resumes/reports from it rather than re-fetching a single URL --
+      # no extra load on any government source.
+      #
+      # `if: always() && ...`: the step above may itself exit non-zero (RefreshReport.exit_code --
+      # a broken source, OR a meaningful change to a source golden rows cite / whose golden impact
+      # could not be checked, see docs/adr/0009), and GitHub Actions skips every later step by
+      # default once one has failed UNLESS its `if:` says otherwise -- exactly the case this report
+      # most needs to be visible for. `steps.recrawl.outcome != 'skipped'` keeps this from running
+      # when the step above never ran at all (mode == 'dry-run', or the baseline-snapshot guard
+      # failed first). `|| true` on the python call: this step is purely informational (the step
+      # above already decided the job's real exit code), so its own exit code must never duplicate
+      # or override that -- it exists only to put the human-readable table (which names every
+      # meaningful change AND, at the top, unmissably, WHICH of the two red reasons applies if any
+      # -- see RefreshReport.render_table) where a person actually looks first: the GitHub Actions
+      # run summary.
+      - name: Write the human-readable report to the job summary
+        if: always() && steps.db.outputs.mode == 'live' && steps.recrawl.outcome != 'skipped'
+        working-directory: services/orchestrator
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          python -m app.recrawl >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the refresh report
         if: always()

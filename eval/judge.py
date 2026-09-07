@@ -26,7 +26,13 @@ import random
 import time
 from typing import TYPE_CHECKING
 
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI, RateLimitError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAI,
+    RateLimitError,
+)
 
 from app.config import Settings, get_settings
 
@@ -80,7 +86,12 @@ def get_shared_rate_limiter() -> InMemoryRateLimiter:
 # Public (non-underscore) name because eval/metrics.py imports this exact tuple to scope RAGAS's
 # own RunConfig(exception_types=...) to the same set of genuinely-transient errors, instead of
 # RAGAS's default of retrying every Exception subclass.
-RETRYABLE_JUDGE_ERRORS = (RateLimitError, APIStatusError, APIConnectionError, APITimeoutError)
+RETRYABLE_JUDGE_ERRORS = (
+    RateLimitError,
+    APIStatusError,
+    APIConnectionError,
+    APITimeoutError,
+)
 _MAX_RETRIES = _judge_settings.JUDGE_MAX_RETRIES
 _MAX_BACKOFF_SECONDS = 60.0
 

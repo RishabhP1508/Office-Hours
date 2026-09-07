@@ -28,7 +28,15 @@ from app.guardrails.citations import verify_citations
 from app.guardrails.clarifier import CLARIFY_QUESTION, is_too_vague
 from app.guardrails.classifier import ADVICE_PATTERNS, classify_advice, rule_based_advice_signal
 from app.pipeline import answer_question
-from app.prompts import strip_source_list_block
+from app.prompts import (
+    REFUSAL_SYSTEM_PROMPT,
+    REFUSAL_SYSTEM_PROMPT_VERSION,
+    SYSTEM_PROMPT,
+    SYSTEM_PROMPT_VERSION,
+    _prompt_version,
+    normalize_native_citation_markup,
+    strip_source_list_block,
+)
 from app.providers.embeddings import OllamaEmbedder, StubEmbedder
 from app.providers.llm import LLM, StubLLM
 from app.schemas import ResponseType
@@ -150,6 +158,42 @@ async def test_out_of_range_citation_is_blocked_not_rendered(pool, embedder, set
     assert "[9]" not in response.answer
 
 
+# --- Phase 8 round 4: a generator that cites in gpt-oss's own native "【N†...】" markup is
+# --- normalized and passes, driven through the real pipeline end to end. ---
+
+
+async def test_native_style_citation_is_normalized_and_answer_renders(pool, embedder, settings):
+    fake_text = "You must file Form I-765【1†L2-L5】 to request an OPT work permit."
+    fake_llm = FixedAnswerLLM(fake_text)
+    question = "What is a Form I-515A and when is it issued?"
+    response = await answer_question(
+        question, pool=pool, embedder=embedder, llm=fake_llm, settings=settings
+    )
+    assert response.response_type == ResponseType.ANSWER.value
+    assert response.refusal_reason is None
+    assert "【" not in response.answer
+    assert "】" not in response.answer
+    assert "[1]" in response.answer
+
+
+async def test_out_of_range_native_style_citation_is_still_blocked_not_rendered(
+    pool, embedder, settings
+):
+    """Normalization must never widen what verification accepts -- an out-of-range index is still
+    rejected as hallucinated whether the model spelled it "[9]" (see
+    test_out_of_range_citation_is_blocked_not_rendered above) or gpt-oss's own "【9†...】"."""
+    fake_text = "The rule is stated clearly【9†z】, which nobody retrieved for this question."
+    fake_llm = FixedAnswerLLM(fake_text)
+    question = "What is a Form I-515A and when is it issued?"
+    response = await answer_question(
+        question, pool=pool, embedder=embedder, llm=fake_llm, settings=settings
+    )
+    assert response.response_type == ResponseType.BLOCKED_UNVERIFIED.value
+    assert response.refusal_reason == "citation_index_out_of_range"
+    assert fake_text not in response.answer
+    assert "【9" not in response.answer
+
+
 # --- DoD 4: a query with no relevant source returns NO_ANSWER; the generator is never called. ---
 
 
@@ -209,6 +253,88 @@ def test_strip_source_list_block_removes_trailing_sources_section():
 def test_strip_source_list_block_leaves_a_normal_answer_untouched():
     answer = "The STEM OPT extension is 24 months [1]."
     assert strip_source_list_block(answer) == answer
+
+
+# --- Supplementary: normalize_native_citation_markup (Phase 8 round 4) ---
+
+
+def test_normalize_native_citation_markup_translates_the_dagger_form():
+    answer = "You must file Form I-765【1†L2-L5】 to request an OPT work permit."
+    normalized = normalize_native_citation_markup(answer)
+    assert "【" not in normalized
+    assert "】" not in normalized
+    assert "[1]" in normalized
+    assert "Form I-765" in normalized
+
+
+def test_normalize_native_citation_markup_translates_the_bare_form():
+    assert normalize_native_citation_markup("It is 24 months【3】.") == "It is 24 months[3]."
+
+
+def test_normalize_native_citation_markup_translates_every_occurrence():
+    answer = "First claim【1†a】. Second claim【2†b】."
+    normalized = normalize_native_citation_markup(answer)
+    assert normalized == "First claim[1]. Second claim[2]."
+
+
+def test_normalize_native_citation_markup_is_a_noop_on_plain_bracket_citations():
+    answer = "The STEM OPT extension is 24 months [1]."
+    assert normalize_native_citation_markup(answer) == answer
+
+
+def test_normalize_native_citation_markup_never_manufactures_a_citation_from_nothing():
+    """The core safety property: text with NO citation markers of any kind -- neither this
+    project's own "[N]" nor the model's native "【N†...】" -- must pass through completely
+    unchanged. Normalization only ever rewrites the SHAPE of a citation that is already there; it
+    must never be able to introduce one.
+    """
+    answer = "The STEM OPT extension is 24 months. There is no citation in this sentence at all."
+    assert normalize_native_citation_markup(answer) == answer
+
+
+# --- Supplementary: normalization + verification together (the actual fix, chained the same way
+# --- app/pipeline.py chains them) ---
+
+
+def test_a_genuinely_cited_native_style_answer_passes_verification_after_normalization():
+    answer = "You must file Form I-765【1†L2-L5】 to request an OPT work permit."
+    normalized = normalize_native_citation_markup(answer)
+    result = verify_citations(normalized, num_contexts=2, response_type="answer")
+    assert result.ok is True
+    assert result.reason is None
+
+
+def test_an_out_of_range_native_style_citation_is_still_blocked_after_normalization():
+    """Normalization must never widen what verification accepts: an out-of-range index still gets
+    rejected as hallucinated, whether it was spelled "[9]" or "【9†...】"."""
+    answer = "The rule is stated clearly【9†z】, which nobody retrieved for this question."
+    normalized = normalize_native_citation_markup(answer)
+    result = verify_citations(normalized, num_contexts=2, response_type="answer")
+    assert result.ok is False
+    assert result.reason == "citation_index_out_of_range"
+
+
+# --- Supplementary: prompt version hashes (Phase 8 round 4, app/prompts.py -- Langfuse) ---
+
+
+def test_prompt_versions_match_the_current_prompt_text():
+    assert SYSTEM_PROMPT_VERSION == _prompt_version(SYSTEM_PROMPT)
+    assert REFUSAL_SYSTEM_PROMPT_VERSION == _prompt_version(REFUSAL_SYSTEM_PROMPT)
+
+
+def test_prompt_version_changes_when_the_prompt_text_changes():
+    a = _prompt_version("You are Office Hours. Rule 1.")
+    b = _prompt_version("You are Office Hours. Rule 1 changed.")
+    assert a != b
+
+
+def test_prompt_version_is_deterministic():
+    assert _prompt_version("some prompt text") == _prompt_version("some prompt text")
+
+
+def test_the_two_system_prompts_have_different_versions():
+    # Sanity check against a copy-paste mistake making both constants point at the same text.
+    assert SYSTEM_PROMPT_VERSION != REFUSAL_SYSTEM_PROMPT_VERSION
 
 
 # --- Supplementary: programmatic citation verification (app/guardrails/citations.py) ---

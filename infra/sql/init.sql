@@ -230,3 +230,59 @@ BEGIN
             DROP COLUMN last_verified_at;
     END IF;
 END $$;
+
+-- Phase 8 round 3: semantic response cache (app/cache.py). Off by default
+-- (Settings.SEMANTIC_CACHE_ENABLED=False, see app/config.py) -- this table exists on every fresh
+-- clone whether or not the setting is on, but nothing reads from or writes to it until it is, so
+-- `docker compose up` and the CI invariant gate are unaffected either way.
+--
+-- One row per cached question embedding. `corpus_version` is app/cache.py::corpus_version's
+-- output at the moment this row was written; a corpus change (a re-index that moves
+-- `sources.last_changed_at`, or changes `documents`' row count) makes every row written under the
+-- OLD version both unreachable (app/cache.py::lookup only ever searches the CURRENT version) and,
+-- on the next write, actively deleted (app/cache.py::store) -- see that module's own docstring for
+-- why both halves matter. `response_type` is constrained to the two cacheable types (see
+-- app/schemas.py::ResponseType and app/cache.py::CACHEABLE_RESPONSE_TYPES) as a second,
+-- database-level guard against ever caching a CLARIFY/NO_ANSWER/BLOCKED_UNVERIFIED response, not
+-- just an application-level convention.
+CREATE TABLE IF NOT EXISTS query_cache (
+    id                 BIGSERIAL PRIMARY KEY,
+    embedding          VECTOR(768) NOT NULL,
+    corpus_version     TEXT NOT NULL,
+    response_type      TEXT NOT NULL CHECK (response_type IN ('answer', 'refusal_advice')),
+    response_json      JSONB NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS query_cache_corpus_version_idx ON query_cache (corpus_version);
+CREATE INDEX IF NOT EXISTS query_cache_embedding_hnsw
+    ON query_cache USING hnsw (embedding vector_cosine_ops);
+
+-- Phase 8 round 3: the daily generation budget cap (app/usage.py, read by app/pipeline.py before
+-- every call to the generator). One row per UTC calendar day, created on that day's first
+-- generation call; a day with no row at all has made zero generation calls, not an unknown count.
+-- Persisted so a service restart never resets the count mid-day -- see
+-- app/usage.py::get_generation_count_today/record_generation_call.
+CREATE TABLE IF NOT EXISTS daily_generation_counts (
+    day                DATE PRIMARY KEY,
+    generation_count   INT NOT NULL DEFAULT 0
+);
+
+-- Phase 8 round 3: persistent usage counters (app/usage.py, exposed by GET /usage in
+-- app/main.py). `usage_totals` is a single row (id is always 1, enforced by the CHECK) holding a
+-- running count of every query handled, ever. `usage_sessions` holds one row per DISTINCT
+-- anonymous session hash ever seen (see app/usage.py::hash_session_identifier for how that hash is
+-- computed and why it cannot be reversed to identify anyone) -- "distinct_sessions" is a plain
+-- count(*) over this table, never re-derived. NEITHER table stores a raw client identifier, a
+-- question, or anything else that could be personally identifying -- see ARCHITECTURE.md, "No
+-- personal identifying information is stored".
+CREATE TABLE IF NOT EXISTS usage_totals (
+    id             INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    total_queries  BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO usage_totals (id, total_queries) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS usage_sessions (
+    session_hash   TEXT PRIMARY KEY,
+    first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

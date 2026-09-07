@@ -29,10 +29,19 @@ services:
       EMBED_DIM: "${EMBED_DIM:-768}"
       LLM_PROVIDER: "${LLM_PROVIDER:-ollama}"
       LLM_MODEL: "${LLM_MODEL:-qwen3.5-8k:latest}"
+      OLLAMA_API_KEY: "${OLLAMA_API_KEY:-}"
+      OLLAMA_CLOUD: "${OLLAMA_CLOUD:-false}"
+      LLM_FALLBACK_PROVIDER: "${LLM_FALLBACK_PROVIDER:-}"
+      LLM_FALLBACK_MODEL: "${LLM_FALLBACK_MODEL:-}"
+      LLM_FALLBACK_BASE_URL: "${LLM_FALLBACK_BASE_URL:-}"
+      LLM_FALLBACK_API_KEY: "${LLM_FALLBACK_API_KEY:-}"
       LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-600.0}"
       EMBED_TIMEOUT_SECONDS: "${EMBED_TIMEOUT_SECONDS:-180.0}"
       OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-60m}"
       OLLAMA_THINK: "${OLLAMA_THINK:-false}"
+      EMBED_GGUF_PATH: "${EMBED_GGUF_PATH:-}"
+      EMBED_GGUF_N_CTX: "${EMBED_GGUF_N_CTX:-2048}"
+      EMBED_GGUF_THREADS: "${EMBED_GGUF_THREADS:-1}"
       RETRIEVAL_TOP_K: "${RETRIEVAL_TOP_K:-5}"
       RRF_K: "${RRF_K:-60}"
       HYBRID_CANDIDATE_POOL: "${HYBRID_CANDIDATE_POOL:-20}"
@@ -50,6 +59,19 @@ services:
       JUDGE_REQUESTS_PER_MINUTE: "${JUDGE_REQUESTS_PER_MINUTE:-20}"
       JUDGE_MAX_RETRIES: "${JUDGE_MAX_RETRIES:-12}"
       ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-http://localhost:3000}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      SEMANTIC_CACHE_ENABLED: "${SEMANTIC_CACHE_ENABLED:-false}"
+      SEMANTIC_CACHE_SIMILARITY_THRESHOLD: "${SEMANTIC_CACHE_SIMILARITY_THRESHOLD:-0.15}"
+      CLASSIFIER_LLM_PROVIDER: "${CLASSIFIER_LLM_PROVIDER:-}"
+      CLASSIFIER_LLM_MODEL: "${CLASSIFIER_LLM_MODEL:-}"
+      DAILY_GENERATION_CAP: "${DAILY_GENERATION_CAP:-0}"
+      SESSION_HASH_SALT: "${SESSION_HASH_SALT:-office-hours-dev-salt-change-in-production}"
+      # Langfuse (Phase 8 round 4): off by default -- absent keys mean app/langfuse_telemetry.py
+      # never constructs a client, so local dev and the CI invariant gate are unaffected either
+      # way. Set all three in .env to opt in locally against a real Langfuse project.
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -98,6 +120,11 @@ services:
       # deliberately. See .env.example's own comment on TRUSTED_PROXY_CIDRS.
       TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-}"
       ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-http://localhost:3000}"
+      # Phase 8 round 4: SAME variable name and (by default) SAME value as the orchestrator's own
+      # SESSION_HASH_SALT below -- see services/gateway/internal/middleware/session.go and
+      # services/orchestrator/app/main.py::_client_session_hash for why GET /usage's
+      # distinct_sessions needs this to make a real client hash the same way on both sides.
+      SESSION_HASH_SALT: "${SESSION_HASH_SALT:-office-hours-dev-salt-change-in-production}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-lgtm:4318"
       OTEL_SERVICE_NAME: "office-hours-gateway"
     depends_on:

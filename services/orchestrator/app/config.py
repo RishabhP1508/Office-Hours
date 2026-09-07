@@ -26,6 +26,76 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "ollama"
     LLM_MODEL: str = "qwen3.5-8k:latest"
 
+    # --- Phase 8 round 8: in-process GGUF embeddings (EMBED_PROVIDER=gguf), production's actual
+    # embedding provider (docs/adr/0013-in-process-gguf-embeddings.md). Neither Ollama Cloud nor
+    # NVIDIA serves nomic-embed-text, and the 221 stored vectors in `documents` are nomic-embed-text
+    # 768-dim, so production loads the IDENTICAL GGUF file Ollama itself uses (baked into the
+    # image, see services/orchestrator/Dockerfile) and embeds with it in-process via
+    # llama-cpp-python -- no API, no vendor, no third machine. Empty EMBED_GGUF_PATH is fine for a
+    # fresh local clone: EMBED_PROVIDER defaults to "ollama" below, so
+    # app/providers/embeddings.py::GGUFEmbedder is never constructed unless EMBED_PROVIDER=gguf is
+    # set explicitly.
+    #
+    # EMBED_GGUF_N_CTX is the ONE setting n_batch and n_ubatch are both derived from
+    # (GGUFEmbedder always constructs llama_cpp.Llama with n_batch=n_ubatch=n_ctx=this value) --
+    # see GGUFEmbedder's own docstring for why: llama.cpp's own default n_batch=512 silently splits
+    # any longer sequence into multiple batches and returns a DIFFERENT vector for it, measured
+    # directly against 25 real stored corpus vectors (5 of 25 fell below cosine 0.9999, min 0.974,
+    # every one >=583 tokens; every chunk <=485 tokens matched). Exposing n_batch/n_ubatch as
+    # separate settings would let them silently drift apart from n_ctx in some future .env edit;
+    # deriving all three from one number makes that impossible. 2048 is the measured serving
+    # config (351MB loaded / 358MB peak, 16.2ms median query embed at 1 thread) and comfortably
+    # covers this corpus's longest chunk (1946 tokens); a future re-ingest with EMBED_PROVIDER=gguf
+    # embedding long chunks would need this raised (the measured ingest config, 8192, peaks at
+    # 742MB) -- never lowered to save memory without checking it still covers every stored chunk's
+    # token count. GGUFEmbedder raises rather than silently truncating an overlong input either way.
+    EMBED_GGUF_PATH: str = ""
+    EMBED_GGUF_N_CTX: int = 2048
+    # 1 is the exact thread count the 351MB/16.2ms measurement above was taken at; Fly's
+    # shared-cpu-1x (this project's production VM size) has one shared vCPU, so more threads add
+    # scheduling overhead rather than real parallelism.
+    EMBED_GGUF_THREADS: int = 1
+
+    # Ollama Cloud auth (Phase 8 production primary). Empty by default: local Ollama needs no
+    # auth, so app/providers/llm.py::OllamaLLM sends no Authorization header at all unless this is
+    # set. Production points OLLAMA_BASE_URL at https://ollama.com and sets this to a real Ollama
+    # Cloud API key, sent as `Authorization: Bearer $OLLAMA_API_KEY` on every /api/chat call.
+    OLLAMA_API_KEY: str = ""
+
+    # Whether OLLAMA_BASE_URL is Ollama Cloud rather than a local Ollama install. False by default,
+    # which is what keeps a fresh local clone byte-for-byte unchanged: keep_alive and think are
+    # local-Ollama-only concerns (see those two settings' own comments below). This project HAS
+    # confirmed Ollama Cloud's real /api/chat behavior for both (see docs/reports/phase-8.md): a
+    # direct probe against the live cloud backend with `{"model": "gpt-oss:120b-cloud", "think":
+    # false, "keep_alive": "60m", "stream": false}` returned HTTP 200 -- both fields are ACCEPTED,
+    # neither causes an error -- but `"think": false` does NOT suppress gpt-oss's reasoning block:
+    # the response carried a populated `thinking` field (243 characters) alongside a non-empty
+    # `content` field (190 characters) regardless. So the empty-answer failure mode `OLLAMA_THINK
+    # =false` exists to prevent locally (a reasoning model spending its whole output budget inside
+    # the thinking block and returning empty content, see OLLAMA_THINK's own comment) does not occur
+    # with gpt-oss on Ollama Cloud either way. Setting this True still makes
+    # app/providers/llm.py::OllamaLLM omit both fields from the request: keep_alive is meaningless
+    # against a hosted endpoint (Ollama Cloud manages its own model lifecycle, not this process's),
+    # and think has nothing to gain by being sent -- it neither suppresses the reasoning block nor
+    # prevents any failure mode there -- so omitting both stays the simplest correct choice, now
+    # confirmed rather than assumed.
+    OLLAMA_CLOUD: bool = False
+
+    # Fallback generator (Phase 8 production only). Empty LLM_FALLBACK_PROVIDER (the default) means
+    # no fallback at all: get_llm() returns the bare primary provider, exactly as it always has, so
+    # a fresh local clone's behavior is untouched. When set, app/providers/llm.py wraps the primary
+    # and this fallback in a FallbackLLM that tries the primary first and this second, exactly once
+    # each. Production sets LLM_FALLBACK_PROVIDER="nvidia" (any value other than "ollama"/"hosted"/
+    # "stub" is treated as a generic OpenAI-compatible /v1/chat/completions endpoint -- see
+    # app/providers/llm.py::_build_provider), LLM_FALLBACK_MODEL="openai/gpt-oss-20b",
+    # LLM_FALLBACK_BASE_URL="https://integrate.api.nvidia.com/v1/chat/completions" (the FULL
+    # completions URL, not a base to append a path onto), and LLM_FALLBACK_API_KEY to a real NVIDIA
+    # API key.
+    LLM_FALLBACK_PROVIDER: str = ""
+    LLM_FALLBACK_MODEL: str = ""
+    LLM_FALLBACK_BASE_URL: str = ""
+    LLM_FALLBACK_API_KEY: str = ""
+
     # Provider timeouts (read/request timeout; a short connect timeout is fixed in the provider
     # code separately). The local Ollama generator can spend several minutes deliberating on an
     # advice-seeking question before responding, so this defaults high rather than to httpx's 5s
@@ -94,6 +164,20 @@ class Settings(BaseSettings):
     OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4318"
     OTEL_SERVICE_NAME: str = "office-hours-orchestrator"
 
+    # Logging (Phase 8). Under uvicorn, `logging.basicConfig` is never called by anything unless
+    # app/main.py does it itself: uvicorn's own default logging config
+    # (uvicorn.config.LOGGING_CONFIG) configures the "uvicorn"/"uvicorn.error"/"uvicorn.access"
+    # loggers only, and leaves the root logger untouched (level WARNING, no handler). Every
+    # `logger.info(...)` in app/* (in particular app/providers/llm.py::FallbackLLM's
+    # `llm.primary_failed`/`llm.served_by` lines, which name which provider actually served a
+    # request) propagates to that unconfigured root logger and is silently discarded -- confirmed
+    # against a running container (effective level for app.providers.llm was WARNING, root had zero
+    # handlers). app/main.py calls `logging.basicConfig(level=LOG_LEVEL, ...)` at import time,
+    # before the FastAPI app object is built, so the root logger has both a level and a handler
+    # before the first request can possibly arrive. Defaults to INFO so a fresh clone's
+    # `docker logs` shows the provider-served-by line without any extra configuration.
+    LOG_LEVEL: str = "INFO"
+
     # Ingestion / crawling
     CRAWL_DELAY_SECONDS: float = 2.0
     USER_AGENT: str = "OfficeHoursBot/0.1 (+https://github.com/office-hours)"
@@ -101,6 +185,15 @@ class Settings(BaseSettings):
     # Filesystem
     SOURCES_MANIFEST_PATH: str = "/app/data/sources/sources.yaml"
     RAW_SNAPSHOT_DIR: str = "/app/data/sources/raw"
+
+    # Golden-set impact reporting (Phase 8 round 2, app/recrawl.py). Read-only: app/recrawl.py
+    # never writes to this path, it only reads each row's `source_urls` field to report which
+    # golden rows a meaningfully-changed source might affect. Container-absolute by default, the
+    # same convention as SOURCES_MANIFEST_PATH/RAW_SNAPSHOT_DIR above -- docker-compose.yml already
+    # bind-mounts ./eval to /app/eval, so this default resolves correctly there with no extra
+    # wiring; .github/workflows/recrawl.yml overrides it to a checkout-relative path the same way
+    # it already overrides RAW_SNAPSHOT_DIR/SOURCES_MANIFEST_PATH.
+    GOLDEN_SET_PATH: str = "/app/eval/golden.jsonl"
 
     # Ingestion mode. "fetch" (default) reads SOURCES_MANIFEST_PATH and fetches each URL over
     # HTTP, as Phase 0 always has. "snapshot" skips the manifest and the network entirely: it
@@ -197,6 +290,103 @@ class Settings(BaseSettings):
     # orchestrator has to answer the browser's preflight itself until then. Comma-separated list of
     # allowed origins; the default covers the frontend's local dev server only.
     ALLOWED_ORIGINS: str = "http://localhost:3000"
+
+    # --- Phase 8 round 3: semantic cache (app/cache.py) ---
+    # Off by default: a fresh clone's `docker compose up` and the CI invariant gate are unaffected
+    # either way, since app/pipeline.py never calls app/cache.py at all unless this is True.
+    SEMANTIC_CACHE_ENABLED: bool = False
+
+    # Cosine-distance threshold below which a cached entry is served instead of re-generating.
+    # Derived from real measurements against the real nomic-embed-text embedder (the same one the
+    # query path uses), never picked -- see docs/reports/phase-8.md for the full measurement
+    # output. Two pools were measured, both over eval/golden.jsonl's 21 real questions:
+    #
+    # 1. "Same-intent" distances: 12 of the 21 golden questions, each paired with a natural
+    #    paraphrase written for this measurement (different wording, same underlying question --
+    #    e.g. "How long is the STEM OPT extension?" vs. "How many months does the STEM OPT
+    #    extension last?"). min=0.0394, max=0.1944, mean=0.1041 across the 12 pairs.
+    # 2. "Different-question" distances: every one of the 210 distinct pairs among those same 21
+    #    golden questions. The CLOSEST pair -- the real near-miss this threshold has to stay under
+    #    -- is 0.1595, between "Should I leave my current job for one at an E-Verify employer so I
+    #    can get the STEM extension?" (advice-seeking) and "Does my employer need E-Verify for the
+    #    STEM extension?" (purely informational). That is exactly the pair a false cache hit would
+    #    be most dangerous for: it would serve one question's response_type (REFUSAL_ADVICE or
+    #    ANSWER) for the other, crossing the advice/information line this project treats as a hard
+    #    safety boundary, not a quality nuance.
+    #
+    # These two pools OVERLAP (0.1944 > 0.1595): there is no single threshold that catches every
+    # measured paraphrase while missing every measured different-question pair. 0.15 is chosen to
+    # sit strictly below the measured 0.1595 near-miss, with a small margin, rather than at the
+    # edge of it -- the honest cost is that 2 of the 12 measured paraphrases (0.1944 and 0.1599)
+    # now sit ABOVE this threshold and would MISS the cache (a real repeat question, re-generated
+    # instead of served from cache). That is an accepted, asymmetric cost: a false miss only costs
+    # one extra generation call; a false hit on this specific near-miss pair would answer an
+    # advice-seeking question with a cached factual response or vice versa, which this project
+    # cannot tolerate at any rate greater than the guardrail pipeline's own. 10 of the 12 measured
+    # paraphrases (min 0.0394) still hit at this threshold.
+    SEMANTIC_CACHE_SIMILARITY_THRESHOLD: float = 0.15
+
+    # --- Phase 8 round 3: cheap-model routing for the Layer 2 advice classifier ---
+    # Empty by default (both), which is what keeps a fresh clone byte-for-byte unchanged:
+    # app/providers/llm.py::get_classifier_llm returns None when CLASSIFIER_LLM_PROVIDER is empty,
+    # and app/pipeline.py falls back to the SAME generator LLM_MODEL for Layer 2 exactly as it
+    # always has (see app/guardrails/classifier.py -- classify_advice itself is unchanged; only
+    # WHICH LLM object it is handed differs). Configured, not hardcoded: production sets
+    # CLASSIFIER_LLM_PROVIDER=ollama, CLASSIFIER_LLM_MODEL to a cloud-tagged small model (Ollama
+    # Cloud lists gpt-oss:20b and gemma4 as cloud-tagged options; either is a reasonable choice for
+    # a binary classification task).
+    #
+    # DELIBERATE, DOCUMENTED DECISION: the classifier model is NOT included in
+    # app/providers/llm.py::resolve_generator_models, and therefore never checked by
+    # assert_no_generator_judge_family_collision (the generator/judge family guard). This is
+    # intentional, not an oversight: eval/judge.py's judge calls (score_comprehensibility,
+    # classify_refusal, and every RAGAS metric) score ONLY the generator's own answer text
+    # (`answer_text` in app/pipeline.py) -- the classifier's raw output (a `{"advice": true|false}`
+    # JSON blob) is parsed into a boolean, recorded on the classify span's `advice_decided_by`
+    # attribute, and then discarded; it never becomes part of any text the judge is asked to score.
+    # A judge favoring its own family's writing style (the self-preference bias the guard exists to
+    # prevent) has no surface to act on here, because the judge never sees anything the classifier
+    # wrote. See services/orchestrator/tests/test_model_family_guard.py for the test asserting this
+    # exclusion holds (a CLASSIFIER_LLM_MODEL that WOULD collide with the judge's family must NOT
+    # raise), so a future edit that widens the guard to include it would have to consciously break
+    # that test rather than silently regress this reasoning.
+    CLASSIFIER_LLM_PROVIDER: str = ""
+    CLASSIFIER_LLM_MODEL: str = ""
+
+    # --- Phase 8 round 3: daily generation budget cap (app/usage.py, read by app/pipeline.py) ---
+    # 0 means "no cap" -- the default, which is what keeps a fresh clone and the CI invariant gate
+    # unaffected: app/usage.py::budget_exceeded returns False immediately (no database round trip)
+    # whenever this is <= 0. When set to a positive integer, app/pipeline.py refuses to call the
+    # generator once today's UTC count of successful generation calls reaches this value, and
+    # degrades instead (serves from the semantic cache if there is a hit, otherwise returns a
+    # response naming the retrieved sources without generating a summary of them -- see
+    # app/pipeline.py's module docstring for the exact shape of that response).
+    DAILY_GENERATION_CAP: int = 0
+
+    # --- Phase 8 round 3: anonymous session hashing (app/usage.py) ---
+    # HMAC-SHA256 key for app/usage.py::hash_session_identifier. This default is fine for local dev
+    # (there is nothing sensitive to protect on a machine only its own developer can reach) but
+    # MUST be overridden with a real, random secret in production, the same way every other secret
+    # in this project is: an environment variable, never a hardcoded production value, never
+    # committed. See hash_session_identifier's own docstring for exactly what having this secret
+    # does and does not protect against.
+    SESSION_HASH_SALT: str = "office-hours-dev-salt-change-in-production"
+
+    # --- Phase 8 round 4: production observability, Grafana Cloud (OTLP) + Langfuse ---
+    # OTEL_EXPORTER_OTLP_ENDPOINT/OTEL_EXPORTER_OTLP_ENDPOINT already exist above; no new setting
+    # needed for the Grafana Cloud switch itself (see app/telemetry.py's own comment, "THE URL
+    # RULE", for the one thing that changed there). OTEL_EXPORTER_OTLP_HEADERS/
+    # OTEL_EXPORTER_OTLP_PROTOCOL are read directly by the OTel SDK from the process environment
+    # (confirmed: OTLPSpanExporter/OTLPMetricExporter apply OTEL_EXPORTER_OTLP_HEADERS even when
+    # `endpoint` is passed explicitly), so neither needs a Settings field of its own either.
+    #
+    # Langfuse (app/langfuse_telemetry.py): all three empty by default, which is what keeps a fresh
+    # clone's `docker compose up` and the CI invariant gate unaffected -- app/langfuse_telemetry.py
+    # ::setup_langfuse only ever builds a real client when BOTH LANGFUSE_PUBLIC_KEY and
+    # LANGFUSE_SECRET_KEY are non-empty.
+    LANGFUSE_HOST: str = ""
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
 
 
 @lru_cache

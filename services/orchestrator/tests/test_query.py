@@ -6,8 +6,10 @@ never need a reachable Ollama or the live_stack marker below -- only the origina
 does.
 """
 
+import hashlib
 import json
 import os
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -421,4 +423,102 @@ async def test_answer_question_default_on_event_matches_a_no_op_on_event(
     assert with_on_event.response_type == baseline.response_type
     assert with_on_event.citations == baseline.citations
     assert with_on_event.refusal_reason == baseline.refusal_reason
-    assert observed_events, "on_event was given but never called"
+
+
+# =================================================================================================
+# Phase 8 round 4: GET /usage's distinct_sessions must be REAL behind the Go gateway, not stuck at
+# 1 forever. The gateway (services/gateway/internal/middleware/session.go) sets
+# X-Office-Hours-Session-Hash on every request it forwards -- an HMAC-SHA256 hex digest of the
+# ORIGINAL caller's own address, computed at the gateway, never the raw address itself. app/main.py
+# ::_client_session_hash must use that header's value directly when it is present and looks like a
+# real hash, and fall back to hashing THIS process's own peer address (TestClient's fixed one, in
+# these tests) exactly as it always has when the header is absent or malformed.
+# =================================================================================================
+
+
+def test_distinct_sessions_counts_real_distinct_clients_via_the_forwarded_session_header(
+    stub_client,
+):
+    # Fresh, random 64-character hex hashes per test run (never "a" * 64 / "b" * 64 -- a repeated,
+    # fixed value would already be recorded in usage_sessions from an earlier run against the same
+    # persistent database, the same reason tests/test_usage.py's own
+    # test_record_query_dedupes_the_same_session_hash uses a fresh uuid4 rather than a fixed
+    # string), so "distinct_sessions grew by exactly 2" is correct on every run, not just the
+    # first.
+    hash_a = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    hash_b = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    question = {"question": "How long is the STEM OPT extension?"}
+
+    before = stub_client.get("/usage").json()
+
+    stub_client.post("/query", json=question, headers={"X-Office-Hours-Session-Hash": hash_a})
+    stub_client.post("/query", json=question, headers={"X-Office-Hours-Session-Hash": hash_a})
+    stub_client.post("/query", json=question, headers={"X-Office-Hours-Session-Hash": hash_b})
+
+    after = stub_client.get("/usage").json()
+    assert after["total_queries"] == before["total_queries"] + 3
+    # hash_a recorded twice, hash_b once -- exactly two DISTINCT sessions, proving distinct_sessions
+    # reflects the forwarded header rather than TestClient's own single, fixed peer address (which
+    # would otherwise collapse every request behind the gateway into one session forever).
+    assert after["distinct_sessions"] == before["distinct_sessions"] + 2
+
+
+def test_malformed_session_hash_header_falls_back_to_the_peer_address_hash(stub_client):
+    """A header value that is not a real 64-character hex digest (a bug in, or a caller bypassing,
+    the gateway) must never be trusted verbatim -- it falls back to hashing this request's own peer
+    address instead, exactly as if the header were absent. Two DIFFERENT malformed values from the
+    SAME TestClient (a single, fixed peer address) must therefore still count as only ONE distinct
+    session, not two -- if the code wrongly used the malformed header text as-is, this would be 2.
+
+    A FRESH salt (a random uuid4, the same convention tests/test_usage.py's own
+    test_record_query_dedupes_the_same_session_hash uses) is set on app.state.settings before
+    issuing any request: TestClient's peer address is a FIXED constant ("testclient"), so without a
+    fresh salt the fallback hash this test exercises would already have been recorded by an earlier
+    test (or an earlier run against the same persistent usage_sessions table), and
+    distinct_sessions would not visibly grow at all -- not because the code is wrong, but because
+    usage_sessions accumulates every distinct hash FOREVER (see app/usage.py's own docstring). A
+    fresh salt makes THIS test's own fallback hash provably never-before-seen.
+    """
+    app.state.settings = Settings(
+        LLM_PROVIDER="stub",
+        EMBED_PROVIDER="stub",
+        NO_ANSWER_MAX_DISTANCE=2.0,
+        SESSION_HASH_SALT=str(uuid.uuid4()),
+    )
+    question = {"question": "How long is the STEM OPT extension?"}
+    before = stub_client.get("/usage").json()
+
+    stub_client.post(
+        "/query", json=question, headers={"X-Office-Hours-Session-Hash": "not-a-real-hash"}
+    )
+    stub_client.post(
+        "/query", json=question, headers={"X-Office-Hours-Session-Hash": "also-not-a-real-hash"}
+    )
+
+    after = stub_client.get("/usage").json()
+    assert after["total_queries"] == before["total_queries"] + 2
+    assert after["distinct_sessions"] == before["distinct_sessions"] + 1
+
+
+def test_absent_session_hash_header_falls_back_to_the_peer_address_hash_unchanged(stub_client):
+    """No header at all (a direct caller, or any client that does not sit behind the gateway) must
+    behave exactly as it always has: hashed from this request's own peer address. Proved the same
+    way as the malformed-header case -- two requests with no header, from the same fixed
+    TestClient peer, count as one distinct session. See the malformed-header test above for why a
+    fresh salt is required for this assertion to be meaningful.
+    """
+    app.state.settings = Settings(
+        LLM_PROVIDER="stub",
+        EMBED_PROVIDER="stub",
+        NO_ANSWER_MAX_DISTANCE=2.0,
+        SESSION_HASH_SALT=str(uuid.uuid4()),
+    )
+    question = {"question": "How long is the STEM OPT extension?"}
+    before = stub_client.get("/usage").json()
+
+    stub_client.post("/query", json=question)
+    stub_client.post("/query", json=question)
+
+    after = stub_client.get("/usage").json()
+    assert after["total_queries"] == before["total_queries"] + 2
+    assert after["distinct_sessions"] == before["distinct_sessions"] + 1

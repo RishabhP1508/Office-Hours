@@ -1,0 +1,258 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "annotations": {
+    "list": []
+  },
+  "description": "Office Hours: query volume, tokens generated per day, faithfulness trend, refusal rate. Reads from the grafana/otel-lgtm all-in-one container's bundled Prometheus-compatible datasource in dev (uid 'prometheus', auto-provisioned by that image), or Grafana Cloud's own Prometheus-compatible datasource in production (Phase 8 round 4) -- no separate Prometheus, no Elasticsearch, no ClickHouse; see ARCHITECTURE.md's observability section. Query volume and refusal rate come from office_hours_queries_total, a runtime OTel counter emitted by services/orchestrator/app/telemetry.py on every served /query and /query/stream response, labeled by response_type. Tokens generated per day is office_hours_generation_tokens_total (Phase 8 round 4), labeled by token_type (prompt|completion) -- REAL, provider-reported token counts (Ollama's own prompt_eval_count/eval_count, or an OpenAI-compatible endpoint's own usage block; see app/providers/llm.py::LLM.last_usage), never estimated. This replaces an earlier panel that showed generation-CALL volume as a cost proxy: both Grafana Cloud's and Langfuse's free tiers are genuinely free, so there was never a real dollar cost to build a proxy for, and real token counts are a more honest and more useful number than a call count once they are actually available. Faithfulness trend is DIFFERENT in kind from the other three: faithfulness is an eval-time metric (it needs the judge and RAGAS, which run only inside `python -m eval.run`, never at request time), so it cannot be a request-time counter. eval/telemetry.py::emit_run_metrics pushes it as a gauge, one data point per full eval run, to the SAME OTLP endpoint -- so this panel is a real trend across however many full runs have actually been recorded, not a live-updating series and not a fabricated one.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Every /query and /query/stream response actually served, by response_type (answer, refusal_advice, clarify, no_answer, blocked_unverified). Emitted by services/orchestrator/app/telemetry.py::record_query_metric, called from app/main.py on every successful response -- real request volume, not a sampled or estimated figure.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": ["sum"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (response_type) (increase(office_hours_queries_total[$__interval]))",
+          "legendFormat": "{{response_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Query volume, by response type",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "REAL token counts, not a dollar figure and not a proxy (Phase 8 round 4, replacing an earlier generation-call-count proxy panel): office_hours_generation_tokens_total, labeled by token_type (prompt|completion), is incremented by whatever the serving provider's own response actually reported (Ollama's prompt_eval_count/eval_count, or an OpenAI-compatible endpoint's usage block -- see app/providers/llm.py::LLM.last_usage), never estimated. Both Grafana Cloud's and Langfuse's free tiers are genuinely free, so there is no real dollar cost to build a proxy for here at all. Emitted by services/orchestrator/app/telemetry.py::record_generation_tokens_metric, called from app/pipeline.py on every successful generator call.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 1,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": ["sum"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (token_type) (increase(office_hours_generation_tokens_total[1d]))",
+          "legendFormat": "{{token_type}} tokens / day",
+          "refId": "A"
+        }
+      ],
+      "title": "Tokens generated per day (real counts, by prompt/completion)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Eval-time metric, not a request-time one: faithfulness needs the hosted judge and RAGAS, which run only inside `python -m eval.run` (never CI mode -- CI mode never computes this at all, see eval/run.py's own module docstring). eval/telemetry.py::emit_run_metrics pushes it as a gauge labeled mode=\"full\", one data point per full eval run that actually completed -- a real trend across however many runs have been recorded, not a live series and not a fabricated one. An empty graph here honestly means no full eval run has been recorded yet against this backend, not a broken panel.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "pointSize": 6,
+            "showPoints": "always"
+          },
+          "max": 1,
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "office_hours_eval_faithfulness{mode=\"full\"}",
+          "legendFormat": "faithfulness (full runs only)",
+          "refId": "A"
+        }
+      ],
+      "title": "Faithfulness trend (full eval runs)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Share of served responses that were NOT a plain answer (refusal_advice, clarify, no_answer, or blocked_unverified, over the total) -- a REPORTED runtime signal, computed from the same office_hours_queries_total counter query volume already uses. This collapses four different guardrail outcomes into one ratio the same way eval/run.py's own classify_refusal_structured does (see that function's own comment for what the collapse costs); it is not a substitute for eval/run.py's judge-scored false_refusal_rate/advice_leakage_rate, which stay the gated metrics.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "red", "value": 0.6 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(increase(office_hours_queries_total{response_type!=\"answer\"}[$__range])) / sum(increase(office_hours_queries_total[$__range]))",
+          "legendFormat": "refusal rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Refusal rate (non-answer / total)",
+      "type": "stat"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["office-hours"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "Office Hours",
+  "uid": "office-hours-overview",
+  "version": 1,
+  "weekStart": ""
+}
