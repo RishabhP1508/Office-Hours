@@ -23,8 +23,23 @@ import (
 	"office-hours/gateway/internal/proxy"
 )
 
+// Bounds for the startup Redis reachability check (see PingRedisWithRetries's own doc comment for
+// why this is retries-with-per-attempt-timeout, never a time.Sleep): 3 attempts at 2s each is "a
+// few seconds" total in the worst case, and "a couple of retries" past the first attempt.
+const (
+	redisStartupPingAttempts = 3
+	redisStartupPingTimeout  = 2 * time.Second
+)
+
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		// A startup error, not a silent fallback -- see internal/config/config.go's own comment
+		// on RedisURL for the incident this closes: an unset REDIS_URL used to resolve to
+		// "redis://localhost:6379," an address that does not exist in production, with nothing
+		// failing loudly about it.
+		log.Fatalf("config error: %v", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -48,9 +63,28 @@ func main() {
 	redisClient := redis.NewClient(redisOpts)
 	defer redisClient.Close()
 
-	// Fail open on a Redis outage: see docs/adr/0007-go-python-split.md for why availability is
-	// weighed above abuse protection for this product's actual risk profile.
-	limiter := middleware.NewRateLimiter(redisClient, cfg.RateLimitCapacity, cfg.RateLimitRefillPerSecond, true)
+	// Verify Redis is actually reachable at startup, with a bounded ping and a couple of retries
+	// (see PingRedisWithRetries's own doc comment for why this never uses time.Sleep). This does
+	// NOT block startup on failure: an unreachable Redis degrades the rate limiter to its
+	// in-process, per-instance fallback bucket (see internal/middleware/ratelimit.go) rather than
+	// taking the whole gateway down, but the outcome is always logged explicitly -- at ERROR on
+	// failure -- so a Redis outage is never silent the way it was before this fix (red-team fix,
+	// 2026-09-07, docs/adr/0016-rate-limiter-fallback-not-fail-open.md).
+	if pingErr := middleware.PingRedisWithRetries(ctx, redisClient, redisStartupPingAttempts, redisStartupPingTimeout); pingErr != nil {
+		log.Printf(
+			"ERROR: Redis unreachable at startup after %d attempt(s): %v -- the rate limiter will "+
+				"run in its in-process, per-instance fallback mode (weaker than the shared Redis "+
+				"bucket, but never \"no limiting at all\") until Redis recovers",
+			redisStartupPingAttempts, pingErr,
+		)
+	} else {
+		log.Println("Redis reachable at startup")
+	}
+
+	// No more failOpen/failClosed choice here: Allow always limits, either against the shared
+	// Redis bucket or (on a Redis error) the in-process fallback bucket of the SAME
+	// capacity/refill -- see RateLimiter's own doc comment.
+	limiter := middleware.NewRateLimiter(redisClient, cfg.RateLimitCapacity, cfg.RateLimitRefillPerSecond)
 
 	p := proxy.New(cfg.OrchestratorURL, cfg.UpstreamTimeout)
 
@@ -73,6 +107,13 @@ func main() {
 
 	router.Route("/v1", func(v1 chi.Router) {
 		v1.Use(middleware.RateLimitMiddleware(limiter, cfg.TrustedProxyCIDRs))
+		// Red-team fix (2026-09-07): rejects an oversized "question" BEFORE any of the more
+		// expensive work below (PII redaction, the proxy round trip, the orchestrator's own
+		// embedding call) ever runs -- see internal/middleware/bodylimit.go's own doc comment for
+		// the derivation MaxQuestionLength shares with the orchestrator's identical check
+		// (app/schemas.py::MAX_QUESTION_LENGTH), and infra/deploy/fly.orchestrator.toml for why
+		// this gateway-side check cannot be the ONLY one.
+		v1.Use(middleware.QuestionLengthMiddleware())
 		v1.Use(middleware.PIIMiddleware(middleware.NewRegexRedactor()))
 		// Phase 8 round 4: stamps every forwarded request with an opaque, salted hash of the
 		// caller's own address (see internal/middleware/session.go) so the orchestrator's GET

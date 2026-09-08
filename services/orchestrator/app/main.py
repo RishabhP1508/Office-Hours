@@ -11,7 +11,9 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
 from app import usage
@@ -22,7 +24,14 @@ from app.langfuse_telemetry import setup_langfuse
 from app.pipeline import answer_question
 from app.providers.embeddings import get_embedder
 from app.providers.llm import get_classifier_llm, get_llm
-from app.schemas import AnswerResponse, BrokenSource, QueryRequest, SourcesStatus, UsageCounts
+from app.schemas import (
+    MAX_QUESTION_LENGTH,
+    AnswerResponse,
+    BrokenSource,
+    QueryRequest,
+    SourcesStatus,
+    UsageCounts,
+)
 from app.telemetry import record_query_metric, setup_telemetry
 
 logger = logging.getLogger(__name__)
@@ -81,6 +90,61 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _is_question_length_violation(exc: RequestValidationError) -> bool:
+    """True if any error in `exc` is specifically the "question" field's own max_length violation
+    (app/schemas.py::QueryRequest, MAX_QUESTION_LENGTH) -- used only to pick a more specific reply
+    message below; every other validation error still gets a clean, generic one.
+    """
+    for error in exc.errors():
+        loc = error.get("loc") or ()
+        if error.get("type") == "string_too_long" and tuple(loc[-1:]) == ("question",):
+            return True
+    return False
+
+
+def _sanitized_for_logging(exc: RequestValidationError) -> list[dict]:
+    """A copy of `exc.errors()` safe to write to the server log: Pydantic's own `input` field
+    carries the raw submitted value verbatim, which for an oversized question can be tens of
+    thousands of characters -- truncated here the same way app/guardrails/classifier.py already
+    truncates an oversized value before logging it (`raw[:200]`), so a validation failure cannot
+    itself flood the log the way the failure it is reporting could.
+    """
+    sanitized = []
+    for error in exc.errors():
+        entry = dict(error)
+        raw_input = entry.get("input")
+        if isinstance(raw_input, str) and len(raw_input) > 200:
+            entry["input"] = f"<{len(raw_input)} chars, truncated: {raw_input[:200]!r}...>"
+        sanitized.append(entry)
+    return sanitized
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Red-team fix (2026-09-07): FastAPI's DEFAULT RequestValidationError handler echoes the raw
+    offending value straight back in the response body (Pydantic's own `input`/`ctx` fields) --
+    for an oversized `question`, that means echoing the entire submitted string, however large,
+    back to the caller, and its `msg` text ("String should have at most N characters") is
+    Pydantic's own internal vocabulary, not guaranteed to read clearly to a stressed, non-native
+    English speaker (CLAUDE.md's own bar for this message). This handler replaces that body with
+    one plain sentence and never repeats the submitted value -- the real detail is logged
+    server-side only (sanitized, see _sanitized_for_logging), never rendered into the response.
+    """
+    logger.warning(
+        "request validation failed for %s: %s", request.url.path, _sanitized_for_logging(exc)
+    )
+    if _is_question_length_violation(exc):
+        message = (
+            f"That question is too long. Please shorten it to {MAX_QUESTION_LENGTH} characters "
+            "or fewer and try again."
+        )
+    else:
+        message = "That request could not be read. Please check it and try again."
+    return JSONResponse(status_code=422, content={"detail": message})
 
 
 @app.get("/health")

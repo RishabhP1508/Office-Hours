@@ -17,9 +17,21 @@ primary_region = "iad"
 # written to this file) ---
 #   REDIS_URL   Upstash Redis, `rediss://default:<password>@<host>:6379` -- the `rediss://` scheme
 #               is what turns TLS on for the token-bucket rate limiter (see
-#               services/gateway/cmd/gateway/main.go and internal/config/config_test.go's TLS
+#               services/gateway/cmd/gateway/main.go and internal/config/redis_tls_test.go's TLS
 #               parsing test). A password lives in this URL, which is exactly why it is a secret
 #               and not an [env] value below.
+#
+#               RED-TEAM FIX (2026-09-07): this is now a HARD requirement, not a convenience --
+#               internal/config/config.go's Load() has NO fallback for a missing REDIS_URL
+#               anymore (it used to silently default to "redis://localhost:6379," an address with
+#               no Redis behind it in production, which is exactly how the rate limiter went
+#               completely unenforced there: 180 requests fired at production with
+#               RATE_LIMIT_BUCKET_CAPACITY=20 below got zero 429s). Leaving this secret unset now
+#               makes the gateway refuse to start (`log.Fatalf`) rather than silently serving
+#               unlimited traffic. Even with REDIS_URL set correctly, a Redis OUTAGE after startup
+#               degrades to an in-process, per-instance fallback bucket rather than either
+#               allowing everything or taking the gateway down -- see
+#               docs/adr/0016-rate-limiter-fallback-not-fail-open.md.
 #   SESSION_HASH_SALT   Phase 8 round 4: MUST be set to the EXACT SAME value as
 #               office-hours-orchestrator's own SESSION_HASH_SALT secret (fly.orchestrator.toml's
 #               own secrets list) -- see services/gateway/internal/middleware/session.go and

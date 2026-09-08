@@ -5,10 +5,10 @@ Pure: no network, no DB, no LangGraph. Given the chunks a query actually retriev
 order), the bracket indices the generated answer actually cited, and today's date, `build_freshness`
 produces a structured block (app/schemas.py::Freshness) recording, per distinct retrieved source,
 its page_last_updated/fetched_at/last_verified_at and any rule_effective_date it carries, plus one
-`FreshnessNotice` per distinct source that BOTH carries a rule_effective_date AND qualifies to be
-surfaced (see build_freshness's own docstring for the two qualifying conditions).
-`freshness_notice_text` turns those notices into the sentence(s) app/pipeline.py appends to the
-rendered answer.
+`FreshnessNotice` per distinct source that carries a rule_effective_date at all -- see
+build_freshness's own docstring, and "WHY THAT GATE WAS OVERRIDDEN" below, for why this is no
+longer additionally gated on rank or citation. `freshness_notice_text` turns those notices into the
+sentence(s) app/pipeline.py appends to the rendered answer.
 
 CRITICAL SCOPE LIMIT: the appended TEXT fires ONLY on the effective-date condition -- never on "one
 of these sources was last verified N days ago" or any other crawl-freshness signal. An
@@ -21,18 +21,41 @@ app/guardrails/citations.py's programmatic check cannot see at all (it never car
 Verification/fetch dates are exposed only in the structured `Freshness.sources` field, never in the
 answer's prose.
 
-WHY A NOTICE ALSO HAS TO BE GATED (not just "carries a dated rule"): the corpus's largest single
-source is the fixed-admission FAQ (dozens of chunks, all sharing one rule_effective_date), so it
-gets retrieved incidentally on questions that have nothing to do with it -- retrieval returning a
-chunk from that page is not the same thing as the dated rule being what the question is actually
-about. Appending the notice sentence unconditionally, on every retrieval that happens to include
-one of that page's chunks, produced answers about unrelated topics (a STEM OPT training-plan
-question, a pre-completion-OPT question) that ended with a warning about an unrelated Sept 15 2026
-rule change -- misleading, not merely noisy. Gating on "was this dated source ranked first" or
-"did the answer actually cite it" ties the notice to evidence the retrieval/generation step itself
-already produced, rather than to a tuned distance threshold: both are non-arbitrary facts about
-this specific query's retrieval and generation, not constants fitted to any particular set of
-questions.
+SUPERSEDED, 2026-09-07 red-team fix -- kept below, not deleted, because it explains a real cost the
+current (ungated) behavior reintroduces: `build_freshness` no longer gates a notice on rank or
+citation at all. EVERY distinct retrieved source that carries a `rule_effective_date` gets a
+notice now, regardless of rank or citation. The reasoning that originally justified the gate, and
+why it was overridden, both follow.
+
+WHY A NOTICE USED TO BE GATED (not just "carries a dated rule") -- ORIGINAL REASONING, NOW
+OVERRIDDEN: the corpus's largest single source is the fixed-admission FAQ (dozens of chunks, all
+sharing one rule_effective_date), so it gets retrieved incidentally on questions that have nothing
+to do with it -- retrieval returning a chunk from that page is not the same thing as the dated rule
+being what the question is actually about. Appending the notice sentence unconditionally, on every
+retrieval that happens to include one of that page's chunks, produced answers about unrelated
+topics (a STEM OPT training-plan question, a pre-completion-OPT question) that ended with a warning
+about an unrelated Sept 15 2026 rule change -- misleading, not merely noisy. Gating on "was this
+dated source ranked first" or "did the answer actually cite it" tied the notice to evidence the
+retrieval/generation step itself already produced, rather than to a tuned distance threshold: both
+are non-arbitrary facts about this specific query's retrieval and generation, not constants fitted
+to any particular set of questions.
+
+WHY THAT GATE WAS OVERRIDDEN: red-team verification on 2026-09-07 measured the gate actually firing
+in production, on the real live stack, not merely in theory. Six real phrasings of "how long do I
+have to leave the US after my program ends" were each run six times. On five of those six runs,
+three fixed-admission chunks were retrieved (ranks 3-5, listed on the answer's own source list) but
+none of them was top-ranked or cited, so `freshness.notices` came back empty and the rendered
+answer stated a bare "60 days" with no effective-date qualification at all -- eight days before the
+rule that number depends on changes. The gate built to stop one false positive (a spurious warning
+on an unrelated question) was suppressing the one signal `app/prompts.py`'s temporal rule needs on
+the question it exists for. A model cannot reliably infer "this passage is dated" from unmarked
+prose alone -- measured at roughly 1 correct run in 6 -- which is also why `app/prompts.py::
+format_context` now marks a dated passage mechanically rather than leaving the model to notice it
+unaided (see that module's own docstring). `build_freshness` emits a notice for every distinct
+retrieved source carrying a `rule_effective_date` now, unconditionally; the noise cost this
+reintroduces (a notice firing on a retrieval that only incidentally touched a dated source) is
+measured and reported, never tuned away -- see docs/adr/0015-ungate-freshness-notice.md for the
+actual before/after count over eval/golden.jsonl.
 """
 
 from __future__ import annotations
@@ -137,31 +160,31 @@ def build_freshness(
     ALWAYS, regardless of rank or citation -- this is the complete freshness bookkeeping for every
     source the query retrieved.
 
-    `FreshnessNotice` (`Freshness.notices`): a DIFFERENT, narrower set. A distinct source qualifies
-    for a notice only when it carries a `rule_effective_date` AND at least one of:
+    `FreshnessNotice` (`Freshness.notices`): a DIFFERENT set from `sources` above, but -- as of the
+    2026-09-07 red-team fix -- narrower ONLY in that it excludes sources with no
+    `rule_effective_date` at all. It is NO LONGER gated on rank or citation: EVERY distinct
+    retrieved source that carries a `rule_effective_date` gets a notice (see the module docstring's
+    "WHY THAT GATE WAS OVERRIDDEN" for why -- the previous top-ranked-or-cited gate suppressed the
+    notice on 5 of 6 real runs of the same real question, exactly when the reader needed the date
+    most).
 
-      (a) "top_ranked" -- one of its retrieved chunks sits at position 1 (1-based) in `chunks`,
-          i.e. `chunks[0]` -- the single highest-ranked chunk `hybrid_search` returned for this
-          query, or
-      (b) "cited" -- the generated answer actually cited one of its retrieved chunks: that chunk's
-          1-based position in `chunks` appears in `cited_indices` (positions line up with the
-          bracket numbering app/prompts.py::format_context gave the model, exactly the numbering
-          app/guardrails/citations.py::parse_cited_indices reads back out of the generated text).
+    `reason` records which one of three, mutually exclusive, ACCURATE facts holds for this source
+    (round 2, 2026-09-08 -- see `app/schemas.py::FreshnessNotice.reason`'s own docstring):
+      "top_ranked" -- one of its retrieved chunks sits at position 1 (1-based) in `chunks`, i.e.
+          `chunks[0]` -- the single highest-ranked chunk `hybrid_search` returned for this query.
+      "cited" -- not top-ranked, but the generated answer's bracket citations named a chunk from
+          this source (that chunk's 1-based position in `chunks` appears in `cited_indices`).
+      "retrieved" -- neither of the above: the source still gets a notice (the gate above is gone),
+          but nothing about rank or citation singles it out.
+    When a source satisfies both "top_ranked" and "cited" at once, `reason` reports "top_ranked"
+    (checked first below); this is an arbitrary tie-break for an arbitrary case, not a signal either
+    caller should read anything into.
 
-    Condition (a) exists specifically because citation alone is not enough: a real Phase 5 case
-    ("How long do I have to leave the United States after my OPT ends?") has the dated source
-    retrieved at rank 1 while the generated answer cites a DIFFERENT chunk for the (still-current)
-    60-day rule and never cites the dated one -- exactly the case where the reader most needs the
-    warning that a replacement rule exists, and a cite-only gate would drop it. Condition (b) exists
-    because top-rank alone is not enough either: a dated source can rank second or later yet still
-    be the chunk the answer is actually built from.
-
-    A dated source retrieved but qualifying for NEITHER condition is deliberately left OUT of
-    `notices` -- notices are the things worth surfacing in prose, and `sources` above already
-    records that source's own `rule_effective_date` regardless, so nothing is lost, only the
-    unwarranted prose warning is. When a source qualifies via both conditions at once, `reason` is
-    reported as `"top_ranked"` (condition (a) is checked first below); this is an arbitrary
-    tie-break for an arbitrary case, not a signal either caller should read anything into.
+    Round 1 (2026-09-07) shipped this with only two `reason` values and a documented imprecision:
+    every non-top-ranked source reported "cited" regardless of whether it actually was, because
+    `app/schemas.py::FreshnessNotice.reason` had no third value and widening that schema was ruled
+    out of that round's scope. Round 2 adds "retrieved" and restores an actual `cited_indices` check
+    here, so every value `reason` can carry is now a true statement about the source it describes.
     """
     sources: list[FreshnessSource] = []
     notices: list[FreshnessNotice] = []
@@ -192,15 +215,24 @@ def build_freshness(
         positions = positions_by_url[url]
         top_ranked = 1 in positions
         cited = any(p in cited_indices for p in positions)
-        if not (top_ranked or cited):
-            continue
+        # Red-team fix, 2026-09-07: no gate here anymore -- a notice fires for every distinct
+        # source that reaches this point (i.e., carries a rule_effective_date), regardless of rank
+        # or citation. Round 2, 2026-09-08: `reason` now reports an accurate third value,
+        # "retrieved", for a source that is genuinely neither top-ranked nor cited, rather than
+        # defaulting to "cited" for that case (see this function's own docstring).
+        if top_ranked:
+            reason = "top_ranked"
+        elif cited:
+            reason = "cited"
+        else:
+            reason = "retrieved"
 
         notices.append(
             FreshnessNotice(
                 source_url=url,
                 rule_effective_date=chunk.rule_effective_date,
                 in_effect=chunk.rule_effective_date <= today,
-                reason="top_ranked" if top_ranked else "cited",
+                reason=reason,
             )
         )
 

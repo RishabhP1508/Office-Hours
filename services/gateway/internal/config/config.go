@@ -5,6 +5,7 @@
 package config
 
 import (
+	"errors"
 	"net"
 	"os"
 	"strconv"
@@ -21,7 +22,17 @@ type Config struct {
 	// "http://orchestrator:8000" inside docker compose). Never has a trailing slash.
 	OrchestratorURL string
 
-	// RedisURL is the connection string for the token-bucket rate limiter's Redis store.
+	// RedisURL is the connection string for the token-bucket rate limiter's Redis store. NO
+	// DEFAULT (see Load, below): an unset REDIS_URL is a startup error, not a silent fallback to
+	// "redis://localhost:6379" -- that address does not exist in production (Fly, Upstash), and a
+	// silent fallback to it was the exact mechanism of a real red-team finding: 180 requests fired
+	// at production with RATE_LIMIT_BUCKET_CAPACITY=20 got zero 429s, because Redis was
+	// unreachable at that address and the OLD code's fail-open policy (see
+	// internal/middleware/ratelimit.go) let every request through with nothing surfacing the
+	// degradation. Removing the default cannot by itself fix a Redis OUTAGE after startup (that is
+	// what ratelimit.go's in-process fallback bucket is for) -- it fixes the narrower, sharper bug
+	// of a MISSING config value being indistinguishable from a real, working Redis at the
+	// well-known local address.
 	RedisURL string
 
 	// RateLimitCapacity is the token bucket's maximum size (burst allowance), per client IP.
@@ -82,7 +93,6 @@ type Config struct {
 const (
 	defaultListenAddr            = ":8080"
 	defaultOrchestratorURL       = "http://localhost:8000"
-	defaultRedisURL              = "redis://localhost:6379"
 	defaultRateLimitCapacity     = 20
 	defaultRateLimitRefillPerSec = 1.0
 	defaultUpstreamTimeout       = 15 * time.Second
@@ -94,13 +104,32 @@ const (
 	defaultSessionHashSalt = "office-hours-dev-salt-change-in-production"
 )
 
+// ErrRedisURLRequired is returned by Load when REDIS_URL is unset or empty. Exported so a caller
+// (or a test) can match on it specifically, rather than string-matching the message.
+var ErrRedisURLRequired = errors.New(
+	"REDIS_URL is required and must be set explicitly -- there is no default. An unset value used " +
+		"to fall back to \"redis://localhost:6379\", an address that does not exist in production " +
+		"(Fly, Upstash) -- see RedisURL's own doc comment for the real incident that fallback " +
+		"caused: 180 requests against production, zero 429s, because Redis was silently unreachable " +
+		"and the rate limiter's old fail-open policy let everything through with no signal that it " +
+		"was happening. Set REDIS_URL (docker-compose.yml already does, for local dev; production " +
+		"sets it as a Fly secret, see infra/deploy/fly.gateway.toml)",
+)
+
 // Load reads Config from the process environment, applying the defaults above wherever a variable
-// is unset, empty, or fails to parse.
-func Load() Config {
+// is unset, empty, or fails to parse -- EXCEPT RedisURL, which has no default at all (see its own
+// doc comment and ErrRedisURLRequired above): an unset REDIS_URL is a startup error, returned here,
+// never a silent fallback.
+func Load() (Config, error) {
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		return Config{}, ErrRedisURLRequired
+	}
+
 	return Config{
 		ListenAddr:               envOr("GATEWAY_LISTEN_ADDR", defaultListenAddr),
 		OrchestratorURL:          strings.TrimRight(envOr("ORCHESTRATOR_URL", defaultOrchestratorURL), "/"),
-		RedisURL:                 envOr("REDIS_URL", defaultRedisURL),
+		RedisURL:                 redisURL,
 		RateLimitCapacity:        envPositiveIntOr("RATE_LIMIT_BUCKET_CAPACITY", defaultRateLimitCapacity),
 		RateLimitRefillPerSecond: envPositiveFloatOr("RATE_LIMIT_REFILL_PER_SECOND", defaultRateLimitRefillPerSec),
 		UpstreamTimeout:          envTimeoutSecondsOr("UPSTREAM_TIMEOUT_SECONDS", defaultUpstreamTimeout),
@@ -109,7 +138,7 @@ func Load() Config {
 		TrustedProxyCIDRs:        parseTrustedProxyCIDRs(envOr("TRUSTED_PROXY_CIDRS", "")),
 		OTLPEndpoint:             envOr("OTEL_EXPORTER_OTLP_ENDPOINT", defaultOTLPEndpoint),
 		ServiceName:              envOr("OTEL_SERVICE_NAME", defaultServiceName),
-	}
+	}, nil
 }
 
 // parseTrustedProxyCIDRs parses a comma-separated list of CIDRs (e.g. "10.0.0.0/8,172.16.0.0/12").

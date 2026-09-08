@@ -41,8 +41,40 @@ class ResponseType(StrEnum):
     BLOCKED_UNVERIFIED = "blocked_unverified"
 
 
+# Red-team fix (2026-09-07): a question with no maximum length reached the embedder with 60,000
+# characters and failed with a 502 that leaked the embedding provider's internal config variable
+# name ("Input is 30007 tokens, over the 2048-token GGUF context budget (EMBED_GGUF_N_CTX)...").
+# MAX_QUESTION_LENGTH closes that off at the door, derived from EMBED_GGUF_N_CTX rather than picked:
+#
+# - EMBED_GGUF_N_CTX=2048 (app/config.py's Settings.EMBED_GGUF_N_CTX) is production's real
+#   embedding context budget. The query is embedded ALONE -- app/pipeline.py calls the embedder on
+#   just the question text, with no retrieved chunks or system prompt sharing the same context
+#   window the way the generator's prompt does -- so the FULL 2048-token budget is available to a
+#   single question, not a shared fraction of it.
+# - A character limit needs a chars-per-token assumption, and the safe direction is the FEWEST
+#   characters a real tokenizer could pack into one token (more tokens per character than the
+#   ~4 chars/token typical of English prose). This was measured, not guessed: the exact failure
+#   this limit exists to close is itself a real measurement -- 60,000 characters produced 30,007
+#   tokens, i.e. 60000 / 30007 = 1.9998 characters per token. Rounding DOWN to 2.0 chars/token
+#   (assuming every character could be at least this token-dense) is the conservative assumption a
+#   length limit needs to hold even for input denser than anything measured so far.
+# - The target budget is 2000 of the 2048 tokens, not the full amount -- a small, deliberate
+#   reserve for whatever the tokenizer adds beyond the raw text itself (BOS/EOS or other special
+#   tokens), so this limit does not sit exactly on the edge of the failure it exists to prevent.
+# - 2000 tokens * 2.0 chars/token (worst case) = 4000 characters.
+#
+# Real questions sit far below this: every question in eval/golden.jsonl is under 200 characters
+# (max 122, mean 63 across 21 rows). 4000 is deliberately generous relative to that -- it bounds the
+# WORST case a hostile or accidental input could produce, not the typical one. Enforced here AND
+# independently at the gateway (services/gateway/internal/middleware/bodylimit.go's
+# MaxQuestionLength, which MUST be kept equal to this value -- see that constant's own comment for
+# why): the orchestrator is reachable directly today, bypassing the gateway entirely (see
+# infra/deploy/fly.orchestrator.toml), so neither check alone is sufficient.
+MAX_QUESTION_LENGTH = 4000
+
+
 class QueryRequest(BaseModel):
-    question: str = Field(min_length=1)
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_LENGTH)
 
 
 class Citation(BaseModel):
@@ -83,20 +115,31 @@ class FreshnessSource(BaseModel):
 
 class FreshnessNotice(BaseModel):
     """A distinct retrieved source states a dated rule -- for example the DHS fixed-period-of-
-    admission final rule, effective 2026-09-15 -- AND qualifies to be surfaced in the rendered
-    answer (see app/guardrails/freshness.py::build_freshness for the two qualifying conditions).
+    admission final rule, effective 2026-09-15. Red-team fix (2026-09-07): every distinct retrieved
+    source carrying a `rule_effective_date` gets a notice now, regardless of rank or citation (see
+    app/guardrails/freshness.py::build_freshness's module docstring, "WHY THAT GATE WAS
+    OVERRIDDEN") -- `reason` is no longer a qualifying condition, only a descriptive fact about how
+    this source related to this particular retrieval and generation.
+
     `in_effect` is `rule_effective_date <= as_of`, computed once in build_freshness so every
-    consumer (the API response, the appended answer text) agrees on the same verdict. `reason`
-    records which condition qualified this notice: `"top_ranked"` (this source's chunk was the
-    single highest-ranked retrieved chunk) or `"cited"` (the generated answer's bracket citations
-    referenced a chunk from this source). A source can satisfy both; build_freshness reports
-    `"top_ranked"` in that case (see its docstring).
+    consumer (the API response, the appended answer text) agrees on the same verdict. `reason` is
+    exactly one of:
+      `"top_ranked"` -- this source's chunk was the single highest-ranked retrieved chunk.
+      `"cited"` -- the generated answer's bracket citations referenced a chunk from this source
+          (and it was not top-ranked).
+      `"retrieved"` -- the source was retrieved but neither top-ranked nor cited: it still gets a
+          notice (see build_freshness), but neither of the other two facts about it is true.
+    A source can satisfy both `"top_ranked"` and `"cited"` at once; build_freshness reports
+    `"top_ranked"` in that case (see its docstring). Round 2 (2026-09-08): `"retrieved"` replaces
+    what used to be a documented KNOWN IMPRECISION where a genuinely neither-top-ranked-nor-cited
+    source silently reported `"cited"` -- every value this field can carry is now an accurate
+    statement about the source it describes.
     """
 
     source_url: str
     rule_effective_date: date
     in_effect: bool
-    reason: Literal["top_ranked", "cited"]
+    reason: Literal["top_ranked", "cited", "retrieved"]
 
 
 class Freshness(BaseModel):

@@ -124,22 +124,50 @@ function NoAnswer({ question, response }: { question: string; response: AnswerRe
   );
 }
 
+// Copy for each known `refusal_reason` a BLOCKED_UNVERIFIED response can carry (see
+// app/pipeline.py::_blocked_message_for_reason, the backend's own by-reason selection). The
+// citation-check copy stays the default for any reason not listed here, including
+// "citation_index_out_of_range" and "answer_missing_citation" -- it was the only copy this
+// component had before the authority guard existed, and it is still correct for both of those.
+const _DEFAULT_BLOCKED_COPY = {
+  heading: "This answer didn't pass our citation check",
+  body: (
+    <>
+      Every claim this tool shows has to trace back to a source it actually retrieved, and this
+      one didn’t clear that bar, so it’s withheld rather than shown. Try rephrasing the question.
+    </>
+  ),
+};
+
+const _BLOCKED_COPY_BY_REASON: Record<string, { heading: string; body: React.ReactNode }> = {
+  answer_claims_official_authority: {
+    heading: "This answer claimed to be official, so we blocked it",
+    body: (
+      <>
+        This tool is not USCIS, DHS, ICE, or SEVP, and it is not authorized to speak for them or
+        to give legal advice. The answer we generated crossed that line, so we are withholding it
+        instead of showing it. Try rephrasing the question.
+      </>
+    ),
+  },
+};
+
 function BlockedUnverified({ question, response }: { question: string; response: AnswerResponse }) {
   // Deliberately plain text, never CitedProse: the fixed safe message never carries a bracket, so
   // running it through the citation parser would only risk treating stray punctuation as one.
   // withNonBreakingHyphens is still safe and applied: it only ever substitutes a character inside
   // an already-matched form-number/status-code token, so it can never introduce or remove a
   // bracket the citation parser would have to see.
+  const copy =
+    (response.refusal_reason && _BLOCKED_COPY_BY_REASON[response.refusal_reason]) ||
+    _DEFAULT_BLOCKED_COPY;
   return (
     <div>
       <YouEcho question={question} />
       <p className="font-serif text-lg leading-[1.85] text-body">
         {withNonBreakingHyphens(response.answer)}
       </p>
-      <Handoff heading="This answer didn't pass our citation check">
-        Every claim this tool shows has to trace back to a source it actually retrieved, and this
-        one didn’t clear that bar, so it’s withheld rather than shown. Try rephrasing the question.
-      </Handoff>
+      <Handoff heading={copy.heading}>{copy.body}</Handoff>
       <Stamp response={response} />
     </div>
   );
