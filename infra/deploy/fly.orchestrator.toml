@@ -21,6 +21,52 @@
 # `app` below is a placeholder -- Fly app names are globally unique across all Fly accounts, so
 # whoever deploys this picks their own (e.g. `fly apps create office-hours-orchestrator-<handle>`)
 # and edits this line to match before the first deploy.
+#
+# RED-TEAM FIX (2026-09-07), DEFECT C -- "this app is publicly reachable, bypassing the gateway
+# entirely": https://oh-orchestrator-rp.fly.dev/query answers unauthenticated today, and so does
+# /usage -- calling this hostname directly skips every protection the gateway enforces (the Redis
+# rate limiter and its fallback, the question-length cap, PII redaction), simply because it is a
+# second, un-gated path to the same service. Phase 7's own report already flagged exactly this
+# ("in a real deployment only the gateway should be exposed").
+#
+# THE FIX BELOW: remove [http_service] -- the block that tells Fly's public Fly Proxy edge to
+# route THIS app's allocated public IP to these machines -- and rely entirely on Fly's private 6PN
+# networking instead, exactly what fly.gateway.toml's own ORCHESTRATOR_URL already uses
+# ("http://oh-orchestrator-rp.internal:8000"). 6PN/`*.internal` DNS and machine-to-machine
+# reachability inside one Fly organization do not depend on [http_service] being present, or on
+# whether the app has a public IP allocated at all -- it is Fly's own private WireGuard mesh,
+# always on between every app in the same org. Removing [http_service] removes the PUBLIC route
+# only; the gateway's own private call keeps working unchanged.
+#
+# "Keep the health check working" (the one hard requirement on this change) is handled by the
+# [checks] table further down, which replaces the old [[http_service.checks]] block one for one:
+# same path, method, interval, timeout, and grace period -- what is checked does not change, only
+# where the check is declared, since there is no more [http_service] to hang it off of.
+#
+# STILL REQUIRED, NOT DONE BY THIS FILE, AND NOT SOMETHING THIS SESSION RAN (this session does not
+# run `fly` or any deploy command -- CLAUDE.md):
+#   1. `fly deploy services/orchestrator --config infra/deploy/fly.orchestrator.toml` -- this
+#      change has NO EFFECT until it is redeployed.
+#   2. `fly ips list -a oh-orchestrator-rp` after the redeploy -- confirm whether this app still
+#      shows an allocated public IPv4/IPv6 (one allocated before [http_service] existed can persist
+#      across a config change that stops referencing it). If it does, release it:
+#      `fly ips release <ip> -a oh-orchestrator-rp` for each one listed. An allocated-but-unrouted
+#      IP should already refuse connections once [http_service] is gone, but an explicit release is
+#      the only way to be certain nothing still answers on it.
+#   3. Confirm `curl https://oh-orchestrator-rp.fly.dev/health` and
+#      `curl -X POST https://oh-orchestrator-rp.fly.dev/query -d '{"question":"test"}'` both fail
+#      (refuse/timeout, not a response) while the gateway's own proxied path
+#      (`https://<gateway-app>.fly.dev/v1/query`) still works end to end.
+#   4. `fly checks list -a oh-orchestrator-rp` -- confirm the health check below is actually
+#      registered and passing.
+#
+# UNVERIFIED, FLAG FOR THE USER: the [checks] table's syntax below is written from documentation
+# memory, not confirmed against a live Fly deploy in this session (this session is not permitted to
+# run `fly` commands at all, so there was no way to verify it here). Check it against Fly's current
+# configuration reference before relying on it, and do not trust this file's syntax as correct
+# until `fly checks list` (step 4 above) confirms it after a real deploy -- a change like this is
+# not "verified" on the strength of this file reading sensibly; it is verified when the environment
+# it targets confirms it.
 app = "oh-orchestrator-rp"
 primary_region = "iad"
 
@@ -138,27 +184,25 @@ primary_region = "iad"
   LANGFUSE_HOST = "https://us.cloud.langfuse.com"
   LANGFUSE_PUBLIC_KEY = "pk-lf-4b386122-b6c3-415e-b085-a7d4f7e75001"
 
-[http_service]
-  internal_port = 8000
-  force_https = true
-  auto_stop_machines = "off"
-  auto_start_machines = true
-  # 1: this shared-cpu-1x/1024MB machine stays running always, at Fly's iad on-demand pricing of
-  # $5.70/mo for 1GB (256MB is $1.94/mo, 512MB is $3.19/mo -- see the [[vm]] memory comment below
-  # for why this moved from 512MB to 1024MB), rather than scaling to zero. The alternative
-  # (min_machines_running = 0) is cheaper only when the machine is actually idle enough to hit
-  # zero, but it trades that for a cold start on the first request after any idle period (image
-  # pull if not cached, Python process start, DB pool open) -- and the whole point of paying for
-  # Fly instead of a free scale-to-zero host was to not have that cold start. Chosen deliberately
-  # over scale-to-zero for that reason, not left at the default.
-  min_machines_running = 1
-
-  [[http_service.checks]]
-    grace_period = "60s"
-    interval = "15s"
-    method = "GET"
-    timeout = "5s"
+# [http_service] REMOVED (see the top-of-file comment on `app`/`primary_region` for the full
+# reasoning): this app no longer accepts public HTTP traffic, so there is no public Fly Proxy
+# service left to configure. auto_stop_machines/auto_start_machines/min_machines_running do not
+# carry over to anything below -- both were about the Fly Proxy deciding to stop or (re-)start a
+# machine based on PUBLIC traffic volume, which no longer applies once that public route is gone.
+# Without [http_service], a deployed machine simply keeps running once `fly deploy` starts it
+# (equivalent, in effect, to the old auto_stop_machines="off"/min_machines_running=1 -- always on,
+# nothing to scale to zero), which is exactly the "no cold start" property this app already chose
+# deliberately over scale-to-zero before this change, for the same reason: the gateway's own 6PN
+# call should never pay a cold-start penalty either.
+[checks]
+  [checks.health]
+    port = 8000
+    type = "http"
+    method = "get"
     path = "/health"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "60s"
 
 [[vm]]
   # shared-cpu-1x with 1024MB (Phase 8 round 8: raised from 512MB). The orchestrator holds an

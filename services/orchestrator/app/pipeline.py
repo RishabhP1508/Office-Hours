@@ -21,22 +21,33 @@ Concretely, in order:
    distance -- RRF-top-1 is a fused-rank quantity, not a semantic-closeness one, and can be noisier
    than the single closest chunk actually retrieved (see Settings.NO_ANSWER_MAX_DISTANCE's comment).
 5. Generate: SYSTEM_PROMPT for information, REFUSAL_SYSTEM_PROMPT for advice (app/prompts.py) --
-   both generate from the same retrieved context, with bracket citations.
+   both generate from the same retrieved context, with bracket citations. Red-team fix (2026-09-07):
+   the per-chunk dict handed to build_user_prompt now also carries `rule_effective_date`, and
+   `today` (computed once, below, and reused at step 8 for build_freshness) is passed through so
+   app/prompts.py::format_context can annotate any passage that carries one with a mechanically
+   generated "takes effect on <date>" / "took effect on <date>" note -- see that module's docstring
+   for why the model could not reliably do this from prose alone.
 6. Normalize the model's own native citation markup ("【N†...】") to this project's "[N]" bracket
    convention (app/prompts.py::normalize_native_citation_markup, Phase 8 round 4), then strip a
    trailing source-list block if the model appended one despite being told not to
    (app/prompts.py::strip_source_list_block) -- BOTH BEFORE verification, not after (see the
    comment at the call site for why the order matters).
-7. Verify citations (app/guardrails/citations.py): block the generated text and return
-   BLOCKED_UNVERIFIED if a cited index falls outside the retrieved range, or if an ANSWER carries no
-   citation at all. Then, only if verification passed, append the DSO/attorney redirect sentence to
-   an advice response if the model did not already include one.
+7. Verify citations (app/guardrails/citations.py), then verify no authority claim
+   (app/guardrails/authority.py): block the generated text and return BLOCKED_UNVERIFIED if a cited
+   index falls outside the retrieved range, if an ANSWER carries no citation at all, or if the
+   answer claims (or implies) that it is official, authoritative, government guidance, or legal
+   advice. Both checks run against the SAME `answer_text`, post-normalization and post-strip; on a
+   citation failure the existing citation-check message renders, on an authority-only failure an
+   honest authority-check message renders instead (see `_blocked_message_for_reason`). Then, only if
+   both checks passed, append the DSO/attorney redirect sentence to an advice response if the model
+   did not already include one.
 8. Freshness (app/guardrails/freshness.py): build the structured freshness block from the same
    retrieved chunks and, for ANSWER and REFUSAL_ADVICE only, append the effective-date notice
-   sentence to the answer text -- but only for a dated source that is either the top-ranked
-   retrieved chunk or actually cited in the generated text (see build_freshness's own docstring for
-   why both conditions are needed); a dated source retrieved incidentally, neither top-ranked nor
-   cited, stays visible in the structured `Freshness.sources` field but appends no text. CLARIFY,
+   sentence to the answer text for EVERY distinct retrieved source that carries a
+   rule_effective_date, regardless of rank or citation. Red-team fix (2026-09-07): this used to be
+   gated on a dated source being either the top-ranked retrieved chunk or actually cited in the
+   generated text; the gate is gone (see build_freshness's own docstring, "WHY THAT GATE WAS
+   OVERRIDDEN", for the red-team evidence and the noise cost this reintroduces). CLARIFY,
    NO_ANSWER, and BLOCKED_UNVERIFIED responses carry freshness=None and no appended text -- none of
    those three renders a generated answer at all.
 
@@ -94,6 +105,7 @@ from psycopg_pool import AsyncConnectionPool
 from app import cache, usage
 from app.config import Settings
 from app.db import RetrievedChunk, hybrid_search
+from app.guardrails.authority import verify_no_authority_claim
 from app.guardrails.citations import parse_cited_indices, verify_citations
 from app.guardrails.clarifier import CLARIFY_QUESTION, is_too_vague
 from app.guardrails.classifier import classify_advice
@@ -125,6 +137,16 @@ _NO_ANSWER_MESSAGE = (
 _BLOCKED_MESSAGE = (
     "I generated an answer to this, but it did not pass this tool's citation check, so I'm not "
     "showing it. Please try rephrasing the question."
+)
+
+# app/guardrails/authority.py's failure case: the generated answer claimed to be official,
+# authoritative, government guidance, or legal advice. _BLOCKED_MESSAGE above would be false here --
+# nothing about the citations was wrong -- so this is a second, honest message rather than a reused
+# one; see _blocked_message_for_reason below for how a response picks between the two.
+_AUTHORITY_BLOCKED_MESSAGE = (
+    "I generated an answer to this, but it claimed to be official, authoritative, or government "
+    "guidance, which this tool is not and cannot claim to be, so I'm not showing it. Please try "
+    "rephrasing the question."
 )
 
 # Phase 8 round 3: the daily generation budget cap's degraded response (Settings.DAILY_GENERATION_
@@ -159,6 +181,19 @@ _REDIRECT_RE = re.compile(
 
 def _has_redirect(text: str) -> bool:
     return bool(_REDIRECT_RE.search(text))
+
+
+def _blocked_message_for_reason(reason: str | None) -> str:
+    """Which safe message renders for a BLOCKED_UNVERIFIED response -- selected by `reason`, not by
+    which check happened to run last, so this stays correct even if step 7's checks are ever
+    reordered. "answer_claims_official_authority" (app/guardrails/authority.py) gets the honest
+    authority message; every other reason (both of verify_citations's own reasons, and anything
+    else that might reuse this response type in the future) keeps the existing citation-check
+    wording.
+    """
+    if reason == "answer_claims_official_authority":
+        return _AUTHORITY_BLOCKED_MESSAGE
+    return _BLOCKED_MESSAGE
 
 
 def _citation_url(chunk: RetrievedChunk) -> str:
@@ -351,14 +386,21 @@ async def answer_question(
                 refusal_reason=reason,
             )
 
+    # Computed once and reused at step 8 (build_freshness) below, rather than calling the clock
+    # twice for what is conceptually one "as of" moment for this request.
+    today = datetime.now(UTC).date()
+
     context = [
         {
             "content": chunk.content,
             "citation_url": _citation_url(chunk),
+            # Red-team fix: carried through so app/prompts.py::format_context can annotate any
+            # passage whose chunk carries one -- see this module's docstring, step 5.
+            "rule_effective_date": chunk.rule_effective_date,
         }
         for chunk in chunks
     ]
-    user_prompt = build_user_prompt(question, context)
+    user_prompt = build_user_prompt(question, context, today=today)
 
     # citations/contexts depend only on `chunks`, never on the generated answer text, so they are
     # built here -- before step 4.5's budget check and step 5's generate -- rather than after
@@ -477,23 +519,44 @@ async def answer_question(
     answer_text = normalize_native_citation_markup(answer_text)
     answer_text = strip_source_list_block(answer_text)
 
-    # --- Step 7: verify citations. Blocks rendering the generated text on failure. ---
+    # --- Step 7: verify citations, then verify no authority claim. Both run against the SAME
+    # --- answer_text and both feed the one "verify" stage event; blocks rendering the generated
+    # --- text if either fails. Citation failure takes precedence over an authority failure when
+    # --- picking which reason/message renders if, somehow, both would fail on the same answer --
+    # --- see tests/test_guardrails.py's Test A/B for why that fixture is deliberately built so
+    # --- verify_citations passes and the authority guard is the only thing that can block it. ---
     await _emit({"event": "stage", "stage": "verify", "status": "start"})
     verification = verify_citations(
         answer_text, num_contexts=len(chunks), response_type=candidate_response_type.value
     )
-    await _emit({"event": "stage", "stage": "verify", "status": "done", "ok": verification.ok})
+    authority_verification = verify_no_authority_claim(answer_text)
+    verify_ok = verification.ok and authority_verification.ok
+    await _emit({"event": "stage", "stage": "verify", "status": "done", "ok": verify_ok})
 
-    if not verification.ok:
+    if not verify_ok:
+        failed = verification if not verification.ok else authority_verification
         trace.get_current_span().set_attribute(
             "response_type", ResponseType.BLOCKED_UNVERIFIED.value
         )
+        if failed is authority_verification:
+            # Deliberately NEVER export the matched sentence (there used to be an
+            # "authority_claim_sentence" attribute here carrying it): this runs on exactly the path
+            # where the user's own question may have manipulated the model into writing it, this
+            # project stores no record of who asked what, and the gateway's PII redaction only
+            # covers emails/phone/SSN/A-numbers, not free text. `authority_verification.detail` is
+            # a fixed label from app.guardrails.authority.AUTHORITY_PREDICATE_LABELS (e.g.
+            # "official_guidance"), never the sentence itself -- see that module's PRIVACY comment.
+            # Span attributes cannot be None; detail is always set alongside ok=False.
+            trace.get_current_span().set_attribute("authority_claim_blocked", True)
+            trace.get_current_span().set_attribute(
+                "authority_claim_predicate", authority_verification.detail or "unknown"
+            )
         return AnswerResponse(
-            answer=_BLOCKED_MESSAGE,
+            answer=_blocked_message_for_reason(failed.reason),
             citations=citations,
             contexts=contexts,
             response_type=ResponseType.BLOCKED_UNVERIFIED.value,
-            refusal_reason=verification.reason,
+            refusal_reason=failed.reason,
             generated_at=datetime.now(UTC),
         )
 
@@ -517,9 +580,7 @@ async def answer_question(
     # or after the DSO redirect makes no difference, since that sentence never carries a bracket.
     # Reused from app/guardrails/citations.py rather than re-implemented here, per that module's
     # own docstring ("the same convention eval/run.py's own parse_cited_indices uses").
-    freshness = build_freshness(
-        chunks, today=datetime.now(UTC).date(), cited_indices=parse_cited_indices(answer_text)
-    )
+    freshness = build_freshness(chunks, today=today, cited_indices=parse_cited_indices(answer_text))
     notice_text = freshness_notice_text(freshness.notices)
     if notice_text:
         answer_text = f"{answer_text}\n\n{notice_text}"

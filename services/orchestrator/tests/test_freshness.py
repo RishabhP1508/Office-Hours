@@ -1586,16 +1586,101 @@ def test_build_freshness_cited_but_not_top_ranked_dated_source_produces_a_notice
     assert "September 15, 2026" in text
 
 
-def test_build_freshness_dated_source_neither_top_ranked_nor_cited_produces_no_notice():
-    """The exact spurious case the Phase 5 defect report describes: a dated source is retrieved
-    (position 2, not top-ranked) but the generated answer never cited it. No notice, no appended
-    text -- but its `rule_effective_date` is still visible in `Freshness.sources`, so nothing about
-    that source's own freshness bookkeeping is lost, only the unwarranted prose warning is.
+def test_build_freshness_dated_source_at_rank_five_uncited_still_produces_a_notice():
+    """Red-team fix, 2026-09-07 (was: "...produces_no_notice"; see the module docstring's "WHY
+    THAT GATE WAS OVERRIDDEN"): a dated source retrieved at rank 5, never cited by the generated
+    answer, must still produce a notice. This is exactly the shape of the live defect: three
+    fixed-admission chunks retrieved at ranks 3-5, none top-ranked, none cited, and the notice used
+    to come back empty on 5 of 6 real production runs of the same question.
     """
     dated_url = "https://studyinthestates.dhs.gov/quick-facts"
     chunks = [
-        _make_chunk(source_url="https://example.gov/unrelated", rule_effective_date=None),
-        _make_chunk(source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(id=1, source_url="https://example.gov/unrelated-1", rule_effective_date=None),
+        _make_chunk(id=2, source_url="https://example.gov/unrelated-2", rule_effective_date=None),
+        _make_chunk(id=3, source_url="https://example.gov/unrelated-3", rule_effective_date=None),
+        _make_chunk(id=4, source_url="https://example.gov/unrelated-4", rule_effective_date=None),
+        _make_chunk(id=5, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+    ]
+
+    freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices=set())
+
+    assert len(freshness.notices) == 1
+    notice = freshness.notices[0]
+    assert notice.source_url == dated_url
+    assert notice.rule_effective_date == date(2026, 9, 15)
+    assert notice.in_effect is False
+    # Round 2 (2026-09-08): a genuinely neither-top-ranked-nor-cited source reports "retrieved",
+    # not "cited" -- see the regression test right below this one for the exact false-positive
+    # case this replaces.
+    assert notice.reason == "retrieved"
+
+    text = freshness_notice_text(freshness.notices)
+    assert text is not None
+    assert "September 15, 2026" in text
+    assert dated_url in text
+
+    dated_source = next(s for s in freshness.sources if s.source_url == dated_url)
+    assert dated_source.rule_effective_date == date(2026, 9, 15)
+
+
+def test_build_freshness_reason_is_not_falsely_cited_when_other_chunks_are_cited():
+    """Round 2 regression guard: the exact false statement independent verification caught in
+    round 1 -- a dated source at rank 5, with `cited_indices={1, 2}` (two OTHER chunks cited, never
+    this one), used to report `reason="cited"` even though this source itself was never cited. That
+    was a false statement in structured API output. It must now report "retrieved".
+    """
+    dated_url = "https://example.gov/rank-five-dated"
+    chunks = [
+        _make_chunk(id=1, source_url="https://example.gov/unrelated-1", rule_effective_date=None),
+        _make_chunk(id=2, source_url="https://example.gov/unrelated-2", rule_effective_date=None),
+        _make_chunk(id=3, source_url="https://example.gov/unrelated-3", rule_effective_date=None),
+        _make_chunk(id=4, source_url="https://example.gov/unrelated-4", rule_effective_date=None),
+        _make_chunk(id=5, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+    ]
+
+    freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={1, 2})
+
+    assert len(freshness.notices) == 1
+    assert freshness.notices[0].reason == "retrieved"
+
+
+def test_build_freshness_reason_covers_all_three_values_for_the_three_retrieval_shapes():
+    """Round 2 (2026-09-08): `FreshnessNotice.reason` has three values now, each an accurate
+    statement about the source it describes (see app/schemas.py::FreshnessNotice.reason's own
+    docstring). One retrieval, three distinct dated sources, one per shape: top-ranked-and-uncited,
+    non-top-ranked-but-cited, and neither top-ranked nor cited.
+    """
+    top_ranked_url = "https://example.gov/top-ranked-dated"
+    cited_url = "https://example.gov/cited-dated"
+    retrieved_only_url = "https://example.gov/retrieved-only-dated"
+    chunks = [
+        _make_chunk(id=1, source_url=top_ranked_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(id=2, source_url=cited_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(id=3, source_url="https://example.gov/unrelated", rule_effective_date=None),
+        _make_chunk(id=4, source_url=retrieved_only_url, rule_effective_date=date(2026, 9, 15)),
+    ]
+
+    # cited_indices={2}: position 2 (cited_url) is cited; position 1 (top_ranked_url) is not cited
+    # but IS top-ranked; position 4 (retrieved_only_url) is neither.
+    freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={2})
+
+    assert len(freshness.notices) == 3
+    by_url = {n.source_url: n for n in freshness.notices}
+    assert by_url[top_ranked_url].reason == "top_ranked"
+    assert by_url[cited_url].reason == "cited"
+    assert by_url[retrieved_only_url].reason == "retrieved"
+
+
+def test_build_freshness_without_any_dated_source_produces_no_notice():
+    """The negative case the red-team fix must not break: a retrieval with no dated source among
+    its chunks at all must still produce zero notices -- ungating the top-ranked/cited condition
+    does not mean every retrieval fires a notice, only every retrieval that actually retrieved a
+    `rule_effective_date`-carrying chunk.
+    """
+    chunks = [
+        _make_chunk(id=1, source_url="https://example.gov/unrelated-1", rule_effective_date=None),
+        _make_chunk(id=2, source_url="https://example.gov/unrelated-2", rule_effective_date=None),
+        _make_chunk(id=3, source_url="https://example.gov/unrelated-3", rule_effective_date=None),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices=set())
@@ -1603,8 +1688,28 @@ def test_build_freshness_dated_source_neither_top_ranked_nor_cited_produces_no_n
     assert freshness.notices == []
     assert freshness_notice_text(freshness.notices) is None
 
-    dated_source = next(s for s in freshness.sources if s.source_url == dated_url)
-    assert dated_source.rule_effective_date == date(2026, 9, 15)
+
+def test_build_freshness_date_rollover_flips_in_effect_and_wording_to_took_effect():
+    """With `today` frozen to a date after the rule's effective date, `in_effect` must flip to
+    True and `freshness_notice_text`'s wording must switch from "takes effect on" (future) to
+    "took effect on" (already in effect) -- the real DHS fixed-admission rule is eight days away
+    from this rollover as of this fix, so it ships whether or not this is tested.
+    """
+    chunk = _make_chunk(
+        source_url="https://studyinthestates.dhs.gov/quick-facts",
+        rule_effective_date=date(2026, 9, 15),
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 16), cited_indices=set())
+
+    assert len(freshness.notices) == 1
+    notice = freshness.notices[0]
+    assert notice.in_effect is True
+
+    text = freshness_notice_text(freshness.notices)
+    assert text is not None
+    assert "took effect on September 15, 2026" in text
+    assert "takes effect on" not in text
 
 
 def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_sentence():
@@ -1835,12 +1940,15 @@ async def test_pipeline_appends_notice_reason_cited_for_a_non_top_dated_chunk_th
     assert dated_url in response.answer
 
 
-async def test_pipeline_appends_no_notice_for_a_dated_chunk_neither_top_ranked_nor_cited(
+async def test_pipeline_appends_notice_for_a_dated_chunk_neither_top_ranked_nor_cited(
     monkeypatch, embedder, settings
 ):
-    """The exact spurious case build_freshness's gating exists to prevent: a dated source retrieved
-    incidentally (not top-ranked, never cited) must add NO text to the rendered answer, but its
-    rule_effective_date still has to survive in the structured Freshness.sources bookkeeping.
+    """Red-team fix, 2026-09-07 (was: "...appends_no_notice..."; see
+    app/guardrails/freshness.py's module docstring, "WHY THAT GATE WAS OVERRIDDEN"): a dated source
+    retrieved incidentally -- not top-ranked, never cited -- must now still add the effective-date
+    notice to the rendered answer. This is exactly the shape of the live defect: dated
+    fixed_admission chunks retrieved at ranks 3-5, cited by nothing the model wrote, and the notice
+    used to come back empty on 5 of 6 real production runs of the same question.
     """
     other_url = "https://example.gov/other-only-cited"
     dated_url = "https://example.gov/dated-neither-top-nor-cited"
@@ -1862,11 +1970,13 @@ async def test_pipeline_appends_no_notice_for_a_dated_chunk_neither_top_ranked_n
 
     assert response.response_type == ResponseType.ANSWER.value
     assert response.freshness is not None
-    assert response.freshness.notices == []
-    assert response.answer == fixed_text, (
-        f"a dated source that is neither top-ranked nor cited must add no text to the answer, got "
-        f"{response.answer!r}"
-    )
+    assert len(response.freshness.notices) == 1
+    assert response.freshness.notices[0].source_url == dated_url
+    # Round 2 (2026-09-08): genuinely neither top-ranked nor cited reports "retrieved", not "cited".
+    assert response.freshness.notices[0].reason == "retrieved"
+    assert fixed_text in response.answer
+    assert "September 15, 2026" in response.answer
+    assert dated_url in response.answer
 
     dated_source = next(s for s in response.freshness.sources if s.source_url == dated_url)
     assert dated_source.rule_effective_date == date(2026, 9, 15)

@@ -37,7 +37,7 @@ export interface FreshnessNotice {
   source_url: string;
   rule_effective_date: string;
   in_effect: boolean;
-  reason: "top_ranked" | "cited";
+  reason: "top_ranked" | "cited" | "retrieved";
 }
 
 export interface Freshness {
