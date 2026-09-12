@@ -135,6 +135,33 @@ class Settings(BaseSettings):
     # against without being re-run, and changing top_k would invalidate that comparison.
     HYBRID_CANDIDATE_POOL: int = 20
 
+    # Dated-rule companion retrieval (docs/adr/0019-dated-rule-companion-retrieval.md). The DHS
+    # fixed-period-of-admission final rule (effective 2026-09-15, changing the F-1
+    # post-completion departure period from 60 days to 30) sits in three chunks that carry a
+    # `rule_effective_date` and that measurably lose the RRF fusion race on plain departure-period
+    # questions -- "What is the grace period after OPT ends?" retrieves only the still-current
+    # 60-day chunks in the fused top-k, never the dated replacement, which violates the
+    # "answers state both the current rule and its dated replacement" rule (ARCHITECTURE.md).
+    # app/db.py::hybrid_search's `companions` CTE fixes this directly: once the fused top-k
+    # contains ANY chunk carrying a rule_effective_date, it adds up to this many MORE chunks that
+    # carry that SAME date, ordered by raw cosine distance, regardless of whether they fused well.
+    #
+    # 2, not 1: measured directly against "What is the grace period after OPT ends?" -- the single
+    # closest dated chunk by distance is id 670, which discusses the rule but does not itself
+    # state the new 30-day number; the chunk that actually states it sits one further out, behind
+    # 670. A companion count of 1 admits 670 alone and still fails to surface the replacement
+    # figure; 2 admits both. n=2 was fitted to a fixed acceptance ladder (see the ADR for exactly
+    # which queries and why that is a legitimate way to pick it here) -- treat it as a floor to
+    # revisit, not a constant with headroom to spare, the next time a new dated rule lands in the
+    # corpus.
+    #
+    # 0 disables the feature entirely: app/db.py's `companions` CTE returns zero rows (a `LIMIT 0`
+    # regardless of its WHERE clause), and hybrid_search's output is byte-identical to the
+    # pre-companion behavior. app/pipeline.py's no-answer gate ignores companion chunks
+    # unconditionally, by construction, regardless of this setting's value -- see hybrid_search's
+    # own docstring and RetrievedChunk.retrieved_by.
+    DATED_RULE_COMPANIONS: int = 2
+
     # Eval judge (Phase 1). Hosted NVIDIA endpoint, a different model family than the generator,
     # so a self-preference bias never creeps into the eval gate (see ARCHITECTURE.md, "The eval
     # judge is a hosted model from a different family than the generator"). JUDGE_API_KEY has no

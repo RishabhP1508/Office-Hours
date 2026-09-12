@@ -1531,6 +1531,7 @@ def _make_chunk(**overrides) -> RetrievedChunk:
         rrf_score=0.5,
         semantic_rank=1,
         keyword_rank=None,
+        retrieved_by="fusion",
     )
     defaults.update(overrides)
     return RetrievedChunk(**defaults)
@@ -2047,6 +2048,7 @@ async def test_hybrid_search_carries_rule_effective_date_through(pool):
         k=settings.RETRIEVAL_TOP_K,
         rrf_k=60,
         candidate_pool=20,
+        dated_rule_companions=0,
     )
     assert any(r.rule_effective_date == date(2026, 9, 15) for r in results), (
         f"expected at least one retrieved chunk to carry rule_effective_date=2026-09-15, got "
@@ -2094,6 +2096,7 @@ async def test_pipeline_freshness_notice_fires_via_top_ranked_on_the_live_corpus
             k=settings.RETRIEVAL_TOP_K,
             rrf_k=60,
             candidate_pool=20,
+            dated_rule_companions=0,
         )
         freshness = build_freshness(chunks, today=datetime.now(UTC).date(), cited_indices=set())
         return freshness.notices

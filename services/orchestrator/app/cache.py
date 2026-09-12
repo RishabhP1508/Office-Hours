@@ -26,9 +26,33 @@ HOW invalidation works: every cache row is stamped with `corpus_version()` at wr
 version is `max(sources.last_changed_at)` (moved forward by every meaningful re-index --
 app/recrawl.py::reindex_source always sets it) combined with `count(documents)` (a second,
 independent signal against a future write path that changes chunk count without moving
-last_changed_at). `store()` additionally DELETES every row whose corpus_version does not match the
-version it is about to write under, so the table never accumulates rows from a superseded corpus
-state at all -- a corpus change does not just make old entries unreachable, it wipes them outright.
+last_changed_at), combined with TODAY'S UTC DATE (see "WHY A DATE IS PART OF THIS" below).
+`store()` additionally DELETES every row whose corpus_version does not match the version it is
+about to write under, so the table never accumulates rows from a superseded corpus state at all --
+a corpus change does not just make old entries unreachable, it wipes them outright.
+
+WHY A DATE IS PART OF THIS (root-caused, not merely patched): a `corpus_version` built only from
+`last_changed_at`/`count(documents)` has no way to notice that a DAY has passed with the corpus
+itself unchanged, and this cache has no TTL either. Some of the answer text this module caches is
+DATE-DERIVED, not corpus-derived: app/guardrails/freshness.py::freshness_notice_text's own
+"takes effect on <date>"/"took effect on <date>" wording, and app/guardrails/temporal.py::
+qualify_future_dated_figures's inserted qualifying sentence, both switch wording based on whether
+`today` is on or after a `rule_effective_date` -- and neither `sources.last_changed_at` nor
+`count(documents)` moves when only the CALENDAR moves. Without today's date in the version string,
+a response cached on September 11 stating "takes effect on September 15, 2026" would still be
+served, verbatim, on September 16 -- after the rule everyone can see has already come into force --
+because nothing about the corpus itself changed, only which side of that date "today" now falls on.
+Concretely: `version("2026-09-11")` != `version("2026-09-16")` even with `last_changed_at`/
+`count(documents)` held fixed, so `lookup()` (which only ever matches the CURRENT version) can never
+return that stale row again once the day turns over, and `store()`'s own delete-superseded-versions
+step wipes it outright the next time anything is cached.
+
+THE HONEST COST: cache entries now expire once per UTC day, even when the corpus itself never
+changes at all -- a strictly higher cache-miss rate than a pure corpus-derived version would ever
+produce. This is accepted deliberately: the cache exists to save the cost of a repeat generation
+(app/cache.py's own module docstring, above), which is a COST optimization; a wrong, stale date in a
+rendered answer is a CORRECTNESS problem, and this project does not trade correctness for a cache
+hit rate.
 
 WHY `lookup()` ALSO PARTITIONS ON THE ADVICE/INFORMATION CLASSIFICATION (Phase 8 round 4, fixing a
 real bug a round-3 semantic-only cache had): a cosine-distance threshold measures TOPIC closeness,
@@ -108,6 +132,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, date, datetime
 
 from pgvector import Vector
 from psycopg.rows import dict_row
@@ -123,11 +148,17 @@ logger = logging.getLogger(__name__)
 CACHEABLE_RESPONSE_TYPES = frozenset({ResponseType.ANSWER.value, ResponseType.REFUSAL_ADVICE.value})
 
 
-async def corpus_version(pool: AsyncConnectionPool) -> str | None:
-    """A string identifying "the corpus as it stands right now" -- see the module docstring for
-    what it is built from and why. Never a version number this code invents or increments itself;
-    always re-derived from `sources`/`documents` directly, so it is correct even if some other
+async def corpus_version(pool: AsyncConnectionPool, *, today: date | None = None) -> str | None:
+    """A string identifying "the corpus as it stands right now, on this UTC day" -- see the module
+    docstring ("WHY A DATE IS PART OF THIS") for why the date is in here at all, alongside what the
+    rest of it is built from. Never a version number this code invents or increments itself; always
+    re-derived from `sources`/`documents`/the clock directly, so it is correct even if some other
     process (a manual SQL edit, a different service instance) changed the corpus.
+
+    `today` defaults to `datetime.now(UTC).date()` only here, at the outermost call boundary --
+    app/pipeline.py's real call site never passes it, so production always versions against the
+    real clock; a test passes an explicit `today` to prove two different days produce two different
+    versions without waiting for a real day to turn over.
 
     Returns `None` on ANY database error (logged at WARNING) instead of raising -- see the module
     docstring, "OPTIONAL INFRASTRUCTURE, NEVER FATAL". app/pipeline.py's caller already treats
@@ -135,6 +166,8 @@ async def corpus_version(pool: AsyncConnectionPool) -> str | None:
     function does not need to know that, it just has to fail into a value the caller already
     handles safely.
     """
+    if today is None:
+        today = datetime.now(UTC).date()
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -151,7 +184,7 @@ async def corpus_version(pool: AsyncConnectionPool) -> str | None:
         )
         return None
     changed_at_part = max_last_changed_at.isoformat() if max_last_changed_at is not None else "none"
-    return f"{changed_at_part}:{chunk_count}"
+    return f"{changed_at_part}:{chunk_count}:{today.isoformat()}"
 
 
 def _required_response_type(is_advice: bool) -> str:
