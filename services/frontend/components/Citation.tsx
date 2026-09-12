@@ -1,7 +1,8 @@
 import type { Citation as CitationType } from "../lib/api";
 
 /** One bracket citation marker (`[2]`, or a comma group like `[1, 3]`), parsed by
- * lib/citations.ts::parseAnswerSegments. Each number links to `citations[n-1].source_url`; an
+ * lib/prose.ts::parseInline using the pattern lib/citations.ts::citationRegex() defines. Each
+ * number links to `citations[n-1].source_url`; an
  * index with no matching citation (should never happen once app/guardrails/citations.py has
  * verified the answer, but a defensive frontend never trusts that blindly) renders as inert text,
  * never a broken link. Brackets are never stripped, renumbered, or reformatted. */
