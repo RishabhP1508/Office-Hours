@@ -276,14 +276,33 @@ const _BLOCKED_COPY_BY_REASON: Record<string, { heading: string; body: React.Rea
       </>
     ),
   },
+  // app/guardrails/temporal.py's BLOCK signal (that module's own docstring, "BLOCK VS INSERT"):
+  // the generated answer stated a rule that changes on a known future date as though it were
+  // already the rule in force, with nothing in it naming the version still in force today.
+  answer_states_future_rule_as_current: {
+    heading: "A rule here is about to change, so we're not guessing",
+    body: (
+      <>
+        A rule affecting this answer changes on a specific date, and this tool could not state
+        both the current version and the upcoming one clearly enough to trust here, so it’s
+        withheld rather than shown. Check the source linked above directly, or talk to your DSO
+        or a licensed immigration attorney.
+      </>
+    ),
+  },
 };
 
 function BlockedUnverified({ question, response }: { question: string; response: AnswerResponse }) {
-  // Deliberately plain text, never CitedProse: the fixed safe message never carries a bracket, so
-  // running it through the citation parser would only risk treating stray punctuation as one.
-  // withNonBreakingHyphens is still safe and applied: it only ever substitutes a character inside
-  // an already-matched form-number/status-code token, so it can never introduce or remove a
-  // bracket the citation parser would have to see.
+  // Rendered through CitedProse (parseInline/InlineNodes), not bare text, since the temporal
+  // guard's own block message (refusal_reason="answer_states_future_rule_as_current",
+  // app/pipeline.py::_future_rule_blocked_message) carries a markdown link to the real, retrieved
+  // source -- a bare string render would leave that link inert. This used to be deliberately plain
+  // text with a comment noting the fixed safe message never carries a bracket; that is no longer
+  // true, so bare text would silently show "[the official source](https://...)" as literal
+  // characters instead of a clickable link. `citations` is passed through for symmetry with every
+  // other CitedProse call site, even though this response type carries none (app/pipeline.py
+  // clears citations to [] on this path): a stray "[7]"-shaped bracket would just resolve against
+  // an empty list rather than crash.
   const copy =
     (response.refusal_reason && _BLOCKED_COPY_BY_REASON[response.refusal_reason]) ||
     _DEFAULT_BLOCKED_COPY;
@@ -291,7 +310,7 @@ function BlockedUnverified({ question, response }: { question: string; response:
     <div>
       <YouEcho question={question} />
       <p className="font-serif text-lg leading-[1.85] text-body">
-        {withNonBreakingHyphens(response.answer)}
+        <CitedProse text={response.answer} citations={response.citations} />
       </p>
       <Handoff heading={copy.heading}>{copy.body}</Handoff>
       <Stamp response={response} />
