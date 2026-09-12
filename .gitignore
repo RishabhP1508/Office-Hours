@@ -56,3 +56,4 @@ docs/design/
 .playwright-mcp/
 *.png
 !docs/**/*.png
+docs/security/
