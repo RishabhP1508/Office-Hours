@@ -1369,6 +1369,12 @@ def test_system_prompt_versions_are_pinned():
     # against anyone editing the system prompts without meaning to: `_prompt_version` is a content
     # hash (see app/prompts.py), so any edit to either prompt's text -- however small -- moves its
     # hash and fails this test, which is the point.
+    #
+    # Rule 6 was changed on 12 September 2026 to ask for a plain "- " list on enumerable content,
+    # then reverted the same day: measured on 16 production answers to four enumerable questions,
+    # the model emitted an actual list 6/16 before the change and 5/16 after -- no movement, so
+    # the change is reverted and SYSTEM_PROMPT_VERSION returns to its earlier value.
+    # REFUSAL_SYSTEM_PROMPT was never touched and its pin below did not move.
     assert SYSTEM_PROMPT_VERSION == "af1b88eeb3bf"
     assert REFUSAL_SYSTEM_PROMPT_VERSION == "c5934a0286ca"
 
