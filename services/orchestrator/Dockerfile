@@ -40,18 +40,44 @@ COPY tests ./tests
 # build gets the real ~262MB file alongside it.
 COPY models ./models
 
+# Two installs, deliberately. The old single install passed --extra-index-url, which does NOT mean
+# "use this index only for the package that needs it": pip queries EVERY index for EVERY package
+# name in the resolution and takes the highest version found anywhere. Measured, not assumed --
+# under the old flag this build queried abetlen's index for 59 distinct package names (58 of them
+# 404), and a handmade fastapi 99.0.0 served from a throwaway index beat PyPI's real 0.141.1. That
+# put the whole production dependency set behind one third-party GitHub Pages account. See
+# REPORT.md, "EXPOSURE: the production Dockerfile is open to dependency confusion".
+#
+# Step 1 runs ONLY when "gguf" is requested. It uses --index-url (not --extra-index-url), so
+# abetlen's index is the only index in scope, and --no-deps, so nothing but the one pinned name is
+# ever resolved against it. --disable-pip-version-check suppresses pip's own self-update query,
+# which would otherwise ask that index about the name "pip" as well; it cannot install anything,
+# but leaving it out means the index is asked about two names instead of one. Net: an allowlist of
+# exactly one package.
+#
+# Step 2 installs the project and its extras with PyPI as the sole index. llama-cpp-python==0.3.35
+# is already satisfied by then, so pip reports "Requirement already satisfied" and never reaches
+# PyPI's sdist -- no compiler in this image, and none needed -- while STILL resolving that wheel's
+# own dependencies (typing-extensions, numpy, diskcache, jinja2, MarkupSafe) from PyPI, so --no-deps
+# costs nothing in the final package set. Both halves of that were measured: `pip check` reports no
+# broken requirements, and `pip freeze` is byte-identical to a same-day build of the old flags.
+# Blast radius: 59 package names -> 1.
+#
+# The "," padding on the case guard makes the match token-exact: "gguf" and "dev,eval,gguf" select
+# step 1; "evalgguf" and "dev,gguffy" do not.
+#
 # Empty INSTALL_EXTRAS must install the bare package with NO extras at all (`pip install -e "."`),
 # not `pip install -e ".[]"` -- empty-bracket extras syntax is not something to rely on here, so
-# this branches in shell instead. --extra-index-url adds abetlen's own wheel index alongside PyPI
-# (pip still resolves every other dependency from PyPI as usual); it is what lets llama-cpp-python
-# (the "gguf" extra) install from a prebuilt manylinux2014_x86_64 wheel with no compiler in this
-# image, and it is harmless to pass even when INSTALL_EXTRAS never requests that package at all.
+# this branches in shell instead.
 RUN pip install --upgrade pip && \
+    case ",$INSTALL_EXTRAS," in \
+      *,gguf,*) pip install --index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+                  --disable-pip-version-check --no-deps "llama-cpp-python==0.3.35" ;; \
+    esac && \
     if [ -n "$INSTALL_EXTRAS" ]; then \
-      pip install --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
-        -e ".[$INSTALL_EXTRAS]"; \
+      pip install --index-url https://pypi.org/simple -e ".[$INSTALL_EXTRAS]"; \
     else \
-      pip install -e "."; \
+      pip install --index-url https://pypi.org/simple -e "."; \
     fi
 
 EXPOSE 8000
