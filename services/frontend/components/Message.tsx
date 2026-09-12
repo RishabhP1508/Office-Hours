@@ -1,24 +1,109 @@
+import { Fragment } from "react";
 import type { AnswerResponse, Citation as CitationType } from "../lib/api";
-import { parseAnswerSegments } from "../lib/citations";
 import { formatLongDate } from "../lib/format";
 import { withNonBreakingHyphens } from "../lib/nonbreaking";
-import { deriveLead, splitParagraphs, withoutDuplicateFreshnessNoticeParagraph } from "../lib/prose";
+import {
+  deriveLead,
+  parseBlocks,
+  parseInline,
+  splitParagraphs,
+  withoutDuplicateFreshnessNoticeParagraph,
+  type InlineNode,
+} from "../lib/prose";
 import Citation from "./Citation";
 import Freshness from "./Freshness";
 import Handoff from "./Handoff";
 import SourceList from "./SourceList";
 
-function CitedProse({ text, citations }: { text: string; citations: CitationType[] }) {
-  const segments = parseAnswerSegments(withNonBreakingHyphens(text));
+/** Renders one `parseInline` node tree as React elements -- never as an HTML string, so there is
+ * no `dangerouslySetInnerHTML` and no injection surface. `bold`/`italic` recurse over their own
+ * children, which may themselves include a `citation` node (e.g. "**30 days [7]**" -- see
+ * lib/prose.ts's tokeniser comment for why a single combined pass is what makes that legal); a
+ * `link` is only ever produced by `parseInline` after it already passed the http(s)-only scheme
+ * check, so no second check is needed here; a `citation` node renders the same `<Citation>`
+ * component every bracket marker has always rendered as. */
+function InlineNodes({ nodes, citations }: { nodes: InlineNode[]; citations: CitationType[] }) {
   return (
     <>
-      {segments.map((segment, i) =>
-        segment.kind === "text" ? (
-          <span key={i}>{segment.value}</span>
-        ) : (
-          <Citation key={i} indices={segment.indices} citations={citations} />
-        )
-      )}
+      {nodes.map((node, i) => {
+        switch (node.kind) {
+          case "text":
+            return <Fragment key={i}>{node.value}</Fragment>;
+          case "bold":
+            return (
+              <strong key={i}>
+                <InlineNodes nodes={node.children} citations={citations} />
+              </strong>
+            );
+          case "italic":
+            return (
+              <em key={i}>
+                <InlineNodes nodes={node.children} citations={citations} />
+              </em>
+            );
+          case "link":
+            return (
+              <a key={i} href={node.url} target="_blank" rel="noopener noreferrer">
+                {node.label}
+              </a>
+            );
+          case "citation":
+            return <Citation key={i} indices={node.indices} citations={citations} />;
+        }
+      })}
+    </>
+  );
+}
+
+/** One run of prose (a paragraph, a list item, the lead sentence): a single call into
+ * `parseInline`, which tokenises citation markers and markdown (bold/italic/link) together in one
+ * pass, so a citation marker sitting inside a bold or italic span no longer needs to survive being
+ * split into a separate segment first. */
+function CitedProse({ text, citations }: { text: string; citations: CitationType[] }) {
+  const nodes = parseInline(withNonBreakingHyphens(text));
+  return <InlineNodes nodes={nodes} citations={citations} />;
+}
+
+/** One blank-line-delimited paragraph, expanded into its block-level pieces (plain text, a bullet
+ * list, a numbered list, or a heading line with its hashes stripped) so that a list the model wrote
+ * with single newlines between items renders as actual `<li>` elements instead of one run-on
+ * paragraph. Every block's text still goes through `CitedProse`, so citations and inline markdown
+ * both work inside list items exactly as they do in ordinary paragraphs. */
+function ParagraphBlocks({ paragraph, citations }: { paragraph: string; citations: CitationType[] }) {
+  const blocks = parseBlocks(paragraph);
+  return (
+    <>
+      {blocks.map((block, i) => {
+        switch (block.kind) {
+          case "bullet-list":
+            return (
+              <ul key={i} className="mb-4 mt-0 list-disc pl-5">
+                {block.items.map((item, j) => (
+                  <li key={j} className="mb-1">
+                    <CitedProse text={item} citations={citations} />
+                  </li>
+                ))}
+              </ul>
+            );
+          case "numbered-list":
+            return (
+              <ol key={i} className="mb-4 mt-0 list-decimal pl-5">
+                {block.items.map((item, j) => (
+                  <li key={j} className="mb-1">
+                    <CitedProse text={item} citations={citations} />
+                  </li>
+                ))}
+              </ol>
+            );
+          case "heading":
+          case "paragraph":
+            return (
+              <p key={i} className="mb-4 mt-0">
+                <CitedProse text={block.text} citations={citations} />
+              </p>
+            );
+        }
+      })}
     </>
   );
 }
@@ -67,9 +152,7 @@ function AnsweredProse({
           </span>
         )}
         {bodyParagraphs.map((paragraph, i) => (
-          <p key={i} className="mb-4 mt-0">
-            <CitedProse text={paragraph} citations={response.citations} />
-          </p>
+          <ParagraphBlocks key={i} paragraph={paragraph} citations={response.citations} />
         ))}
       </div>
       {response.freshness && <Freshness notices={response.freshness.notices} />}

@@ -389,6 +389,11 @@ The number is right. The half that tells someone what is at stake is dropped, an
 
 ### 11. MEDIUM: markdown leaks into the prose, and lists collapse into run-on paragraphs
 
+> **Status: FIXED on disk 12 September 2026, not yet deployed.** A markdown renderer now runs in
+> the frontend; see "Finding 11 fixed: the frontend renders markdown" below for what it covers,
+> what it deliberately does not, and how it was verified. Everything below records the defect as
+> found on 7 September.
+
 There is no markdown renderer. `services/frontend/components/Message.tsx` splits on blank lines and renders each paragraph as plain text (which is why the XSS probes in finding 20 are safe). Prompt rule 6 says "Do not use headings or heavy bold formatting; write in plain paragraphs," and the model ignores it often.
 
 **Measured rate,** 10 runs of the identical question `How long is the STEM OPT extension?`:
@@ -1765,6 +1770,78 @@ figure in it at all --
 
 -- past tense, three days early, in the same answer the guard had already corrected once. Nothing
 about a figure-anchored check can see that sentence. Recorded rather than fixed.
+
+### Finding 11 fixed: the frontend renders markdown, and the one gap left on purpose
+
+The trigger was a live report that `**30 days**` rendered with literal asterisks on the deployed site,
+on the sentence stating the rule that changes on 15 September. Fixed by rendering the markdown rather
+than stripping the markers, in `services/frontend/lib/prose.ts` and `components/Message.tsx`.
+
+**Which constructs leak, re-measured on the live deployment 12 September, 10 answers.** Not re-quoted
+from the 7 September numbers: the prompt, the corpus and retrieval have all changed since.
+
+    construct   12 Sept (10 answers)   7 Sept (10 answers)   covered by the fix?
+    bold             21, in 6 of 10          14              yes
+    bullet            6, in 2 of 10           8              yes
+    numlist           4, in 1 of 10           0              yes
+    italic            2                       2              yes
+    mdlink            2 (model-written)       0              yes
+    heading           0                       0              yes (hashes stripped)
+    table             0                       7              NO -- see below
+    code              0                       0              no
+
+Bold held at exactly 6 of 10, the same rate as five days earlier. Three things moved: tables vanished,
+and numbered lists and model-written markdown links appeared where there had been none.
+
+**Tables are a known gap, left deliberately.** 7 occurrences on 7 September, 0 on 12 September, across
+10 answers each time. The two questions that produced them ("Compare pre-completion and post-completion
+OPT", "What are the eligibility requirements for the STEM OPT extension?") are ones the user judged
+acceptable to let degrade. A table that does recur will still render with literal pipes. **This is a
+measured decision, not an oversight**, and it is recorded here so a future session does not treat it
+as one. Revisit it if a sample shows tables returning.
+
+**Verified against real production answers, not fixtures, and that is what caught the residual.** The
+first implementation passed all 12 of its unit tests and still leaked 2 markers when run over the 10
+captured production answers. Cause: citation parsing ran first over the whole string and markdown
+parsing second over each leftover segment, so a span CONTAINING a citation was split and neither of its
+markers matched:
+
+    input:   *A higher-level STEM degree ... one additional 24-month extension [1].*
+    rendered: *A higher-level STEM degree ... one additional 24-month extension   [1]   .*
+
+Measured on the real answers before the second round: 3 of 23 spans straddled a citation marker (1 of
+21 bold, 2 of 2 italic). Fixed by collapsing to ONE inline tokeniser that recognises citation markers
+as atomic tokens alongside the markdown constructs, with the citation pattern tried before the link
+pattern so a bare `[2]` can never be parsed as a link.
+
+Final state, over the same 10 production answers:
+
+    nodes by kind : bold 21, italic 2, link 2, citation 30, text 89
+    list blocks   : 7
+    rendered text still containing a markdown marker : 0
+
+**All 30 citations survived**, which is the check that mattered: the risk in collapsing two passes into
+one was that `[7]` would start being parsed as a markdown link. 17 of 17 unit tests pass, `tsc
+--noEmit` exits 0, lint is clean, and `next build` compiles -- the typecheck and build were re-run
+independently because the change edited `tsconfig.json`, and a tsconfig change is exactly the kind that
+passes in one harness and fails in the deploy.
+
+**The list fix matters more than the asterisks.** Those 10 answers produced 7 list blocks. Finding 11
+called the collapsed run-on lists the worse half of the defect -- four rules and two sub-conditions in
+one unbroken paragraph -- and the same change fixes it.
+
+**Safety property preserved.** No `dangerouslySetInnerHTML` anywhere (the only matches are comments
+explaining its absence), which is what made the red-team's XSS probes safe. Links are scheme-checked to
+`http(s)` and carry `rel="noopener noreferrer"`; `[label](javascript:alert(1))` renders as literal text,
+pinned by a test.
+
+**One observation deliberately not chased.** A single production answer was reported as opening with a
+bare figure rather than the lead sentence prompt rule 6 asks for. Ten production samples did not
+reproduce it: all ten opened with a full lead sentence and none triggered the frontend's lead-promotion
+path. The candidate mechanism is `lib/prose.ts::deriveLead`, which promotes a first sentence of 90
+characters or fewer to a standalone 23px block, so a short opening would render as a bare prominent
+figure -- confirmed reachable by running the real logic, never observed live. Closed as unreproduced
+rather than investigated further, on one observation against ten counter-samples.
 
 ### How non-deterministic is the judge? Measured, 10 repeats on each of two fixed inputs.
 
