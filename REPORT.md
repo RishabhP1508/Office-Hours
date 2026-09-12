@@ -35,7 +35,7 @@ Sixteen times in this build, the thing that was broken was the thing doing the m
 | 11 | `tests/test_guardrails.py::test_no_answer_threshold_separates_control_queries_on_the_live_corpus` | It calls `hybrid_search(..., rrf_k=60, candidate_pool=20)` with both values written as literals rather than read from `Settings`. It is the check that protects the no-answer threshold against a retrieval change, and it is the one check that cannot see a retrieval change: set `RRF_K=10` in the environment and this test still measures 60 and still passes green. Nothing has been misled by it yet, because `RRF_K` has never been changed. | Reading the test while costing out option 1, before changing anything. Recorded here because it is the same defect caught early rather than late. |
 | 12 | The headline sentence of this report's own summary, mine | "A student asking \"what is my grace period\" gets the outgoing 60-day number" was never run as written. Run against the local stack on 11 September, that exact string returns `clarify` (`query_too_vague`): after stopwords it has two content words against a `CLARIFY_MIN_CONTENT_WORDS` of 3, so it never reaches retrieval at all. Every first-person variant measured ("What is my grace period?", "How long is my grace period?", "What is my grace period after OPT?") returns `clarify` or `refusal_advice`, never a plain cited answer, because "my" trips the advice classifier. The underlying finding is real and reproduces on third-person phrasings; the sentence chosen to dramatise it does not. | Running the example sentence instead of quoting it. The defect it illustrates was measured seven different ways and the illustration itself never once. |
 | 13 | The `full_corpus` pytest marker, as the boundary of the automated gate | Every check that needs the real 14-source corpus is marked `full_corpus`, and CI runs `pytest -m "not full_corpus"`. So the 17 tests that exercise the real corpus never run in any automated gate, and one of them, `test_pipeline_freshness_notice_fires_via_top_ranked_on_the_live_corpus`, has been failing since before this session against a corpus that drifted underneath it. A red test that nothing runs is indistinguishable from a green one. **This is Phase 2's DoD 5 again**, recorded in `docs/reports/phase-2.md`: a check that was "structurally incapable" of catching the thing it existed for, because of where it ran rather than what it asserted. | Running `pytest -m full_corpus` deliberately during this verification, which nothing in the normal loop does. The inventory below says what else is in that blind spot. |
-| 14 | A pinned expected-value literal, `test_prompt_versions_are_unchanged_by_the_currency_marker_fix` | **The only entry here that was not wrong.** The test asserts `SYSTEM_PROMPT_VERSION == "af1b88eeb3bf"` to prove the change did not touch the system prompt. Its whole value rests on that literal having been computed BEFORE the change, and nothing inside the test can establish that: a literal computed afterwards pins the post-change value, passes green forever, and asserts nothing at all. The test cannot distinguish its own healthy case from its own useless one, which is this table's pattern exactly, minus the failure. | Recomputing the hash inside the Docker image built before anyone touched the code. That image genuinely predates the change (importing the new constant from it raises ImportError) and returns the same two hashes, so the pin is real. The lesson is the method, not the outcome: when a check's correctness depends on when a value was produced, only an artifact from before that moment can settle it. |
+| 14 | A pinned expected-value literal, `test_prompt_versions_are_unchanged_by_the_currency_marker_fix` | **The only entry here that was not wrong.** The test asserts `SYSTEM_PROMPT_VERSION == "af1b88eeb3bf"` to prove the change did not touch the system prompt. Its whole value rests on that literal having been computed BEFORE the change, and nothing inside the test can establish that: a literal computed afterwards pins the post-change value, passes green forever, and asserts nothing at all. The test cannot distinguish its own healthy case from its own useless one, which is this table's pattern exactly, minus the failure. | Recomputing the hash inside the Docker image built before anyone touched the code. That image genuinely predates the change (importing the new constant from it raises ImportError) and returns the same two hashes, so the pin is real. The lesson is the method, not the outcome: when a check's correctness depends on when a value was produced, only an artifact from before that moment can settle it. **Update, 12 September:** the test is now `test_system_prompt_versions_are_pinned`. The pin moved to `5f76c8d330e1` when rule 6's paragraphs clause was rewritten, and moved back to `af1b88eeb3bf` the same day when that change was reverted for failing its measurement (see "Rule 6 was a rule fighting itself" below). `af1b88eeb3bf` is both the historical AND the current value, and the round trip is itself the point: the pin is what proved the revert was byte-exact rather than merely approximate. |
 | 15 | The LLM judge itself, at `temperature=0` | **The largest-blast-radius entry in this table, and the one instrument here that caught its own target.** On the eval run of 11 September the determinism self-check scored the SAME row's comprehensibility twice and got 3 and 4. `temperature=0` is not producing identical output, so **every judge-scored number this project has ever reported is noisier than its decimal places suggest** -- comprehensibility, false-refusal and advice-leakage directly, and faithfulness, answer_relevancy and context_precision through RAGAS, which drives the same judge. That includes the Phase 8 baselines every later run is compared against, and it includes the movements this project has read as signal: a comprehensibility shift of 2.857 to 3.333 is smaller than the gap this check just measured on one input. The run immediately before it passed the same check (4 and 4), which establishes nothing: two samples agreeing is not evidence of determinism, and reading it as such would be this table's pattern in its purest form. | The check fired. It was added in Phase 1 to prove temperature was actually being applied, sat green for eight phases, and has now caught exactly the thing it was built for. Worth recording as the counter-example to everything above: a cheap check, written early for a reason that had not happened yet, is what found this. |
 | 16 | A guardrail I designed, specified, and got approved, before writing any of it, mine | **The sharpest one here, because it was caught before it shipped rather than after.** The measured defect was "the answer states the new figure without the effective date", so I proposed a check of the form *if the answer states a figure that appears only in future-dated passages, the answer must also state the effective date*. `app/pipeline.py` step 8 **already appends the freshness notice, which contains that date, to `answer_text` on every ANSWER and REFUSAL_ADVICE**. The check would therefore have passed on every input ever given to it and reported a clean sweep: a guardrail that cannot fire, protecting a real defect, reported as coverage. The measurement that made the absence look real was mine too -- I scored "date in prose" on the text *before* step 8's append, which is the correct thing to measure for the reader and the wrong thing to build a string check against. | Reading `app/pipeline.py` line by line while writing the builder's instructions, rather than building from my own summary of it from earlier in the same session. The fix was to make the check sentence-scoped, which also raised its measured coverage from 4 of 6 failure modes to 6 of 6. Nothing in a test, a review, or the user's approval would have caught this: the check would have been green from the day it landed. |
 
@@ -54,6 +54,27 @@ Sixteen times in this build, the thing that was broken was the thing doing the m
 - When a check's correctness depends on *when* a value was recorded, get that value from an artifact built before the change. A pinned literal cannot testify about its own provenance.
 - Sequence builds and measurements. Do not let anything write into an environment a running measurement depends on.
 
+
+### A method note: the before-check that stopped a regression being reported
+
+Worth stating next to the table above, because it is the counterpart to it -- the method that works
+rather than another instrument that failed.
+
+A prompt change was measured over 16 production answers. One control question that should have stayed
+prose came back as a 2-item bullet list. That is the over-correction signature, and reporting it as a
+regression caused by the change would have been reasonable, would have read as careful, and would have
+been wrong.
+
+Before writing it up, I looked for the same question in the sample captured BEFORE the change. It was
+there: the same question, the same 2-item bullet shape, on 1 of 6 pre-change runs. The behaviour
+pre-existed. The change did not cause it.
+
+**The rule this generalises to:** when a change appears to have caused a behaviour, check whether the
+behaviour predates it before attributing it. That requires having captured the before-state at
+sufficient breadth to answer questions nobody had thought to ask yet, which is the real argument for
+dumping whole samples rather than only the metric you set out to measure. The second short list in
+that same run (`forms` run 1, 2 items) has no matching pre-change run, so it could not be cleared the
+same way, and it is recorded as unresolved rather than quietly grouped with the one that was.
 
 ### A process note, from nearly losing a measurement to a build
 
@@ -1842,6 +1863,129 @@ path. The candidate mechanism is `lib/prose.ts::deriveLead`, which promotes a fi
 characters or fewer to a standalone 23px block, so a short opening would render as a bare prominent
 figure -- confirmed reachable by running the real logic, never observed live. Closed as unreproduced
 rather than investigated further, on one observation against ten counter-samples.
+
+### The run-on list is a generation problem, not a rendering one. Measured.
+
+Prompted by a live report: "What are the eligibility requirements for STEM OPT?" came back as five
+requirements in one continuous 90-word sentence, with a nested sub-condition in parentheses and **no
+markdown markers at all**. Nothing for the renderer to render. Finding 11 called this shape worse than
+the leaked asterisks, and the markdown fix does not touch it.
+
+**First, the renderer does handle real lists.** Confirmed against a captured production answer that
+actually contained one, and it is the hard case rather than an easy one: the model separated its two
+bullets with a SINGLE newline inside one blank-line block, which is exactly the shape finding 11 said
+collapses.
+
+    BEFORE   <p> - Under the existing rule, students have a 60-day "departure preparation period"
+                 ... [2].  - The final rule that takes effect on September 15, 2026 shortens ...
+    AFTER    <ul> 2 items
+                <li> Under the existing rule, students have a 60-day "departure preparation period" ...
+                <li> The final rule that takes effect on September 15, 2026 shortens this ...
+
+**Second, how often the model chooses a list when a list is the right shape.** Four enumerable
+questions, four production runs each, 12 September:
+
+    question                                        list emitted   longest sentence seen
+    eligibility requirements for STEM OPT                2 / 4           91 words
+    what must be reported to the DSO on STEM OPT         2 / 4           65 words
+    documents needed to file for STEM OPT                1 / 4           51 words
+    which forms, and who signs what                      1 / 4           48 words
+
+    markdown list emitted : 6 / 16
+    run-on prose          : 10 / 16
+
+The reported case reproduced exactly: one eligibility run produced a 91-word sentence across an answer
+of only two sentences, another 82 words. **The same question produces either shape depending on the
+run** -- 2 of 4 each way -- so this is not a question the model cannot enumerate. It is a coin flip.
+
+**The comprehensibility cost, measured.** Flesch-Kincaid over the same 16 answers, with list markers
+stripped first so the grade scores the words rather than the bullets:
+
+    with a list   n=6    mean grade 17.18   range 11.0 - 25.9
+    run-on prose  n=10   mean grade 21.07   range 13.3 - 26.9
+    difference                    +3.90 grade levels, worse
+
+Two honest qualifications. The ranges overlap heavily and n is 16, so treat this as suggestive rather
+than settled. But the measurement is biased AGAINST lists, not for them: list items often carry no
+terminal punctuation, so Flesch-Kincaid reads a whole list as one very long sentence. Lists scored
+nearly four grades better despite that handicap.
+
+**What the prompt actually says, which is the part that makes this cheap to fix.** Rule 6 of
+`SYSTEM_PROMPT` reads, in full:
+
+> Lead with the direct answer in one or two sentences before any supporting detail. The first time you
+> use a form number or a piece of jargon, define it in plain words right there (for example, "Form
+> I-765, the work permit application"). **Prefer short sentences over long ones. Do not use headings or
+> heavy bold formatting; write in plain paragraphs.**
+
+The rule contains both halves of the conflict. "Write in plain paragraphs" instructs against
+structure; "prefer short sentences over long ones" asks for the thing structure delivers. On the
+run-on answers the model is **obeying** the first at the expense of the second, and a 91-word sentence
+is the result. This also explains the leak profile measured separately: the markdown that does escape
+is overwhelmingly **bold**, which rule 6 names and forbids, rather than **lists**, which it never
+mentions -- the model is not ignoring the rule, it is following it into a shape nobody wanted.
+
+`reading_grade_level` has been the weakest number in this project since Phase 1 (15.8 on the most
+recent full run, 17.6 at Phase 4). Nothing here was changed: the prompt is untouched pending a
+decision. But of everything measured in this report, a clause in one prompt rule is the smallest
+change with a plausible claim on that metric, and unlike the temporal work it does not fight the
+corpus.
+
+### Rule 6 was a rule fighting itself. The fix aimed at it did not work, and my diagnosis was wrong.
+
+**The conflict is real and both clauses are quoted accurately.** Rule 6 of `SYSTEM_PROMPT` reads:
+
+> Lead with the direct answer in one or two sentences before any supporting detail. ... **Prefer short
+> sentences over long ones. Do not use headings or heavy bold formatting; write in plain paragraphs.**
+
+"Write in plain paragraphs" instructs against structure; "prefer short sentences over long ones" asks
+for what structure delivers. This is the same shape as prompt rule 4 asking the model to use a field
+`format_context` never rendered (instrument entry 1), and as the answer-scoped check that could never
+fire (entry 16): **behaviour that looked like the model ignoring guidance was the model following
+different guidance.** That reading of rule 6 still stands.
+
+**What does not stand is my conclusion about which clause caused the run-ons.** The paragraphs clause
+was replaced with an explicit instruction to write requirements, documents, forms, steps and deadlines
+as a plain list, one item per line. Measured on the identical four enumerable questions, four runs
+each, same Flesch-Kincaid method including its bias against lists:
+
+                              before        after
+    list emitted              6 / 16        5 / 16
+    reading grade, all 16     19.61         19.05
+      answers with a list     17.18 (n=6)   15.55 (n=5)
+      run-on answers          21.07 (n=10)  20.64 (n=11)
+
+**The rate did not move.** The half-grade shift on the full set is noise with the rate flat, and is not
+claimed. Decisively: after being told explicitly to use a list for requirements and documents, the
+model still produced run-on sentences of **63, 54, 51, 49 and 48 words**. "Write in plain paragraphs"
+was not what was suppressing structure, so removing it changed nothing.
+
+**The change was reverted the same day.** `SYSTEM_PROMPT_VERSION` returns to `af1b88eeb3bf`. Keeping it
+would have rested on "it costs nothing and 16 runs cannot rule out a small effect", which is the
+argument for keeping every change that ever failed to measure.
+
+**Stated plainly for the next person who looks at `reading_grade_level`**, which has been this
+project's weakest metric since Phase 1 and is the obvious thing to reach for: the paragraphs clause is
+not the cause, it has been tried, and it did nothing. Whatever drives the run-on shape is somewhere
+else. The conflict inside rule 6 is worth fixing on its own terms, but not as a reading-grade
+intervention.
+
+**A separate open item found in the same measurement: bold is being ignored, not conflicted.** Rule 6
+says "Do not use headings or heavy bold formatting". Across the 28 answers in this run:
+
+    bold inside list items :  12   -- the corpus's own house style; chunk 710 writes
+                                     "- **Departure period**: F students now have ..." and the model
+                                     reproduces it, e.g. "- **Qualifying STEM degree** - you must ..."
+    bold in running prose  :  22   -- emphasis rule 6 explicitly forbids, in ordinary sentences
+
+Two different findings sharing one count, which is why they are split here. The in-item bold is the
+corpus teaching a house style. The 22 in running prose is a rule being disobeyed outright, which is a
+different problem from a rule fighting itself and needs a different fix. **No before-number exists**
+for either on these four questions -- the baseline script did not record bold -- so this is a measured
+state on 28 answers, not a trend, and must not be read as one.
+
+**The renderer carries the load.** All 28 answers through the real parser: 22 list items rendered, 34
+bold nodes, 68 citations, **0 markdown markers leaking**.
 
 ### How non-deterministic is the judge? Measured, 10 repeats on each of two fixed inputs.
 
