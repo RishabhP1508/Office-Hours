@@ -11,15 +11,34 @@ Concretely, in order:
 1. Clarify: if the query is too vague to retrieve against at all (app/guardrails/clarifier.py),
    return CLARIFY immediately -- one question, empty citations, empty contexts, no embedding call,
    no database query.
+1.5. STOPGAP (2026-09-08), see the loud comment at the check itself (just below, in
+   answer_question) and docs/adr/0018-non-latin-script-no-answer-stopgap.md for the full record:
+   a question that is predominantly non-Latin script -- it contains a non-Latin letter AND has no
+   bare Latin content word (an anchor like "STEM OPT") for retrieval to key off -- returns
+   NO_ANSWER with refusal_reason="non_latin_script_unsupported", before any embedding call and
+   before classification. A mixed-script question that DOES carry a Latin anchor (Chinese, Spanish,
+   or Cyrillic all measured working, see the comment at the check) is unaffected and retrieves
+   exactly as before this existed. This trades away the ability to gate a pure non-Latin question
+   that MIGHT have retrieved something reasonable, in exchange for never handing out a confident,
+   wrong, cited number in a language the reader cannot easily verify against the English sources.
 2. Classify: advice vs. information (app/guardrails/classifier.py). An advice verdict does NOT skip
    retrieval or return a canned template -- see step 3 onward and docs/adr/0002-advice-vs-
    information-line.md for why.
-3. Retrieve: hybrid RRF, unchanged from Phase 3, regardless of the classification.
+3. Retrieve: hybrid RRF, unchanged from Phase 3, regardless of the classification. Optionally
+   widened by dated-rule companions (app/db.py::hybrid_search's `companions` CTE,
+   Settings.DATED_RULE_COMPANIONS, docs/adr/0019-dated-rule-companion-retrieval.md): when the fused
+   top-k already contains a chunk carrying a rule_effective_date, up to that many more chunks
+   carrying the SAME date are added, ordered by cosine distance, so the passage stating a
+   future-dated rule's replacement reaches the generator even when RRF ranks it below the cut.
 4. No-answer check: if retrieval returned nothing, or the MINIMUM cosine distance across every
-   retrieved chunk exceeds Settings.NO_ANSWER_MAX_DISTANCE, return NO_ANSWER and never call the
-   generator at all. This is the minimum across all retrieved chunks, not the RRF-top-1 chunk's own
-   distance -- RRF-top-1 is a fused-rank quantity, not a semantic-closeness one, and can be noisier
-   than the single closest chunk actually retrieved (see Settings.NO_ANSWER_MAX_DISTANCE's comment).
+   FUSION-retrieved chunk (RetrievedChunk.retrieved_by == "fusion") exceeds
+   Settings.NO_ANSWER_MAX_DISTANCE, return NO_ANSWER and never call the generator at all. This is
+   the minimum across all fusion chunks, not the RRF-top-1 chunk's own distance -- RRF-top-1 is a
+   fused-rank quantity, not a semantic-closeness one, and can be noisier than the single closest
+   chunk actually retrieved (see Settings.NO_ANSWER_MAX_DISTANCE's comment). Dated-rule companion
+   chunks are excluded from this minimum on purpose: a companion is admitted because a dated rule
+   is in play, not because it is relevant to this question, so it must never be able to flip a
+   genuine NO_ANSWER into an answer.
 5. Generate: SYSTEM_PROMPT for information, REFUSAL_SYSTEM_PROMPT for advice (app/prompts.py) --
    both generate from the same retrieved context, with bracket citations. Red-team fix (2026-09-07):
    the per-chunk dict handed to build_user_prompt now also carries `rule_effective_date`, and
@@ -49,7 +68,12 @@ Concretely, in order:
    generated text; the gate is gone (see build_freshness's own docstring, "WHY THAT GATE WAS
    OVERRIDDEN", for the red-team evidence and the noise cost this reintroduces). CLARIFY,
    NO_ANSWER, and BLOCKED_UNVERIFIED responses carry freshness=None and no appended text -- none of
-   those three renders a generated answer at all.
+   those three renders a generated answer at all. Before the notice is appended,
+   app/guardrails/temporal.py::qualify_future_dated_figures scans the generated prose itself
+   (never the notice, which has not been appended yet) and inserts a date-qualifying sentence
+   directly after any sentence that states a future-dated rule's figure with no date of its own --
+   see that module's own docstring for why this has to be sentence-scoped rather than a check of
+   whether the date appears anywhere in the rendered answer.
 
 Phase 6 addition: an optional, keyword-only `on_event` callback (app/main.py's POST /query/stream
 uses it to drive the frontend's progress UI; POST /query passes nothing, so its behavior is
@@ -95,6 +119,7 @@ module's own docstring for why it can never raise into this function).
 """
 
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
@@ -107,9 +132,10 @@ from app.config import Settings
 from app.db import RetrievedChunk, hybrid_search
 from app.guardrails.authority import verify_no_authority_claim
 from app.guardrails.citations import parse_cited_indices, verify_citations
-from app.guardrails.clarifier import CLARIFY_QUESTION, is_too_vague
+from app.guardrails.clarifier import CLARIFY_QUESTION, content_words, is_too_vague
 from app.guardrails.classifier import classify_advice
 from app.guardrails.freshness import build_freshness, freshness_notice_text
+from app.guardrails.temporal import qualify_future_dated_figures
 from app.langfuse_telemetry import record_generation_trace
 from app.prompts import (
     REFUSAL_SYSTEM_PROMPT,
@@ -132,6 +158,19 @@ from app.telemetry import (
 _NO_ANSWER_MESSAGE = (
     "I don't see this covered in my sources, so I'm not going to guess at an answer. Try "
     "rephrasing the question, or check with your DSO or a licensed immigration attorney."
+)
+
+# STOPGAP (2026-09-08), see the loud comment above _is_predominantly_non_latin below, and
+# docs/adr/0018-non-latin-script-no-answer-stopgap.md, for why this exists and the exact condition
+# for removing it. Deliberately does NOT say "this falls outside the sources this tool has
+# indexed" -- unlike _NO_ANSWER_MESSAGE, the sources may well cover this question; the tool simply
+# cannot read it, and saying otherwise would itself be a false statement.
+_NON_LATIN_UNSUPPORTED_MESSAGE = (
+    "Office Hours can only read English questions reliably right now, so I'm not going to guess "
+    "at an answer to this one. Answering anyway risks handing you a confident but wrong number, "
+    "pointed at English sources you may not be able to check yourself. Please try asking in "
+    "English, or talk to your DSO or a licensed immigration attorney, who can help you in your "
+    "own language."
 )
 
 _BLOCKED_MESSAGE = (
@@ -181,6 +220,97 @@ _REDIRECT_RE = re.compile(
 
 def _has_redirect(text: str) -> bool:
     return bool(_REDIRECT_RE.search(text))
+
+
+# ============================================================================================
+# STOPGAP (2026-09-08): non-Latin-script no-answer gate. Read this comment before touching
+# anything below it -- it is the record of what this trades, why it exists, and the exact
+# condition for removing it, per CLAUDE.md's instruction to document a stopgap loudly at the
+# check itself, not only in docs/adr/0018-non-latin-script-no-answer-stopgap.md (which has the
+# same account for anyone who finds that file first).
+#
+# THE INCIDENT: measured against production (gpt-oss:120b) on 2026-09-08, "옵티 연장은 몇
+# 개월인가요?" ("how many months is the OPT extension?") retrieved 5 chunks and answered "up to
+# 12 months", citing an H-1B/M-2/English-training/OPT/H-1B-cap chunk set with nothing on point.
+# The real STEM OPT extension is 24 months. Root cause, NOT fixed here: cross-lingual retrieval
+# does not work on this corpus/embedder, and no NO_ANSWER_MAX_DISTANCE threshold separates this
+# failure (min distance 0.4591) from a legitimate English question (golden row 16, 0.4720) --
+# fixing that means a multilingual embedder, a full re-embed, and re-deriving the threshold from
+# scratch, none of which is in scope here. Until that lands, a confident, cited, wrong number is
+# judged worse than an honest "I can't read this" for someone who cannot easily check the English
+# sources it points at.
+#
+# THE RULE: gate a question to NO_ANSWER, before any embedding call, ONLY when it is
+# PREDOMINANTLY non-Latin -- it contains at least one non-Latin-script letter AND has no bare
+# Latin content word (an anchor like "STEM" or "OPT") anywhere in it. A mixed-script question
+# that carries such an anchor is NOT gated: this was measured, not assumed, against the one
+# genuinely ambiguous case found while building this -- a Cyrillic question, "Сколько месяцев
+# длится продление STEM OPT?", which retrieves the identical relevant chunk set (ids
+# 441/444/435/437/511/442 -- "Eligibility for the STEM OPT Extension", "STEM OPT Employer
+# Requirements and Responsibilities", "STEM OPT Extension", "When to apply", "STEM OPT
+# Extensions", "Applying for a STEM OPT Extension") at min distance 0.3461, in the same range as
+# the Chinese ("STEM OPT 延期可以延长多少个月？", min distance 0.3313) and Spanish ("¿Cuántos
+# meses dura la extensión STEM OPT?", min distance 0.3385) mixed-script questions this project
+# already relies on working, and comfortably inside the in-domain control range (0.1563-0.3814)
+# that calibrates NO_ANSWER_MAX_DISTANCE. So the Cyrillic-plus-anchor case is treated as a mixed
+# question like the other two, not gated -- one bare Latin anchor is enough, and is treated the
+# same way regardless of which script surrounds it; this is not special-cased per language.
+#
+# WHY SCRIPT, NOT DISTANCE: distance already failed to separate the real incident above from a
+# real English question. Script is available before any embedding call is even made, and does
+# not touch NO_ANSWER_MAX_DISTANCE itself, which is out of scope for this change.
+#
+# WHAT THIS DOES NOT CATCH, MEASURED AND REPORTED SEPARATELY, NOT SILENTLY: Spanish and French
+# written with no Latin loanword at all are still Latin-script, so `_has_non_latin_letter` is
+# False for either and this gate never fires for them. Whether either produces the same
+# confident-wrong-number failure as Korean was measured directly against production and reported
+# in this change's own session output / phase report rather than assumed either way; this gate
+# was NOT extended to Latin-script languages, on instruction, regardless of that result.
+#
+# REMOVE THIS WHEN: cross-lingual retrieval is good enough that NO_ANSWER_MAX_DISTANCE (or
+# whatever threshold replaces it) separates a real non-Latin question from an unanswerable one on
+# its own, the way it already does for English. At that point, this whole block plus the three
+# helper functions below plus the "non_latin_script_unsupported" refusal_reason and the call site
+# in answer_question should all come out together, in one commit -- nothing downstream depends on
+# this existing once distance alone can do the job.
+# ============================================================================================
+
+
+def _is_latin_letter(ch: str) -> bool:
+    """True if `ch` is an alphabetic character from the Latin script -- plain ASCII letters, or
+    an accented/extended Latin letter such as the "n" in "año" or the "e" in "extensión". Used to
+    decide whether a single content WORD counts as a Latin anchor, not whether the question AS A
+    WHOLE is Latin-script -- see _is_predominantly_non_latin below, which is the function that
+    combines this with a full-question script check.
+    """
+    if not ch.isalpha():
+        return False
+    if ch.isascii():
+        return True
+    return unicodedata.name(ch, "").startswith("LATIN")
+
+
+def _has_non_latin_letter(question: str) -> bool:
+    """True if `question` contains at least one alphabetic character from a script other than
+    Latin: Hangul, Han ideographs, Hiragana/Katakana, Devanagari, Arabic, Cyrillic, Thai, and any
+    other non-Latin script. A coarse, purely mechanical Unicode-name check -- it answers "is
+    there a non-Latin letter here", never "what language is this".
+    """
+    return any(ch.isalpha() and not _is_latin_letter(ch) for ch in question)
+
+
+def _is_predominantly_non_latin(question: str) -> bool:
+    """True if `question` should be gated by the stopgap above: it contains a non-Latin letter
+    AND has essentially no Latin content word for retrieval to key off. "Essentially no" is
+    implemented as exactly zero -- `content_words` (app/guardrails/clarifier.py's own whitespace-
+    tokenized, stopword-stripped content-word extraction, reused here rather than a second
+    tokenizer) is scanned for any word containing even one Latin letter; "STEM", "OPT", and any
+    other bare Latin/English loanword all count. See the STOPGAP comment above for the measured
+    evidence behind fixing this at zero rather than some higher count.
+    """
+    if not _has_non_latin_letter(question):
+        return False
+    return not any(_is_latin_letter(ch) for word in content_words(question) for ch in word)
 
 
 def _blocked_message_for_reason(reason: str | None) -> str:
@@ -255,6 +385,33 @@ async def answer_question(
                 refusal_reason="query_too_vague",
             )
 
+        # --- Step 1.5 (STOPGAP, 2026-09-08): non-Latin-script no-answer gate. Must not touch
+        # --- pool or embedder at all if it fires -- same "no embedding call, no database query"
+        # --- property as the clarify path directly above, and for the same reason: there is
+        # --- nothing to retrieve against yet, so nothing should be spent trying. See the large
+        # --- comment above _is_predominantly_non_latin (this module, just above answer_question)
+        # --- and docs/adr/0018-non-latin-script-no-answer-stopgap.md for the full record of what
+        # --- this trades, why it exists, and the exact condition for removing it.
+        non_latin = _is_predominantly_non_latin(question)
+        classify_span.set_attribute("non_latin_script_gate_triggered", non_latin)
+        if non_latin:
+            classify_span.set_attribute("response_type", ResponseType.NO_ANSWER.value)
+            await _emit({"event": "stage", "stage": "classify", "status": "done"})
+            # Reuses ResponseType.NO_ANSWER rather than adding a sixth response type -- same
+            # reasoning as the daily generation budget cap further down (see
+            # _BUDGET_EXCEEDED_MESSAGE's own comment): a new enum member would require
+            # eval/run.py's closed response_type -> refusal mapping to learn about it too, and
+            # this project's scope for that file is read-only. refusal_reason=
+            # "non_latin_script_unsupported" is what actually distinguishes this from a real
+            # "sources don't cover it" NO_ANSWER for anything that inspects the reason rather than
+            # just the coarse type (see services/frontend/components/Message.tsx's NoAnswer,
+            # which selects different handoff copy by this exact string).
+            return _empty_response(
+                answer=_NON_LATIN_UNSUPPORTED_MESSAGE,
+                response_type=ResponseType.NO_ANSWER,
+                refusal_reason="non_latin_script_unsupported",
+            )
+
         # --- Step 2: classify advice vs. information. Sees only the question text. Routed to
         # --- `classifier_llm` when the caller provided one (app/main.py builds this once at
         # --- startup from Settings.CLASSIFIER_LLM_PROVIDER/MODEL -- see
@@ -279,6 +436,7 @@ async def answer_question(
         retrieve_span.set_attribute("retrieval_mode", "hybrid_rrf")
         retrieve_span.set_attribute("rrf_k", settings.RRF_K)
         retrieve_span.set_attribute("candidate_pool", settings.HYBRID_CANDIDATE_POOL)
+        retrieve_span.set_attribute("dated_rule_companions", settings.DATED_RULE_COMPANIONS)
         [query_embedding] = await embedder.embed([question])
 
         # --- Step 3.5 (Phase 8 round 3): semantic cache lookup, using the SAME embedding just
@@ -332,6 +490,7 @@ async def answer_question(
             settings.RETRIEVAL_TOP_K,
             rrf_k=settings.RRF_K,
             candidate_pool=settings.HYBRID_CANDIDATE_POOL,
+            dated_rule_companions=settings.DATED_RULE_COMPANIONS,
         )
         retrieve_span.set_attribute("result_count", len(chunks))
         retrieve_span.set_attribute(
@@ -346,6 +505,10 @@ async def answer_question(
             "both_arms_hits",
             sum(1 for c in chunks if c.semantic_rank is not None and c.keyword_rank is not None),
         )
+        retrieve_span.set_attribute(
+            "dated_companion_count",
+            sum(1 for c in chunks if c.retrieved_by == "dated_companion"),
+        )
         top1_distance = chunks[0].distance if chunks else None
         # The no-answer gate asks "is anything I am about to hand the generator actually
         # relevant", so it gates on the MINIMUM distance across every retrieved chunk, not on
@@ -354,7 +517,15 @@ async def answer_question(
         # the RRF-top-1 chunk sits at distance 0.3311 while the closest retrieved chunk is 0.1926.
         # top1_distance is still recorded on the span for visibility, but min_distance is what the
         # gate below compares against the threshold.
-        min_distance = min((c.distance for c in chunks), default=None)
+        #
+        # Dated-rule companions (app/db.py's `companions` CTE, Settings.DATED_RULE_COMPANIONS,
+        # docs/adr/0019-dated-rule-companion-retrieval.md) are excluded from this minimum: a
+        # companion is admitted because a dated rule is already in play, not because it is
+        # relevant to THIS question, so it must never be able to flip a genuine NO_ANSWER into an
+        # answer. Restricting to retrieved_by == "fusion" reproduces exactly today's set whenever
+        # companions are off (DATED_RULE_COMPANIONS=0) or none were returned.
+        fusion_chunks = [c for c in chunks if c.retrieved_by == "fusion"]
+        min_distance = min((c.distance for c in fusion_chunks), default=None)
         # -1.0 is a sentinel meaning "no chunks at all", not a real distance (cosine distance is
         # always >= 0); OTel span attributes cannot be None.
         retrieve_span.set_attribute(
@@ -580,7 +751,27 @@ async def answer_question(
     # or after the DSO redirect makes no difference, since that sentence never carries a bracket.
     # Reused from app/guardrails/citations.py rather than re-implemented here, per that module's
     # own docstring ("the same convention eval/run.py's own parse_cited_indices uses").
-    freshness = build_freshness(chunks, today=today, cited_indices=parse_cited_indices(answer_text))
+    cited_indices = parse_cited_indices(answer_text)
+    freshness = build_freshness(chunks, today=today, cited_indices=cited_indices)
+
+    # Temporal qualification guard (app/guardrails/temporal.py): inserts a date-qualifying sentence
+    # immediately after any sentence that states a future-dated rule's figure with no date attached.
+    # Called HERE, in this exact spot, for two reasons: (1) it runs AFTER cited_indices was computed
+    # just above, so this insertion provably cannot affect what step 7's verify_citations already
+    # checked; (2) it runs BEFORE the freshness notice is appended just below, so the guard only
+    # ever scans generated prose, never the system-appended notice text -- a check of the shape
+    # "does answer_text contain the effective date anywhere" would trivially pass on every input
+    # once the notice (which always carries the date) is already present, and detect nothing (see
+    # that module's own docstring).
+    qualification = qualify_future_dated_figures(answer_text, chunks, today=today)
+    trace.get_current_span().set_attribute(
+        "temporal_qualification_fired", qualification.insertion_count > 0
+    )
+    trace.get_current_span().set_attribute(
+        "temporal_qualification_insertions", qualification.insertion_count
+    )
+    answer_text = qualification.text
+
     notice_text = freshness_notice_text(freshness.notices)
     if notice_text:
         answer_text = f"{answer_text}\n\n{notice_text}"

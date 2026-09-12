@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import httpx
 import psycopg
@@ -147,6 +147,22 @@ async def test_corpus_version_changes_when_a_source_is_reindexed(pool, database_
     finally:
         await _delete_test_rows(write_conn, source_url)
         await write_conn.close()
+
+
+async def test_corpus_version_differs_across_dates_for_an_unchanged_corpus(pool):
+    """The cache staleness fix: date-derived text baked into a cached `answer_text` (the freshness
+    notice's own "takes effect on"/"took effect on" wording, and app/guardrails/temporal.py's
+    inserted qualifying sentence) must never be served past the day it was computed for -- see
+    app/cache.py's own module docstring, "WHY A DATE IS PART OF THIS". This varies ONLY the `today`
+    passed to `corpus_version` -- the corpus itself (whatever `sources`/`documents` already hold in
+    this pool) is never touched, so a difference here can only come from the date component.
+    """
+    version_day_one = await cache.corpus_version(pool, today=date(2026, 9, 11))
+    version_day_two = await cache.corpus_version(pool, today=date(2026, 9, 16))
+
+    assert version_day_one is not None
+    assert version_day_two is not None
+    assert version_day_one != version_day_two
 
 
 # =================================================================================================

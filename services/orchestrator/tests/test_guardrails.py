@@ -20,18 +20,27 @@ down.
 
 import json
 import os
-from datetime import date
+import re
+from datetime import date, timedelta
 
 import pytest
+from psycopg.rows import dict_row
+from test_freshness import _make_chunk
 
 import app.pipeline as pipeline_module
 from app.config import Settings, get_settings
-from app.db import hybrid_search, make_pool
+from app.db import RetrievedChunk, hybrid_search, make_pool
 from app.guardrails.authority import AUTHORITY_PREDICATE_LABELS, verify_no_authority_claim
-from app.guardrails.citations import VerificationResult, verify_citations
+from app.guardrails.citations import VerificationResult, parse_cited_indices, verify_citations
 from app.guardrails.clarifier import CLARIFY_QUESTION, is_too_vague
 from app.guardrails.classifier import ADVICE_PATTERNS, classify_advice, rule_based_advice_signal
-from app.pipeline import _DSO_REDIRECT_SENTENCE, answer_question
+from app.guardrails.temporal import (
+    _extract_figures,
+    _future_only_figures,
+    _split_sentences_with_separators,
+    qualify_future_dated_figures,
+)
+from app.pipeline import _DSO_REDIRECT_SENTENCE, _is_predominantly_non_latin, answer_question
 from app.prompts import (
     REFUSAL_SYSTEM_PROMPT,
     REFUSAL_SYSTEM_PROMPT_VERSION,
@@ -833,6 +842,477 @@ def test_format_context_two_chunks_only_the_dated_one_gets_a_note():
     )
 
 
+# --- A currency-marker fix (2026-09-11) was tried and reverted: it appended a second sentence to
+# --- `_rule_date_note` right next to the existing "takes effect on <date>" note, when a
+# --- future-dated passage's own content used the present tense ("now"). Measured against a
+# --- pre-declared acceptance target of 9/9 real generations stating both rules with the effective
+# --- date in the prose, it scored 3/9 and was removed -- see app/guardrails/temporal.py for the
+# --- sentence-scoped guard that replaced this approach, and app/prompts.py's `_rule_date_note` for
+# --- the reverted (two-branch, date-only) function this fix used to extend. The two tests below
+# --- survive the revert as plain regression guards: a passage whose own content happens to contain
+# --- "now" must still render exactly the same "took effect on"/"takes effect on" note as any other
+# --- dated passage, nothing more.
+
+_CURRENCY_SENTENCE = (
+    'This passage is written as though that rule is already in force. Where it says "now", '
+    "it means on and after September 15, 2026, not today, September 11, 2026."
+)
+
+
+def test_format_context_currency_marker_present_past_date_gets_no_new_sentence():
+    """A past-dated passage's own "now" is simply correct, so the "took effect" branch renders
+    exactly as it always has -- no new sentence, even though the content contains "now"."""
+    chunks = [
+        {
+            "content": "F students now have 30 days to depart the United States.",
+            "citation_url": "https://example.gov/a",
+            "rule_effective_date": date(2026, 9, 15),
+        }
+    ]
+    rendered = format_context(chunks, today=date(2026, 9, 16))
+    assert rendered == (
+        "[1] Source: https://example.gov/a\n"
+        "This passage describes a rule that took effect on September 15, 2026 "
+        "(on or before today, September 16, 2026).\n"
+        "F students now have 30 days to depart the United States."
+    )
+    assert _CURRENCY_SENTENCE not in rendered
+
+
+def test_format_context_currency_marker_present_date_is_today_gets_no_new_sentence():
+    """`rule_effective_date == today` also takes the "took effect" branch (rule_effective_date <=
+    today), so this is the "is today" half of the "past or is today" case -- no new sentence."""
+    chunks = [
+        {
+            "content": "F students now have 30 days to depart the United States.",
+            "citation_url": "https://example.gov/a",
+            "rule_effective_date": date(2026, 9, 15),
+        }
+    ]
+    rendered = format_context(chunks, today=date(2026, 9, 15))
+    assert rendered == (
+        "[1] Source: https://example.gov/a\n"
+        "This passage describes a rule that took effect on September 15, 2026 "
+        "(on or before today, September 15, 2026).\n"
+        "F students now have 30 days to depart the United States."
+    )
+    assert _CURRENCY_SENTENCE not in rendered
+
+
+def test_format_context_future_dated_passage_without_marker_gets_only_the_existing_note():
+    """Future-dated, but the content never says "now": the existing one-sentence note only, byte-
+    identical to before this fix."""
+    chunks = [
+        {
+            "content": "The departure period will be shortened for F students.",
+            "citation_url": "https://example.gov/a",
+            "rule_effective_date": date(2026, 9, 15),
+        }
+    ]
+    rendered = format_context(chunks, today=date(2026, 9, 11))
+    assert rendered == (
+        "[1] Source: https://example.gov/a\n"
+        "This passage describes a rule that takes effect on September 15, 2026 "
+        "(after today, September 11, 2026).\n"
+        "The departure period will be shortened for F students."
+    )
+
+
+# --- Temporal qualification guard (app/guardrails/temporal.py): replaces the currency-marker fix
+# --- above. Instead of relying on the model to read a note printed above the passage, this guard
+# --- inserts a date-qualifying sentence directly after any SENTENCE of the GENERATED answer that
+# --- states a future-dated rule's figure with no date attached -- see that module's own docstring
+# --- for the full algorithm and why it has to be sentence-scoped. ---
+
+_TODAY = date(2026, 9, 11)
+_FUTURE_DATE = date(2026, 9, 15)
+
+
+def _departure_period_chunks() -> list[RetrievedChunk]:
+    """Two chunks shaped like the real corpus's departure-period pair (docs/adr/0019-dated-rule-
+    companion-retrieval.md): one stating the DHS fixed-period-of-admission rule's new 30-day figure
+    (future-dated, `_FUTURE_DATE`), one stating the still-current 60-day figure (undated). "30" is
+    FUTURE-ONLY (present only in the future chunk); "60" is not (present in the undated chunk too)
+    and must never fire.
+    """
+    return [
+        _make_chunk(
+            id=1,
+            content=(
+                "F students now have 30 days to depart the United States, a decrease from the "
+                "previous 60-day grace period."
+            ),
+            rule_effective_date=_FUTURE_DATE,
+        ),
+        _make_chunk(
+            id=2,
+            content=(
+                "F-1 students currently have 60 days to depart the United States after their "
+                "program ends."
+            ),
+            rule_effective_date=None,
+        ),
+    ]
+
+
+# The three REAL failing sentences measured in production (3 of 9 acceptance runs stated the date
+# in the prose; the other 6, including these three, did not) -- fixtured, not invented, per
+# CLAUDE.md's own instruction on this point.
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        pytest.param(
+            "The new departure period for F-1 students following the completion of their program "
+            "of study, post-completion optional practical training (OPT), or science, technology, "
+            "engineering, and mathematics (STEM) OPT is 30 days. This reduces the previous 60-day "
+            "grace period [7].",
+            id="measured-1-two-sentences-only-first-fires",
+        ),
+        pytest.param(
+            "The departure period for F-1 students is now 30 days, a decrease from the previous "
+            "60-day grace period [7].",
+            id="measured-2-now-30-days",
+        ),
+        pytest.param(
+            "A current rule requires F-1 students to depart the United States within 30 days "
+            "after their optional practical training (OPT) or STEM OPT ends, unless they apply "
+            "for an extension of stay [6].",
+            id="measured-3-current-rule-30-days",
+        ),
+    ],
+)
+def test_temporal_guard_fires_on_real_measured_failing_sentences(sentence):
+    chunks = _departure_period_chunks()
+    result = qualify_future_dated_figures(sentence, chunks, today=_TODAY)
+    assert result.insertion_count == 1, result.text
+    assert "That figure comes from a rule that takes effect on September 15, 2026." in result.text
+    assert "It is not the rule in force today, September 11, 2026." in result.text
+
+
+def test_temporal_guard_does_not_fire_when_the_sentence_already_states_the_effective_date():
+    chunks = _departure_period_chunks()
+    answer = (
+        "The departure period is 30 days, effective September 15, 2026, a decrease from the "
+        "previous 60-day grace period [7]."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 0
+    assert result.text == answer
+
+
+# --- Defect 3, measured: the corpus itself renders every dated chunk's date in ABBREVIATED form
+# --- ("Sept. 15, 2026"), never the full month name, so a model answer copying the corpus's own
+# --- wording must still be recognized as already stating the date -- for each abbreviated
+# --- rendering the corpus and a model could plausibly use. ---
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(
+            "The departure period is 30 days, effective Sept. 15, 2026, a decrease from the "
+            "previous 60-day grace period [7].",
+            id="abbreviated-with-period-and-comma",
+        ),
+        pytest.param(
+            "The departure period is 30 days, effective Sept 15 2026, a decrease from the "
+            "previous 60-day grace period [7].",
+            id="abbreviated-no-period-no-comma",
+        ),
+    ],
+)
+def test_temporal_guard_does_not_fire_when_the_sentence_states_the_date_in_abbreviated_form(
+    answer,
+):
+    chunks = _departure_period_chunks()
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 0
+    assert result.text == answer
+
+
+def test_temporal_guard_still_fires_when_the_sentence_states_a_different_date():
+    """A sentence stating September 15, 2027 -- a different year than the rule's actual September
+    15, 2026 -- must not be recognized as already stating the rule's date: the guard still fires."""
+    chunks = _departure_period_chunks()
+    answer = (
+        "The departure period is 30 days, effective September 15, 2027, a decrease from the "
+        "previous 60-day grace period [7]."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 1
+    assert "That figure comes from a rule that takes effect on September 15, 2026." in result.text
+    assert "It is not the rule in force today, September 11, 2026." in result.text
+
+
+def test_split_sentences_reunites_an_abbreviated_month_with_its_own_day_and_year():
+    """`_SENTENCE_SPLIT_RE` alone treats the period ending an abbreviated month ("Sept.") as a
+    sentence boundary, which would tear "effective Sept. 15, 2026" into "effective Sept." and "15,
+    2026, ...", separating the month from the day and year `_date_stated_pattern` needs alongside
+    it. `_split_sentences_with_separators` re-merges exactly that shape."""
+    parts = _split_sentences_with_separators(
+        "The rule takes effect Sept. 15, 2026, a decrease from the previous grace period."
+    )
+    assert parts == [
+        "The rule takes effect Sept. 15, 2026, a decrease from the previous grace period."
+    ]
+
+
+def test_split_sentences_does_not_merge_a_month_abbreviation_with_no_date_after_it():
+    """Regression guard scoping the merge above: an abbreviation ending a genuine sentence, with
+    nothing date-shaped after it, is left split exactly as `_SENTENCE_SPLIT_RE` alone would split
+    it -- the merge fires only when a digit immediately follows, never on every "Sept."."""
+    parts = _split_sentences_with_separators(
+        "This happened last Sept. The next update follows in Jan."
+    )
+    assert parts == ["This happened last Sept.", " ", "The next update follows in Jan."]
+
+
+def test_temporal_guard_does_not_fire_when_the_figure_appears_in_both_a_dated_and_undated_chunk():
+    chunks = [
+        _make_chunk(
+            id=1,
+            content="F students now have 30 days to depart the United States.",
+            rule_effective_date=_FUTURE_DATE,
+        ),
+        _make_chunk(
+            id=2,
+            content="Some F-1 students already have 30 days to depart under a separate rule.",
+            rule_effective_date=None,
+        ),
+    ]
+    answer = "F students now have 30 days to depart the United States [1]."
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 0
+    assert result.text == answer
+
+
+def test_temporal_guard_does_not_fire_when_no_chunk_is_future_dated():
+    chunks = [
+        _make_chunk(id=1, content="Students have 30 days to depart.", rule_effective_date=None)
+    ]
+    answer = "Students have 30 days to depart [1]."
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 0
+    assert result.text == answer
+
+
+def test_temporal_guard_inserted_sentence_carries_no_citation_bracket():
+    chunks = _departure_period_chunks()
+    answer = (
+        "The departure period for F-1 students is now 30 days, a decrease from the previous "
+        "60-day grace period [7]."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 1
+    inserted = result.text[len(answer) :].strip()
+    assert inserted.startswith("That figure comes from a rule that takes effect on")
+    assert "[" not in inserted
+    assert "]" not in inserted
+    assert parse_cited_indices(inserted) == set()
+
+
+def test_temporal_guard_does_not_change_cited_indices():
+    chunks = _departure_period_chunks()
+    answer = (
+        "A current rule requires F-1 students to depart the United States within 30 days after "
+        "their optional practical training (OPT) or STEM OPT ends, unless they apply for an "
+        "extension of stay [6]."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 1
+    assert parse_cited_indices(result.text) == parse_cited_indices(answer)
+
+
+# --- Figure extraction exclusions (app/guardrails/temporal.py::_extract_figures) -- each needs its
+# --- own test, per the exact instruction this guard was built against. ---
+
+
+def test_extract_figures_excludes_a_citation_bracket_digit():
+    assert _extract_figures("The rule is stated clearly [7], with nothing else numeric.") == set()
+    assert _extract_figures("Two claims cited together [1, 3].") == set()
+
+
+def test_extract_figures_excludes_form_numbers():
+    assert _extract_figures("File Form I-765, I-20, I-983, or I-94, whichever applies.") == set()
+
+
+def test_extract_figures_excludes_a_visa_category_shaped_like_a_form_number():
+    assert _extract_figures("An H-1B petition is filed by the employer.") == set()
+
+
+def test_extract_figures_excludes_bare_four_digit_years():
+    assert _extract_figures("The rule was proposed in 2025 and takes effect in 2026.") == set()
+
+
+def test_extract_figures_excludes_a_rendered_dates_own_digits():
+    assert _extract_figures("The rule takes effect on September 15, 2026.") == set()
+
+
+def test_extract_figures_still_extracts_a_real_figure_alongside_every_exclusion():
+    text = "Students have 30 days [7], per Form I-765, effective September 15, 2026, not 2025."
+    assert _extract_figures(text) == {"30"}
+
+
+# --- Defect 1, measured directly on the live corpus (`SELECT id, rule_effective_date FROM
+# --- documents WHERE rule_effective_date IS NOT NULL`): every dated chunk renders its date in
+# --- ABBREVIATED form -- 'Sept. 15, 2026' (chunks 662, 667-670, 707) and 'Nov. 14, 2030' (668,
+# --- 711) among them -- never the full month name. Before the fix, `_DATE_PHRASE_RE` matched
+# --- neither, so the day and year digits leaked through as ordinary figures. ---
+
+
+def test_extract_figures_excludes_an_abbreviated_dates_own_digits_but_keeps_a_real_figure():
+    text = (
+        "Students now have 30 days, a decrease from the previous 60 days, effective "
+        "Sept. 15, 2026."
+    )
+    assert _extract_figures(text) == {"30", "60"}
+
+
+def test_extract_figures_excludes_a_second_abbreviated_dates_own_digits():
+    text = "The transition period for this rule ends Nov. 14, 2030, after which it is permanent."
+    assert _extract_figures(text) == set()
+
+
+# --- Defect 2, measured directly on the live corpus (chunks 675/676): a markdown link's URL is
+# --- preserved verbatim in chunk content, and a hostname digit inside it (i94.cbp.dhs.gov's "94")
+# --- is not a form number -- Form I-94 in the surrounding prose IS already excluded by
+# --- `_FORM_NUMBER_RE`, but the "94" inside the URL itself was leaking through as a bare
+# --- figure. ---
+
+
+def test_extract_figures_excludes_digits_inside_a_url_but_keeps_a_real_figure():
+    text = (
+        "The AUD will be on the student's Form I-94, accessible from the "
+        "[Form I-94 website](https://i94.cbp.dhs.gov/home). Students must depart within 30 days."
+    )
+    assert _extract_figures(text) == {"30"}
+
+
+# --- Defect 3, measured directly on the live corpus (chunk 444, "STEM OPT Employer Requirements
+# --- and Responsibilities"): the "Last Reviewed/Updated: 01/30/2026" footer ingestion preserves
+# --- verbatim. Chunk 444 is UNDATED (no rule_effective_date) and is retrieved for the ladder query
+# --- "How long do I have to leave the US after OPT ends?" -- before this fix, its footer's "30"
+# --- disqualified the real future-only "30" (the 30-day post-OPT departure period under the Sept.
+# --- 15, 2026 rule) from ever firing, because a figure found in any undated/past-dated chunk is
+# --- never future-only (ALGORITHM step 1). This footer shape is CORPUS-WIDE, not specific to chunk
+# --- 444: chunks 439, 492, 515, 600, and 660 each carry the same "Last Reviewed/Updated:" /
+# --- "Updated:" footer with their own MM/DD/YYYY date. ---
+
+
+def test_extract_figures_excludes_a_numeric_dates_own_digits_but_keeps_a_real_figure():
+    # Chunk 444's own footer, verbatim.
+    text = (
+        "Students must depart the United States within 30 days of the program end date.\n\n"
+        "Last Reviewed/Updated:\n\n01/30/2026"
+    )
+    assert _extract_figures(text) == {"30"}
+
+
+def test_extract_figures_excludes_a_two_digit_year_numeric_dates_own_digits():
+    # Same footer shape, one-digit month/day and a two-digit year (M/D/YY) -- not itself measured
+    # on the live corpus (every dated footer there uses a four-digit year), but the same US
+    # government page convention the fix is asked to cover.
+    text = "Last Reviewed/Updated: 3/5/26 -- students have 60 days to comply."
+    assert _extract_figures(text) == {"60"}
+
+
+def test_extract_figures_does_not_swallow_a_single_slash_ratio_that_is_not_a_date():
+    # Negative control: the OPT / STEM OPT cumulative unemployment limit this corpus states as a
+    # table ("Up to 90 days" / "For a total of...150 days" -- chunks 512 and 443) is commonly
+    # shorthanded as "the 90/150 day rule". It has the same "digits, slash, digits" surface shape a
+    # numeric date's own number groups have, but only ONE slash (two number groups, not three), so
+    # `_NUMERIC_DATE_RE` (which requires two slashes to match at all) must not touch it -- both "90"
+    # and "150" are real figures, not leftover date fragments.
+    text = "The cumulative unemployment limit during OPT and STEM OPT is the 90/150 day rule."
+    assert _extract_figures(text) == {"90", "150"}
+
+
+# --- full_corpus: an independent regression guard for Defects 1, 2, and 3 above, run against the
+# --- live corpus rather than a fixtured chunk. Uses its OWN, independently-defined "looks like a
+# --- date phrase", "looks like a URL", and "looks like a numeric date" shapes -- generic patterns,
+# --- not temporal.py's own `_DATE_PHRASE_RE`/`_MONTH_ABBREVIATIONS`/`_URL_RE`/`_NUMERIC_DATE_RE` --
+# --- so a blind spot shared by both this test and the module under test cannot hide from it the
+# --- way the abbreviated-month blind spot hid from `_extract_figures` before that fix. Every
+# --- expectation (which figures are future-only, which chunks, which dates) is derived from the
+# --- live corpus itself: no figure, chunk id, or date is hardcoded. ---
+
+# A generic "<word>[.]? <day>[,]? <year>" shape -- any 3-9 letter word (not specifically a month
+# name) followed by an optional period, a 1-2 digit day, an optional comma, and a 4-digit year.
+# Deliberately broader and independent of temporal.py's own month-name lists.
+_TEST_DATE_PHRASE_SHAPE_RE = re.compile(r"\b[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}\b")
+_TEST_URL_SHAPE_RE = re.compile(r"https?://\S+")
+
+# A generic "<n>/<n>/<n>" numeric-date shape -- a 1-4 digit run, a slash, a 1-4 digit run, a slash,
+# a 1-4 digit run. Deliberately broader than temporal.py's own `_NUMERIC_DATE_RE` (which anchors the
+# first two groups to 1-2 digits and the last to exactly 2 or 4), so a blind spot in this test's own
+# regex construction cannot coincide with a blind spot in the module under test.
+_TEST_NUMERIC_DATE_SHAPE_RE = re.compile(r"\b\d{1,4}/\d{1,4}/\d{1,4}\b")
+
+
+@pytest.mark.full_corpus
+async def test_no_future_only_figure_is_confined_to_a_date_or_url_span_in_the_live_corpus(pool):
+    """Across every chunk in the live corpus, a figure `_future_only_figures` (app/guardrails/
+    temporal.py) treats as future-only must have at least one occurrence, in the future-dated
+    chunk(s) it came from, that sits OUTSIDE a date-phrase-shaped span, a URL-shaped span, and a
+    numeric-date-shaped span. A figure with EVERY occurrence confined to one of those spans is a
+    leftover digit fragment (a date's own day/year/numeric form, or a URL's hostname digits), not a
+    real rule figure -- exactly the shape of all three defects this module was fixed for.
+    """
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("SELECT id, content, rule_effective_date FROM documents")
+            rows = await cur.fetchall()
+    assert rows, "expected the live corpus to have rows"
+
+    dated_rows = [row for row in rows if row["rule_effective_date"] is not None]
+    assert dated_rows, "expected at least one dated chunk in the live corpus"
+
+    # Derived from the data, not hardcoded to any one rule's date: one day before the earliest
+    # rule_effective_date actually present, so every dated chunk in this corpus counts as
+    # future-only-eligible regardless of the wall-clock date this test happens to run on.
+    today = min(row["rule_effective_date"] for row in dated_rows) - timedelta(days=1)
+
+    chunks = [
+        _make_chunk(
+            id=row["id"], content=row["content"], rule_effective_date=row["rule_effective_date"]
+        )
+        for row in rows
+    ]
+    future_only = _future_only_figures(chunks, today=today)
+    assert future_only, "expected at least one future-only figure on the live corpus"
+
+    future_dated_contents = [
+        row["content"] for row in dated_rows if row["rule_effective_date"] > today
+    ]
+
+    for figure, dates in future_only.items():
+        figure_re = re.compile(r"\b" + re.escape(figure) + r"\b")
+        free_standing_occurrence_found = False
+        for content in future_dated_contents:
+            excluded_spans = [
+                (m.start(), m.end())
+                for regex in (
+                    _TEST_DATE_PHRASE_SHAPE_RE,
+                    _TEST_URL_SHAPE_RE,
+                    _TEST_NUMERIC_DATE_SHAPE_RE,
+                )
+                for m in regex.finditer(content)
+            ]
+            for match in figure_re.finditer(content):
+                if not any(
+                    start <= match.start() and match.end() <= end for start, end in excluded_spans
+                ):
+                    free_standing_occurrence_found = True
+                    break
+            if free_standing_occurrence_found:
+                break
+        assert free_standing_occurrence_found, (
+            f"figure {figure!r} (future-only via rule date(s) {sorted(dates)}) has every "
+            "occurrence in its source chunk(s) confined inside a date phrase or a URL -- it is a "
+            "leftover digit fragment, not a real rule figure"
+        )
+
+
 def test_build_user_prompt_default_today_still_works_for_a_caller_with_no_dated_chunks():
     """Backward-compat regression: tests/test_stub_providers.py calls build_user_prompt with no
     `today` argument at all, and none of its fixture chunks ever carry a rule_effective_date -- the
@@ -880,6 +1360,17 @@ def test_prompt_version_is_deterministic():
 def test_the_two_system_prompts_have_different_versions():
     # Sanity check against a copy-paste mistake making both constants point at the same text.
     assert SYSTEM_PROMPT_VERSION != REFUSAL_SYSTEM_PROMPT_VERSION
+
+
+def test_system_prompt_versions_are_pinned():
+    # Pinned literals (verified against a Docker image built before the currency-marker fix, and
+    # since that fix's own revert, against app/prompts.py as it stands now -- SYSTEM_PROMPT and
+    # REFUSAL_SYSTEM_PROMPT have not changed text since either point). This is an independent guard
+    # against anyone editing the system prompts without meaning to: `_prompt_version` is a content
+    # hash (see app/prompts.py), so any edit to either prompt's text -- however small -- moves its
+    # hash and fails this test, which is the point.
+    assert SYSTEM_PROMPT_VERSION == "af1b88eeb3bf"
+    assert REFUSAL_SYSTEM_PROMPT_VERSION == "c5934a0286ca"
 
 
 # --- Supplementary: programmatic citation verification (app/guardrails/citations.py) ---
@@ -1109,6 +1600,158 @@ def test_clarifier_still_flags_original_ascii_vague_queries_after_the_fix():
         assert is_too_vague(question) is True
 
 
+# --- STOPGAP (2026-09-08): non-Latin-script no-answer gate (app/pipeline.py::
+# --- _is_predominantly_non_latin). See the large comment above that function in app/pipeline.py
+# --- and docs/adr/0018-non-latin-script-no-answer-stopgap.md for the full record of what this
+# --- trades and why. This is a DIFFERENT check from the clarifier above: the clarifier asks "is
+# --- there enough content to retrieve against at all" (script-aware since ADR 0017) and a pure
+# --- non-Latin question can genuinely pass it -- "我的实习工作许可可以延长多少个月？" is a real,
+# --- specific question, not a vague one. This gate asks a narrower question on top of that: "is
+# --- this question in a script the tool cannot reliably retrieve against AT ALL", regardless of
+# --- how specific it is, and routes it to NO_ANSWER instead of risking a confident wrong answer.
+
+# MUST GATE: pure non-Latin script, no bare Latin content word anywhere, retrieval on this
+# corpus/embedder is not reliable for these (see docs/adr/0017-non-latin-script-clarifier-fix.md's
+# own downstream measurement table, and the live incident this stopgap exists to close).
+_MUST_GATE_NON_LATIN = [
+    pytest.param("옵티 연장은 몇 개월인가요?", id="korean-real-production-incident"),
+    pytest.param("我的实习工作许可可以延长多少个月？", id="chinese-pure-no-latin-anchor"),
+    pytest.param("एसटीईएम ओपीटी एक्सटेंशन कितने महीने का होता है?", id="hindi-pure-no-latin-anchor"),
+    pytest.param(
+        "كم عدد الأشهر التي يستغرقها تمديد التدريب العملي؟", id="arabic-pure-no-latin-anchor"
+    ),
+    pytest.param("私の就労許可は何ヶ月延長できますか？", id="japanese-pure-no-latin-anchor"),
+    pytest.param("ใบอนุญาตทำงานของฉันขยายได้กี่เดือน", id="thai-pure-no-latin-anchor"),
+]
+
+
+@pytest.mark.parametrize("question", _MUST_GATE_NON_LATIN)
+def test_gate_fires_on_pure_non_latin_questions(question):
+    assert _is_predominantly_non_latin(question) is True
+
+
+# MUST NOT GATE: either plain English, or a non-Latin script carrying a bare Latin anchor
+# ("STEM OPT") that this project measured retrieves the correct chunk set regardless of which
+# script surrounds it -- see the STOPGAP comment in app/pipeline.py for the exact measured
+# distances (Chinese 0.3313, Spanish 0.3385, Cyrillic 0.3461, all against the same relevant
+# STEM-OPT-extension chunk set).
+_MUST_NOT_GATE_MIXED_OR_LATIN = [
+    pytest.param(
+        "STEM OPT 延期可以延长多少个月？", id="chinese-mixed-with-latin-anchor-already-working"
+    ),
+    pytest.param(
+        "¿Cuántos meses dura la extensión STEM OPT?", id="spanish-mixed-with-latin-anchor"
+    ),
+    pytest.param(
+        "Сколько месяцев длится продление STEM OPT?",
+        id="cyrillic-mixed-with-latin-anchor-measured-working",
+    ),
+]
+
+
+@pytest.mark.parametrize("question", _MUST_NOT_GATE_MIXED_OR_LATIN)
+def test_gate_does_not_fire_on_mixed_script_questions_with_a_latin_anchor(question):
+    assert _is_predominantly_non_latin(question) is False
+
+
+def test_gate_does_not_fire_on_any_golden_question():
+    """Every one of eval/golden.jsonl's 21 real questions is plain English -- see
+    tests/test_guardrails.py's earlier corpus-trap comments for why golden.jsonl cannot itself
+    exercise a non-Latin path. This asserts the negative directly: the stopgap must never fire on
+    a real, answerable English question.
+    """
+    from eval.run import load_golden_set
+
+    rows = load_golden_set()
+    assert len(rows) == 21
+    for row in rows:
+        assert (
+            _is_predominantly_non_latin(row["question"]) is False
+        ), f"golden row {row['question']!r} was wrongly gated as non-Latin"
+
+
+@pytest.mark.parametrize("question", ["help", "opt?", "i have a question", "visa"])
+def test_gate_does_not_fire_on_the_existing_vague_english_controls(question):
+    assert _is_predominantly_non_latin(question) is False
+
+
+# --- End-to-end, through answer_question: the gate must fire BEFORE the clarifier's own vague
+# --- check has a chance to matter for a pure non-Latin question, must never touch pool/embedder
+# --- (same property the CLARIFY path already has, see test_vague_query_returns_clarify_without_
+# --- retrieving above), and must carry the honest refusal_reason and empty citations/contexts.
+
+
+async def test_non_latin_gate_returns_no_answer_without_retrieving():
+    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+    response = await answer_question(
+        "옵티 연장은 몇 개월인가요?",
+        pool=ExplodingPool(),
+        embedder=ExplodingEmbedder(),
+        llm=ExplodingLLM(),
+        settings=settings,
+    )
+    assert response.response_type == ResponseType.NO_ANSWER.value
+    assert response.refusal_reason == "non_latin_script_unsupported"
+    assert response.citations == []
+    assert response.contexts == []
+    assert "english" in response.answer.lower()
+    assert (
+        "dso" in response.answer.lower() or "designated school official" in response.answer.lower()
+    )
+
+
+async def test_specific_non_latin_question_is_still_gated_though_clarifier_alone_would_pass_it():
+    """Distinguishes this gate from the clarifier above: "我的实习工作许可可以延长多少个月？" is a
+    real, specific question that ADR 0017's own fix deliberately lets past the clarifier (see
+    test_clarifier_does_not_flag_real_non_latin_questions). This stopgap still routes it to
+    NO_ANSWER -- being specific enough to retrieve against is not the same thing as being in a
+    script this corpus/embedder can retrieve against reliably.
+    """
+    assert is_too_vague("我的实习工作许可可以延长多少个月？") is False
+    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+    response = await answer_question(
+        "我的实习工作许可可以延长多少个月？",
+        pool=ExplodingPool(),
+        embedder=ExplodingEmbedder(),
+        llm=ExplodingLLM(),
+        settings=settings,
+    )
+    assert response.response_type == ResponseType.NO_ANSWER.value
+    assert response.refusal_reason == "non_latin_script_unsupported"
+
+
+async def test_vague_non_latin_query_still_clarifies_ahead_of_the_non_latin_gate():
+    """Ordering guarantee: step 1 (clarify) runs before step 1.5 (this gate), so a query that is
+    BOTH vague AND non-Latin still gets CLARIFY, not NO_ANSWER -- the same one-clarifying-question
+    behavior test_clarifier_still_flags_genuinely_vague_non_latin_queries already asserts at the
+    clarifier level, checked here end to end through the whole pipeline.
+    """
+    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+    response = await answer_question(
+        "도와주세요",  # Korean "please help" -- vague, and non-Latin, and has no Latin anchor
+        pool=ExplodingPool(),
+        embedder=ExplodingEmbedder(),
+        llm=ExplodingLLM(),
+        settings=settings,
+    )
+    assert response.response_type == ResponseType.CLARIFY.value
+    assert response.refusal_reason == "query_too_vague"
+
+
+async def test_mixed_script_question_with_latin_anchor_reaches_retrieval_not_the_gate(
+    pool, embedder, llm, settings
+):
+    """The gate must not fire on a mixed-script question carrying a Latin anchor -- it must reach
+    retrieval and generate exactly as an equivalent English question would (proven here by NOT
+    using Exploding* fakes: if the gate wrongly fired, `refusal_reason` would be
+    "non_latin_script_unsupported" instead of whatever the real pipeline produces).
+    """
+    response = await answer_question(
+        "STEM OPT 延期可以延长多少个月？", pool=pool, embedder=embedder, llm=llm, settings=settings
+    )
+    assert response.refusal_reason != "non_latin_script_unsupported"
+
+
 # --- full_corpus: calibrates NO_ANSWER_MAX_DISTANCE against the live 216-chunk corpus and the
 # --- real nomic-embed-text embeddings. Requires the real corpus (python -m app.ingest,
 # --- INGEST_MODE=fetch) and a reachable Ollama -- never runs against the fixture corpus or the
@@ -1120,9 +1763,16 @@ async def test_no_answer_threshold_separates_control_queries_on_the_live_corpus(
     """14 control queries, none drawn from eval/golden.jsonl: 7 in-domain-but-not-golden questions
     about F-1/OPT/STEM OPT/H-1B topics this corpus covers, phrased differently from any golden row,
     and 7 deliberately off-topic questions with nothing to do with immigration. Gates on the
-    MINIMUM distance across all retrieved chunks, matching app/pipeline.py -- not the RRF-top-1
-    chunk's own distance, which is a noisier, fused-rank quantity (see
-    Settings.NO_ANSWER_MAX_DISTANCE's comment in app/config.py).
+    MINIMUM distance across all FUSION-retrieved chunks (RetrievedChunk.retrieved_by == "fusion"),
+    matching app/pipeline.py's no-answer gate exactly -- not the RRF-top-1 chunk's own distance,
+    which is a noisier, fused-rank quantity (see Settings.NO_ANSWER_MAX_DISTANCE's comment in
+    app/config.py), and not a dated-rule companion's distance either: a companion is admitted
+    because a dated rule is in play, not because it is relevant, so it must never be able to move
+    this measurement (see Settings.DATED_RULE_COMPANIONS's comment).
+
+    rrf_k/candidate_pool/dated_rule_companions are read from `settings`, not hardcoded, so this
+    test measures whatever configuration app/pipeline.py actually runs with -- a literal here would
+    keep passing while silently measuring a configuration the system no longer uses.
 
     The seven in-domain controls measured 0.1563-0.3814 here, comfortably below 0.50.
 
@@ -1165,10 +1815,18 @@ async def test_no_answer_threshold_separates_control_queries_on_the_live_corpus(
     async def min_distance(question: str) -> float:
         [embedding] = await embedder.embed([question])
         results = await hybrid_search(
-            pool, embedding, question, k=settings.RETRIEVAL_TOP_K, rrf_k=60, candidate_pool=20
+            pool,
+            embedding,
+            question,
+            k=settings.RETRIEVAL_TOP_K,
+            rrf_k=settings.RRF_K,
+            candidate_pool=settings.HYBRID_CANDIDATE_POOL,
+            dated_rule_companions=settings.DATED_RULE_COMPANIONS,
         )
         assert results, f"expected at least one result for {question!r}"
-        return min(r.distance for r in results)
+        fusion_results = [r for r in results if r.retrieved_by == "fusion"]
+        assert fusion_results, f"expected at least one fusion result for {question!r}"
+        return min(r.distance for r in fusion_results)
 
     for question in in_domain_queries:
         distance = await min_distance(question)
@@ -1206,7 +1864,13 @@ async def test_no_answer_gate_does_not_suppress_a_sparse_form_number_match(pool)
 
     [embedding] = await embedder.embed([question])
     results = await hybrid_search(
-        pool, embedding, question, k=settings.RETRIEVAL_TOP_K, rrf_k=60, candidate_pool=20
+        pool,
+        embedding,
+        question,
+        k=settings.RETRIEVAL_TOP_K,
+        rrf_k=60,
+        candidate_pool=20,
+        dated_rule_companions=0,
     )
     assert results, f"expected at least one result for {question!r}"
     assert any(r.section_heading == "Form I-515A" for r in results), (

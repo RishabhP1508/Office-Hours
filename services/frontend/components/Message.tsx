@@ -101,8 +101,56 @@ function Clarify({ question, response }: { question: string; response: AnswerRes
   );
 }
 
+// Copy for each known `refusal_reason` a NO_ANSWER response can carry, the same by-reason
+// selection pattern _BLOCKED_COPY_BY_REASON below uses for BLOCKED_UNVERIFIED. The existing
+// "outside the indexed sources" copy stays the default for every reason not listed here,
+// including the ordinary "sources don't cover this" case and the daily-generation-cap
+// degradation -- it was the only copy this component had before the stopgap below existed, and
+// it is still correct for both of those.
+//
+// "non_latin_script_unsupported" (STOPGAP, 2026-09-08, app/pipeline.py -- see the large comment
+// above _is_predominantly_non_latin there, and docs/adr/0018-non-latin-script-no-answer-
+// stopgap.md) needs DIFFERENT copy, not the default: the default's "This falls outside the
+// sources this tool has indexed" would be a FALSE statement here. The sources may well cover the
+// question; the gate fired because the tool cannot read the question's script, before retrieval
+// ever ran, not because retrieval came back empty.
+const _DEFAULT_NO_ANSWER_COPY = {
+  heading: "Where to look instead",
+  body: (
+    <>
+      This falls outside the <span className="whitespace-nowrap">F‑1</span>, OPT, STEM OPT, and{" "}
+      <span className="whitespace-nowrap">H‑1B</span> sources this tool has indexed. Your DSO has
+      likely answered this question before, and a licensed immigration attorney can help with
+      anything specific to your case.
+    </>
+  ),
+  stampExtra: "no sources cited because none applied",
+};
+
+const _NO_ANSWER_COPY_BY_REASON: Record<
+  string,
+  { heading: string; body: React.ReactNode; stampExtra: string }
+> = {
+  non_latin_script_unsupported: {
+    heading: "This tool only reads English right now",
+    body: (
+      <>
+        The sources behind Office Hours may well cover your question. The problem is this tool
+        can’t yet read it reliably in this language, and guessing risked handing you a confident
+        but wrong number pointed at English sources you couldn’t easily check yourself. Try asking
+        in English, or talk to your DSO or a licensed immigration attorney, who can help you in
+        your own language.
+      </>
+    ),
+    stampExtra: "no sources checked because the question couldn’t be read",
+  },
+};
+
 function NoAnswer({ question, response }: { question: string; response: AnswerResponse }) {
   const paragraphs = splitParagraphs(response.answer);
+  const copy =
+    (response.refusal_reason && _NO_ANSWER_COPY_BY_REASON[response.refusal_reason]) ||
+    _DEFAULT_NO_ANSWER_COPY;
   return (
     <div>
       <YouEcho question={question} />
@@ -113,13 +161,8 @@ function NoAnswer({ question, response }: { question: string; response: AnswerRe
           </p>
         ))}
       </div>
-      <Handoff heading="Where to look instead">
-        This falls outside the <span className="whitespace-nowrap">F‑1</span>, OPT, STEM OPT, and{" "}
-        <span className="whitespace-nowrap">H‑1B</span> sources this tool has indexed. Your DSO has
-        likely answered this question before, and a licensed immigration attorney can help with
-        anything specific to your case.
-      </Handoff>
-      <Stamp response={response} extra="no sources cited because none applied" />
+      <Handoff heading={copy.heading}>{copy.body}</Handoff>
+      <Stamp response={response} extra={copy.stampExtra} />
     </div>
   );
 }

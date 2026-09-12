@@ -20,12 +20,17 @@ into the score, not just carried as a spare column.
 """
 
 import os
+import re
+from datetime import UTC, date, datetime
 
 import pytest
 
 from app.config import Settings, get_settings
-from app.db import hybrid_search, make_pool
-from app.providers.embeddings import StubEmbedder
+from app.db import RetrievedChunk, hybrid_search, make_pool
+from app.pipeline import answer_question
+from app.providers.embeddings import OllamaEmbedder, StubEmbedder
+from app.providers.llm import LLM
+from app.schemas import ResponseType
 
 # pyproject.toml sets asyncio_mode = "auto", so `async def test_*` functions below run as asyncio
 # tests without an explicit marker; adding one anyway would also mis-mark the one plain (sync)
@@ -72,7 +77,9 @@ async def test_keyword_only_chunk_is_retrievable(pool, embedder):
     question = f"What is a {_KEYWORD_ONLY_TERM} and when is it issued?"
     [embedding] = await embedder.embed([question])
 
-    results = await hybrid_search(pool, embedding, question, k=5, rrf_k=60, candidate_pool=20)
+    results = await hybrid_search(
+        pool, embedding, question, k=5, rrf_k=60, candidate_pool=20, dated_rule_companions=0
+    )
 
     assert results, "Expected at least one result"
     assert results[0].section_heading == _KEYWORD_ONLY_HEADING, (
@@ -92,7 +99,9 @@ async def test_rrf_ordering_is_by_rrf_score_descending_with_at_least_one_rank(po
     question = "How long is the STEM OPT extension and what happens with cap-gap?"
     [embedding] = await embedder.embed([question])
 
-    results = await hybrid_search(pool, embedding, question, k=5, rrf_k=60, candidate_pool=20)
+    results = await hybrid_search(
+        pool, embedding, question, k=5, rrf_k=60, candidate_pool=20, dated_rule_companions=0
+    )
 
     assert results, "Expected at least one result"
     scores = [r.rrf_score for r in results]
@@ -113,7 +122,9 @@ async def test_stopword_only_query_degrades_to_semantic_only(pool, embedder):
     question = "is the a of"
     [embedding] = await embedder.embed([question])
 
-    results = await hybrid_search(pool, embedding, question, k=5, rrf_k=60, candidate_pool=20)
+    results = await hybrid_search(
+        pool, embedding, question, k=5, rrf_k=60, candidate_pool=20, dated_rule_companions=0
+    )
 
     assert len(results) == 5, f"Expected 5 chunks from the semantic arm alone, got {len(results)}"
     for r in results:
@@ -128,8 +139,12 @@ async def test_hybrid_search_is_deterministic(pool, embedder):
     question = "What documents do I need at a U.S. port of entry as an F-1 student?"
     [embedding] = await embedder.embed([question])
 
-    first = await hybrid_search(pool, embedding, question, k=5, rrf_k=60, candidate_pool=20)
-    second = await hybrid_search(pool, embedding, question, k=5, rrf_k=60, candidate_pool=20)
+    first = await hybrid_search(
+        pool, embedding, question, k=5, rrf_k=60, candidate_pool=20, dated_rule_companions=0
+    )
+    second = await hybrid_search(
+        pool, embedding, question, k=5, rrf_k=60, candidate_pool=20, dated_rule_companions=0
+    )
 
     assert [r.id for r in first] == [
         r.id for r in second
@@ -156,6 +171,279 @@ def test_retrieval_top_k_defaults_to_five():
     (eval/results/20260830T183110Z.json) it is being compared against.
     """
     assert Settings().RETRIEVAL_TOP_K == 5
+
+
+# =================================================================================================
+# Dated-rule companion retrieval (docs/adr/0019-dated-rule-companion-retrieval.md). Every test
+# below that queries the live corpus is `full_corpus`-marked and uses the real OllamaEmbedder --
+# the dated fixed_admission content (rule_effective_date=2026-09-15) these tests depend on exists
+# only in the real 14-source manifest's ingested corpus, never in eval/fixtures/sources/.
+# =================================================================================================
+
+# Confirmed against the live corpus: the fused top-k for this question carries no
+# rule_effective_date at all, so it is the "companions must add nothing" control below.
+_NO_DATED_CHUNK_QUERY = "How long is my travel signature valid on my I-20?"
+
+# The live motivating case (Settings.DATED_RULE_COMPANIONS's own comment): the fused top-k already
+# contains A dated chunk, but not the one that actually states the new 30-day departure number.
+_HAS_DATED_CHUNK_QUERY = "What is the grace period after OPT ends?"
+
+
+@pytest.fixture
+def real_embedder():
+    settings = get_settings()
+    return OllamaEmbedder(base_url=settings.OLLAMA_BASE_URL, model=settings.EMBED_MODEL)
+
+
+@pytest.mark.full_corpus
+async def test_dated_rule_companions_off_matches_pre_companion_behavior(pool, real_embedder):
+    """dated_rule_companions=0 must return exactly k rows, every one `retrieved_by == "fusion"`,
+    reproducing hybrid_search's behavior from before the `companions` CTE existed. Proved by
+    comparing it against a companions-enabled call on a query whose fused top-k contains no dated
+    chunk to add (_NO_DATED_CHUNK_QUERY, confirmed above) -- if the two calls' id lists match in
+    order, dated_rule_companions=0 has changed nothing about the underlying fusion query.
+    """
+    settings = get_settings()
+    [embedding] = await real_embedder.embed([_NO_DATED_CHUNK_QUERY])
+
+    off = await hybrid_search(
+        pool,
+        embedding,
+        _NO_DATED_CHUNK_QUERY,
+        k=settings.RETRIEVAL_TOP_K,
+        rrf_k=settings.RRF_K,
+        candidate_pool=settings.HYBRID_CANDIDATE_POOL,
+        dated_rule_companions=0,
+    )
+    on = await hybrid_search(
+        pool,
+        embedding,
+        _NO_DATED_CHUNK_QUERY,
+        k=settings.RETRIEVAL_TOP_K,
+        rrf_k=settings.RRF_K,
+        candidate_pool=settings.HYBRID_CANDIDATE_POOL,
+        dated_rule_companions=2,
+    )
+
+    assert len(off) == settings.RETRIEVAL_TOP_K, f"expected exactly k rows, got {len(off)}"
+    assert all(
+        r.retrieved_by == "fusion" for r in off
+    ), f"expected every row to be retrieved_by='fusion': {[(r.id, r.retrieved_by) for r in off]}"
+    off_ids = [r.id for r in off]
+    on_ids = [r.id for r in on]
+    assert off_ids == on_ids, (
+        "dated_rule_companions=0 must return the identical id list, in the identical order, as a "
+        f"companions-enabled call on a query with no dated chunk to add -- off={off_ids} "
+        f"on={on_ids}"
+    )
+
+
+@pytest.mark.full_corpus
+async def test_no_dated_chunk_in_top_k_adds_no_companions(pool, real_embedder):
+    """A query whose fused top-k contains no chunk carrying a rule_effective_date must return zero
+    companions even with dated_rule_companions=2 -- the companions CTE's WHERE clause requires a
+    date already present in `top` to match against, and an empty set of dates makes that clause
+    false for every row in `documents`, regardless of the LIMIT.
+    """
+    settings = get_settings()
+    [embedding] = await real_embedder.embed([_NO_DATED_CHUNK_QUERY])
+
+    results = await hybrid_search(
+        pool,
+        embedding,
+        _NO_DATED_CHUNK_QUERY,
+        k=settings.RETRIEVAL_TOP_K,
+        rrf_k=settings.RRF_K,
+        candidate_pool=settings.HYBRID_CANDIDATE_POOL,
+        dated_rule_companions=2,
+    )
+
+    assert not any(r.rule_effective_date is not None for r in results), (
+        f"expected no dated chunk in the fused top-k for {_NO_DATED_CHUNK_QUERY!r}, got "
+        f"{[(r.id, r.rule_effective_date) for r in results]}"
+    )
+    assert len(results) == settings.RETRIEVAL_TOP_K
+    assert all(r.retrieved_by == "fusion" for r in results)
+
+
+@pytest.mark.full_corpus
+async def test_dated_chunk_in_top_k_adds_up_to_n_companions(pool, real_embedder):
+    """A query whose fused top-k DOES contain a dated chunk must add at most
+    Settings.DATED_RULE_COMPANIONS more rows, each `retrieved_by == "dated_companion"`, each
+    carrying a non-null rule_effective_date equal to one already present among the fusion rows,
+    and none duplicating a fusion row's id.
+    """
+    settings = get_settings()
+    [embedding] = await real_embedder.embed([_HAS_DATED_CHUNK_QUERY])
+
+    results = await hybrid_search(
+        pool,
+        embedding,
+        _HAS_DATED_CHUNK_QUERY,
+        k=settings.RETRIEVAL_TOP_K,
+        rrf_k=settings.RRF_K,
+        candidate_pool=settings.HYBRID_CANDIDATE_POOL,
+        dated_rule_companions=2,
+    )
+
+    fusion = [r for r in results if r.retrieved_by == "fusion"]
+    companions = [r for r in results if r.retrieved_by == "dated_companion"]
+    fusion_ids = {r.id for r in fusion}
+    fusion_dates = {r.rule_effective_date for r in fusion if r.rule_effective_date is not None}
+
+    assert len(fusion) == settings.RETRIEVAL_TOP_K
+    assert fusion_dates, (
+        f"expected {_HAS_DATED_CHUNK_QUERY!r} to retrieve a dated chunk in its fused top-k -- "
+        f"this test no longer exercises the case it is named for: "
+        f"{[(r.id, r.rule_effective_date) for r in fusion]}"
+    )
+    assert (
+        len(results) <= settings.RETRIEVAL_TOP_K + 2
+    ), f"expected at most k+2 rows, got {len(results)}: {[r.id for r in results]}"
+    assert (
+        companions
+    ), "expected at least one dated companion row for a query with a dated fusion hit"
+    for r in companions:
+        assert r.rule_effective_date is not None, f"companion {r.id} carries no rule_effective_date"
+        assert r.rule_effective_date in fusion_dates, (
+            f"companion {r.id}'s rule_effective_date {r.rule_effective_date} is not one already "
+            f"present among the fusion rows {fusion_dates}"
+        )
+        assert r.id not in fusion_ids, f"companion {r.id} duplicates a fusion row id"
+
+
+# "30" and a "depart..." word in the SAME sentence -- not merely the same chunk -- so this cannot
+# be satisfied by an unrelated "30" (a form number, a percentage, a minute count) sharing a long
+# chunk with an unrelated "departure" mention elsewhere in it. Written as content regexes, not an
+# id list, so this survives a re-ingest that renumbers chunks.
+_DEPART_RE = re.compile(r"\bdepart\w*\b", re.IGNORECASE)
+_THIRTY_RE = re.compile(r"\b30\b")
+_SIXTY_DAY_RE = re.compile(r"60[\s-]days?", re.IGNORECASE)
+
+
+def _states_new_departure_period(content: str) -> bool:
+    return any(
+        _THIRTY_RE.search(sentence) and _DEPART_RE.search(sentence)
+        for sentence in re.split(r"(?<=[.!?])\s+", content)
+    )
+
+
+@pytest.mark.full_corpus
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many days do I have to depart the US after OPT ends?",
+        "What is the grace period after OPT ends?",
+        "How long do I have to leave the US after OPT ends?",
+    ],
+)
+async def test_dated_rule_companions_surface_both_the_new_and_current_departure_period(
+    pool, real_embedder, question
+):
+    """The acceptance case docs/adr/0019-dated-rule-companion-retrieval.md exists for: plain RRF
+    fusion alone answers each of these questions with only the still-current 60-day rule, because
+    the chunk that states the new 30-day replacement loses the fusion race outright. With
+    Settings.DATED_RULE_COMPANIONS on, the retrieved set must contain BOTH a dated chunk stating
+    the new period AND a chunk still stating the current one, so the generator has what it needs
+    to state both rules with their dates (ARCHITECTURE.md, "Answers state both the current rule
+    and its dated replacement").
+    """
+    settings = get_settings()
+    [embedding] = await real_embedder.embed([question])
+
+    results = await hybrid_search(
+        pool,
+        embedding,
+        question,
+        k=settings.RETRIEVAL_TOP_K,
+        rrf_k=settings.RRF_K,
+        candidate_pool=settings.HYBRID_CANDIDATE_POOL,
+        dated_rule_companions=settings.DATED_RULE_COMPANIONS,
+    )
+
+    assert any(
+        r.rule_effective_date is not None and _states_new_departure_period(r.content)
+        for r in results
+    ), (
+        f"expected a dated chunk stating the new 30-day departure period for {question!r}, got "
+        f"{[(r.id, r.retrieved_by, r.rule_effective_date, r.section_heading) for r in results]}"
+    )
+    assert any(_SIXTY_DAY_RE.search(r.content) for r in results), (
+        f"expected at least one retrieved chunk to still mention the 60-day period for "
+        f"{question!r}, got {[(r.id, r.section_heading) for r in results]}"
+    )
+
+
+class _ExplodingLLM(LLM):
+    async def generate(self, system: str, user: str) -> str:
+        raise AssertionError("LLM.generate must not be called when the no-answer gate fires")
+
+
+class _ExplodingPool:
+    def __getattr__(self, name):
+        raise AssertionError(f"pool.{name} must not be touched -- hybrid_search is faked below")
+
+
+def _fake_chunk(**overrides) -> RetrievedChunk:
+    defaults = dict(
+        id=1,
+        content="chunk text",
+        source_url="https://example.gov/a",
+        resolved_url=None,
+        section_heading="Heading",
+        heading_level=2,
+        page_last_updated=None,
+        rule_effective_date=None,
+        fetched_at=datetime(2026, 8, 1, tzinfo=UTC),
+        last_verified_at=datetime(2026, 8, 1, tzinfo=UTC),
+        distance=0.1,
+        rrf_score=0.5,
+        semantic_rank=1,
+        keyword_rank=None,
+        retrieved_by="fusion",
+    )
+    defaults.update(overrides)
+    return RetrievedChunk(**defaults)
+
+
+async def test_no_answer_gate_ignores_companion_chunks(monkeypatch):
+    """Unit test, fakes only, no DB: a companion is admitted because a dated rule is in play, not
+    because it is relevant, so it must never be able to flip a genuine NO_ANSWER into an answer.
+    Fakes app.pipeline's own hybrid_search reference with one FUSION chunk ABOVE
+    NO_ANSWER_MAX_DISTANCE and one DATED_COMPANION chunk BELOW it -- if the no-answer gate
+    incorrectly folded the companion into its minimum-distance calculation, this would produce an
+    ANSWER instead of NO_ANSWER.
+    """
+    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub", NO_ANSWER_MAX_DISTANCE=0.5)
+    chunks = [
+        _fake_chunk(id=1, distance=0.9, retrieved_by="fusion"),
+        _fake_chunk(
+            id=2,
+            distance=0.05,
+            retrieved_by="dated_companion",
+            rule_effective_date=date(2026, 9, 15),
+        ),
+    ]
+
+    async def _fake_hybrid_search(*args, **kwargs):
+        del args, kwargs
+        return chunks
+
+    monkeypatch.setattr("app.pipeline.hybrid_search", _fake_hybrid_search)
+
+    response = await answer_question(
+        "What does the fixed period of admission rule say for F-1 students?",
+        pool=_ExplodingPool(),
+        embedder=StubEmbedder(dim=768),
+        llm=_ExplodingLLM(),
+        settings=settings,
+    )
+
+    assert response.response_type == ResponseType.NO_ANSWER.value, (
+        f"expected NO_ANSWER (the only fusion chunk is above NO_ANSWER_MAX_DISTANCE), got "
+        f"{response.response_type!r} -- the no-answer gate appears to be using the companion "
+        "chunk's distance"
+    )
 
 
 # =================================================================================================
@@ -208,7 +496,13 @@ async def test_hybrid_search_propagates_a_database_error_rather_than_degrading()
         # try/except of its own to turn ANY of these into a degraded, non-raising result.
         with pytest.raises(PoolTimeout):
             await hybrid_search(
-                broken_pool, [0.0] * 768, "test question", k=5, rrf_k=60, candidate_pool=20
+                broken_pool,
+                [0.0] * 768,
+                "test question",
+                k=5,
+                rrf_k=60,
+                candidate_pool=20,
+                dated_rule_companions=0,
             )
     finally:
         await broken_pool.close()

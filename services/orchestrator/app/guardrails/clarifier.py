@@ -312,6 +312,15 @@ def _content_words(question: str) -> list[str]:
     return words
 
 
+def content_words(question: str) -> list[str]:
+    """Public alias of `_content_words`, exposed only so app/pipeline.py's non-Latin-script gate
+    (docs/adr/0018-non-latin-script-no-answer-stopgap.md) can reuse this module's own Latin/
+    whitespace-aware content-word extraction instead of writing a second tokenizer. Behaviour is
+    byte-identical to `_content_words` -- this is a naming/visibility change only, not a new rule.
+    """
+    return _content_words(question)
+
+
 def is_too_vague(
     question: str,
     *,
