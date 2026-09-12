@@ -73,6 +73,10 @@ materially larger algorithm than this one.
   sentence contradicts that claim rather than removing it, because removing it would mean rewriting
   the model's own assertion, which is a semantic judgment a string test cannot make.
 
+**Superseded in part by the 12 September amendment below.** The "contradiction standing" case is
+exactly the one that now blocks instead of being qualified, so it is no longer left standing. The
+reasoning above is kept because it is how the block decision was arrived at.
+
 An earlier draft of this ADR claimed "detects 6 of 6". That was derived by evaluating the detector's
 logic against the nine runs' sentences without checking whether the figure was future-only given each
 query's actual retrieved set. It was wrong, and it is recorded here rather than quietly corrected.
@@ -80,13 +84,56 @@ query's actual retrieved set. It was wrong, and it is recorded here rather than 
 ## Decision
 
 `app/guardrails/temporal.py::qualify_future_dated_figures` runs in `app/pipeline.py` step 8 for
-ANSWER and REFUSAL_ADVICE. For each sentence containing a figure that appears only in future-dated
-retrieved chunks and that does not itself state that rule's effective date, it inserts one derived
-sentence immediately after that sentence.
+ANSWER and REFUSAL_ADVICE. It finds each sentence containing a figure that appears only in
+future-dated retrieved chunks and that does not itself state that rule's effective date, and then
+takes ONE of two actions depending on what else is in that sentence.
 
-**It inserts rather than blocks.** The answer is substantively correct and missing a qualification;
-blocking would discard a correct answer and show the reader nothing. That is different from
-`app/guardrails/authority.py`, where the output itself is compromised and blocking is right.
+**Amended 12 September 2026. The first version of this ADR said "it inserts rather than blocks" for
+every case, and that was measured to be wrong for the worst one.** Ten production runs of "What is
+the grace period after OPT ends?", each opening sentence classified by reading it:
+
+    states the current rule correctly     3 / 10
+    states the FUTURE rule as current     5 / 10
+    neither                               2 / 10
+
+Five of ten opened with a sentence like *"The **current** grace period after post-completion OPT ends
+is **30 days**"* -- a false figure explicitly labelled current, three days before it becomes true.
+Inserting a correction two sentences later does not unsay that for a reader skimming, which is the
+reading behaviour this tool has to assume. The guard fired on exactly those five and on none of the
+other five, so the detection signal was reliable and only the response to it was wrong.
+
+**The two actions, and the mechanical rule that chooses between them.**
+
+- **INSERT** (the original behaviour) when the sentence ALSO contains a figure drawn from a *current*
+  retrieved chunk -- one whose `rule_effective_date` is None or on/before today. Both rules are
+  present and only the date placement is wrong. That is not a contradiction and the correction
+  genuinely helps.
+- **BLOCK** when it does not. The sentence asserts the future rule alone, as though current, with
+  nothing in it to correct. The generated text is discarded and the response becomes
+  `BLOCKED_UNVERIFIED` with `refusal_reason="answer_states_future_rule_as_current"`, zero citations,
+  and a message naming what went wrong and linking the official source. The URL is derived from the
+  triggering chunk (`resolved_url` if set, else `source_url`), never a literal.
+
+This is now the same judgment `app/guardrails/authority.py` makes, applied case by case rather than
+to the whole check: block when the output itself is compromised, qualify when it is merely
+incomplete.
+
+**The separating rule was tested against the data before it was built**, which is the discipline whose
+absence produced the "detects 6 of 6" error recorded above. Checked against 11 verbatim sentences
+measured in production -- 6 block cases, 3 insertion cases, 2 that must be left alone -- it separates
+all 11. (The first run of that check reported two misses; both were defects in the test harness, which
+had omitted the guard's existing "does this sentence already state the date" step and filed one
+fixture in the wrong group.)
+
+**This scaffolding has a 72-hour shelf life and self-resolves. It does not need removing.** On
+15 September 2026 the rule takes effect: the corpus's "F students now have 30 days" stops being false,
+`rule_effective_date` is no longer in the future, `_future_only_figures` returns nothing for that
+date, and both the block and the insertion stop firing on their own. The cheapest change that removes
+the contradiction was therefore the right one to build, rather than the most correct one. Nothing here
+is a durable model of how to handle changing rules; the durable version is the "figure plus unit and
+subject" matching described under Alternatives, and it was not built because the deadline did not
+allow it and the need expires with the deadline. If a FUTURE dated rule enters this corpus, this code
+becomes live again automatically and should be re-measured then rather than trusted.
 
 **It inserts after the sentence rather than appending at the end.** Appending at the end is what the
 system already does with the freshness notice, and a trailing qualifier is precisely the behaviour
@@ -108,6 +155,23 @@ already live for the freshness notice: a response cached on 11 September saying 
 September 15, 2026" would still say it on 16 September. `corpus_version` now folds in the UTC date.
 The honest cost is that cache entries expire daily; the cache is a cost optimisation and a wrong date
 is a correctness problem.
+
+## Two failure shapes this cannot see at all
+
+Measured in the same ten runs, 2 of 10 fit neither category and neither is reachable by a
+figure-anchored check, because both attach the effective date to the figure, which is precisely the
+condition the guard tests for:
+
+- **A currently-in-force rule stated in the past tense.** *"... before that date, students **were
+  allowed** a 60-day grace period."* Correctly dated, so nothing fires, and a reader on 12 September
+  is told the rule that actually governs them is historical.
+- **The current rule omitted entirely.** *"The grace period ... is 30 days ... under the rule that
+  takes effect on September 15, 2026."* Correctly dated, nothing false asserted, and the answer to
+  "what is the grace period" simply never states the number in force today.
+
+Catching either requires reasoning about tense, and about whether the current rule was stated at all,
+which is the semantic judgment this whole approach is bounded by. 2 of 10 on the most consequential
+question in the corpus, recorded rather than folded into either bucket.
 
 ## Tradeoff
 

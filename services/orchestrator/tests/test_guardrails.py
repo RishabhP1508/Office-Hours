@@ -1123,6 +1123,164 @@ def test_temporal_guard_does_not_change_cited_indices():
     assert parse_cited_indices(result.text) == parse_cited_indices(answer)
 
 
+# --- BLOCK VS INSERT (2026-09-12, app/guardrails/temporal.py's own docstring): ten production runs
+# --- of "What is the grace period after OPT ends?" on 2026-09-12 split 3/10 correct, 5/10 stating
+# --- the FUTURE rule as though it were already current, 2/10 neither. The guard already fired on
+# --- exactly those five; this is the split of WHAT to do about it. ---
+
+
+def _departure_period_chunks_with_url(url: str) -> list[RetrievedChunk]:
+    """Same shape as `_departure_period_chunks()` above (30 future-only, 60 a current-rule figure)
+    but with an overridable, distinctive `source_url` on the future-dated chunk -- lets a BLOCK test
+    assert the rendered message names the REAL chunk's URL, not a hardcoded literal.
+    """
+    return [
+        _make_chunk(
+            id=1,
+            content=(
+                "F students now have 30 days to depart the United States, a decrease from the "
+                "previous 60-day grace period."
+            ),
+            source_url=url,
+            rule_effective_date=_FUTURE_DATE,
+        ),
+        _make_chunk(
+            id=2,
+            content=(
+                "F-1 students currently have 60 days to depart the United States after their "
+                "program ends."
+            ),
+            rule_effective_date=None,
+        ),
+    ]
+
+
+_FUTURE_RULE_URL = "https://www.dhs.gov/fixed-period-of-admission-final-rule"
+
+
+# The three real, verbatim production sentences (2026-09-12 measurement) that state the future
+# 30-day figure ALONE, as current, with no "60" (or any other current-rule figure) anywhere in the
+# same sentence -- the shape this split now BLOCKS rather than merely inserting a correction after.
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        pytest.param(
+            "The current grace period after post-completion OPT (or STEM OPT) ends is 30 days - "
+            "students must depart the United States or file for an extension of stay within 30 "
+            "days of the OPT end date [7].",
+            id="prod-2026-09-12-current-grace-period-is-30",
+        ),
+        pytest.param(
+            "The grace period after post-completion OPT ends is now 30 days - students must leave "
+            "the United States or file an extension of stay within 30 days of their OPT completion "
+            "[7].",
+            id="prod-2026-09-12-grace-period-now-30",
+        ),
+        pytest.param(
+            "F students now have 30 days to depart the United States following completion of "
+            "their post-completion optional practical training (OPT) or STEM OPT [7].",
+            id="prod-2026-09-12-f-students-now-have-30",
+        ),
+    ],
+)
+def test_temporal_guard_blocks_when_no_current_rule_figure_accompanies_the_future_one(sentence):
+    chunks = _departure_period_chunks_with_url(_FUTURE_RULE_URL)
+    result = qualify_future_dated_figures(sentence, chunks, today=_TODAY)
+    assert result.blocked is True
+    assert result.blocked_source_urls == (_FUTURE_RULE_URL,)
+
+
+def test_temporal_guard_still_inserts_when_the_sentence_also_states_a_current_rule_figure():
+    """The real production sentence that states BOTH the future-only "30" and the current-rule
+    "60" in the same sentence: only the date placement is wrong, so this still INSERTS -- it must
+    not be blocked."""
+    chunks = _departure_period_chunks_with_url(_FUTURE_RULE_URL)
+    answer = (
+        "The departure period for F-1 students is now 30 days, a decrease from the previous "
+        "60-day grace period [7]."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.blocked is False
+    assert result.blocked_source_urls == ()
+    assert result.insertion_count == 1
+    assert "That figure comes from a rule that takes effect on September 15, 2026." in result.text
+
+
+def test_temporal_guard_does_neither_when_the_sentence_already_states_both_rules_and_dates():
+    """The sentence already states the current rule, the future rule, AND the effective date --
+    the pre-existing "already states the date" check (ALGORITHM step 4) means this never fires at
+    all, so it is neither inserted into nor blocked."""
+    chunks = _departure_period_chunks_with_url(_FUTURE_RULE_URL)
+    answer = (
+        "The standard grace period after post-completion OPT ends is 60 days right now, but it "
+        "will be reduced to 30 days once the new rule takes effect on September 15, 2026."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 0
+    assert result.blocked is False
+    assert result.blocked_source_urls == ()
+    assert result.text == answer
+
+
+def test_future_rule_blocked_message_names_the_actual_chunk_url_not_a_literal():
+    """`app/pipeline.py::_blocked_message_for_reason` builds this reason's message from whatever
+    `future_rule_source_urls` it is given -- proven here by giving it two DIFFERENT urls and
+    checking each rendered message names only its own, never the other's and never a fixed
+    string."""
+    message_a = pipeline_module._blocked_message_for_reason(
+        "answer_states_future_rule_as_current",
+        future_rule_source_urls=("https://www.dhs.gov/rule-a",),
+    )
+    message_b = pipeline_module._blocked_message_for_reason(
+        "answer_states_future_rule_as_current",
+        future_rule_source_urls=("https://www.uscis.gov/rule-b",),
+    )
+    assert "https://www.dhs.gov/rule-a" in message_a
+    assert "https://www.uscis.gov/rule-b" in message_b
+    assert "https://www.dhs.gov/rule-a" not in message_b
+    assert "https://www.uscis.gov/rule-b" not in message_a
+
+
+async def test_temporal_guard_block_path_returns_blocked_unverified_end_to_end(
+    pool, embedder, settings, monkeypatch
+):
+    """Pipeline-level: a generated answer stating the future 30-day figure alone, as current, is
+    blocked whole -- BLOCKED_UNVERIFIED, refusal_reason="answer_states_future_rule_as_current",
+    ZERO citations, and the generated prose itself never rendered. `hybrid_search` is monkeypatched
+    to a fixed, deterministic chunk set (the real DHS-departure-period shape: 30 future-only, 60
+    current) so this test exercises the guard on the GENERATED TEXT, not on the fixture corpus's
+    real retrieval ranking, which this guard has nothing to do with.
+    """
+
+    async def fake_hybrid_search(
+        pool, query_embedding, question, top_k, *, rrf_k, candidate_pool, dated_rule_companions
+    ):
+        return _departure_period_chunks_with_url(_FUTURE_RULE_URL)
+
+    monkeypatch.setattr(pipeline_module, "hybrid_search", fake_hybrid_search)
+
+    fake_text = (
+        "The current grace period after post-completion OPT (or STEM OPT) ends is 30 days - "
+        "students must depart the United States or file for an extension of stay within 30 days "
+        "of the OPT end date [1]."
+    )
+    fake_llm = FixedAnswerLLM(fake_text)
+    response = await answer_question(
+        "What is the grace period after OPT ends?",
+        pool=pool,
+        embedder=embedder,
+        llm=fake_llm,
+        settings=settings,
+    )
+    assert response.response_type == ResponseType.BLOCKED_UNVERIFIED.value
+    assert response.refusal_reason == "answer_states_future_rule_as_current"
+    assert response.citations == []
+    assert response.contexts == []
+    assert fake_text not in response.answer
+    assert "30 days" not in response.answer
+    assert _FUTURE_RULE_URL in response.answer
+
+
 # --- Figure extraction exclusions (app/guardrails/temporal.py::_extract_figures) -- each needs its
 # --- own test, per the exact instruction this guard was built against. ---
 

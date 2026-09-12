@@ -1987,6 +1987,81 @@ state on 28 answers, not a trend, and must not be read as one.
 **The renderer carries the load.** All 28 answers through the real parser: 22 list items rendered, 34
 bold nodes, 68 citations, **0 markdown markers leaking**.
 
+### The opening sentence is false on half of all askings. Measured, 10 production runs.
+
+The grace-period question was observed producing three different shapes from production on the same
+query, so the rate was measured rather than argued about. Ten runs, 12 September, each opening
+sentence classified by reading it:
+
+    states the current rule correctly     3 / 10     runs 4, 6, 7
+    states the FUTURE rule as current     5 / 10     runs 0, 1, 5, 8, 9
+    neither                               2 / 10     runs 2, 3
+
+The five false openings, verbatim:
+
+    run 0   "... is now **30 days** - students must depart the United States or file for an
+             extension of stay before their 'Admit Until' date expires"
+    run 1   "... is now 30 days - students must leave the United States or file an extension of
+             stay within 30 days of their OPT completion"
+    run 5   "The **current** grace period after post-completion OPT (or STEM OPT) ends is
+             **30 days**"                                    <- labels a false figure "current"
+    run 8   "... is **30 days** - students must leave the United States or file for an extension
+             of stay within that period"
+    run 9   "... is 30 days - students must depart the United States or obtain an extension of stay"
+
+**The guard fired on exactly those five and on none of the other five.** Five true positives, zero
+false positives, in ten. The detection signal is reliable; what was wrong was the response to it.
+Appending a correction two sentences after "the current grace period is 30 days" does not unsay it for
+someone skimming, which is the reading behaviour this tool should assume.
+
+**Decision: block rather than correct, for this case only.** A sentence that asserts the future figure
+with no current figure anywhere in it routes to `BLOCKED_UNVERIFIED` with an honest message and a link
+to the official source. The position failures, where both numbers are present and only the date
+placement is wrong, keep the insertion: those are not contradictions and the correction genuinely
+helps. See `docs/adr/0020-temporal-qualification-guard.md`.
+
+**The separating rule was tested against the data before it was built.** A sentence carrying an
+unstated future-only figure blocks if it contains no figure drawn from a current (undated or
+past-dated) retrieved chunk, and gets an insertion if it does. Checked against all 11 real measured
+sentences -- 6 block cases, 3 insertion cases, 2 that must be left alone -- and it separates all 11.
+The first version of that check reported two misses; both were defects in my test harness rather than
+in the rule (it omitted the guard's existing "does the sentence already state the date" step, and one
+fixture was filed in the wrong group). Worth recording that the harness was wrong twice before the
+rule was wrong once.
+
+**This scaffolding has a 72-hour shelf life and self-resolves.** On 15 September the corpus stops being
+wrong: "now 30 days" becomes true, the chunks' `rule_effective_date` is no longer in the future, the
+figure stops being future-only, and the detector stops firing on its own. Nothing needs removing. That
+is the argument for the cheapest change that removes the contradiction rather than the most correct
+one, and it is why no attempt was made to fix the underlying generation behaviour here.
+
+### Two failure shapes a figure-anchored detector cannot see
+
+Runs 2 and 3 of the same ten fit neither bucket, and both would mislead a reader. Recorded as a known
+gap rather than folded into either count.
+
+**Run 2 puts a currently-in-force rule in the past tense.**
+
+> "The grace period after post-completion OPT is 30 days once the new rule takes effect on
+> September 15 2026; **before that date, students were allowed a 60-day grace period**."
+
+The 30 is correctly dated, so the guard does not fire. But "were allowed" describes the rule in force
+today as though it had already ended. A reader on 12 September is told the rule that currently governs
+them is historical.
+
+**Run 3 never states the current rule at all.**
+
+> "The grace period after post-completion OPT ends is 30 days ... **under the rule that takes effect
+> on September 15, 2026** [7]."
+
+Correctly dated, so again no insertion, and nothing false is asserted. But the answer to "what is the
+grace period" simply omits the number in force today. A reader gets a future rule and no present one.
+
+Neither is reachable by a figure-anchored check: both attach the effective date to the figure, which is
+exactly the condition the guard tests for. Catching them needs reasoning about tense and about whether
+the current rule was stated at all, which is the semantic judgment ADR 0020 already records as out of
+reach for a string test. **2 of 10 on the most consequential question in the corpus.**
+
 ### How non-deterministic is the judge? Measured, 10 repeats on each of two fixed inputs.
 
 Run through `eval.judge.score_comprehensibility` and `eval.judge.get_judge_client`, not a hand-rolled

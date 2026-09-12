@@ -63,6 +63,40 @@ ALGORITHM.
        That figure comes from a rule that takes effect on September 15, 2026. It is not the rule in
        force today, September 11, 2026.
 
+BLOCK VS INSERT (2026-09-12): a firing sentence does not always just get that inserted sentence.
+Ten production runs of "What is the grace period after OPT ends?" on 2026-09-12, read by their
+opening sentence: 3/10 stated the current rule correctly, 5/10 stated the FUTURE rule as though it
+were already current ("The current grace period after post-completion OPT ... ends is 30 days",
+three days before that becomes true), 2/10 neither. This guard fired on exactly those five and none
+of the other five -- the detection signal above is reliable -- but appending a correction two
+sentences later does not unsay a false figure asserted as current in the OPENING sentence, for a
+reader skimming it. An honest non-answer naming the source is better than that.
+
+The split: a firing sentence whose OWN figures (`_extract_figures` on the SENTENCE, the same
+extractor `_future_only_figures` above uses on chunk content) include at least one figure that ALSO
+appears in a CURRENT chunk (`rule_effective_date` is `None` or on/before `today`) still gets the
+single derived sentence inserted, exactly as before this split existed: both the current and the
+future rule are present in the sentence, only the date placement is wrong -- "The departure period
+for F-1 students is now 30 days, a decrease from the previous 60-day grace period [7]." states both
+30 (future-only) and 60 (current), so it is INSERT. A firing sentence with NO such figure states the
+future rule ALONE, as current, with nothing anywhere in it naming the rule still in force today --
+that is a false statement, not merely a misplaced date, so the guard reports a BLOCK signal instead
+(`TemporalQualification.blocked`, `.blocked_source_urls`) for app/pipeline.py to act on, rather than
+trying to fix it with an inserted sentence a skimming reader would never reach. The CURRENT-rule
+figure set this comparison needs is built by `_current_rule_figures` below, from the same chunks
+with the same `_extract_figures` `_future_only_figures` already uses (both delegate to
+`_figure_sets`, one shared loop), so the two sets cannot independently drift apart.
+
+`text`/`insertion_count` below are computed exactly as they always were, UNCONDITIONALLY, regardless
+of whether a firing sentence is also flagged for BLOCK -- this function reports both signals
+truthfully and does not itself choose which one wins. app/pipeline.py is the caller that decides:
+when `blocked` is True it discards `text` entirely (a firing sentence in the same answer that ALSO
+qualifies for INSERT does not save it -- one false, current-stated future figure is enough to make
+the whole answer untrustworthy) and renders a fixed safe message instead, naming the real source(s)
+via `blocked_source_urls` (`chunk.resolved_url` if set, else `chunk.source_url` -- the same rule
+app/pipeline.py::_citation_url uses, duplicated as `_citation_url` below rather than imported, since
+app/pipeline.py itself imports this module and an import the other way would be circular).
+
 THE NO-BRACKET PROPERTY, LOAD-BEARING (see app/pipeline.py's own comment at this module's call site,
 which explains why the freshness notice can safely be appended AFTER verify_citations already ran):
 the inserted sentence above never contains a citation bracket, so inserting it can never change what
@@ -298,47 +332,127 @@ def _split_sentences_with_separators(text: str) -> list[str]:
     return result
 
 
-def _future_only_figures(chunks: list[RetrievedChunk], *, today: date) -> dict[str, set[date]]:
-    """Every FUTURE-ONLY figure (ALGORITHM step 1), mapped to the set of future
-    `rule_effective_date` values of the chunk(s) it was found in -- a figure could in principle come
-    from more than one future-dated chunk carrying different dates, so this is a set, not a single
-    date.
+@dataclass(frozen=True)
+class _FigureSets:
+    """The two figure sets `qualify_future_dated_figures` needs, both derived from the SAME single
+    pass over `chunks` (see `_figure_sets` below) so they cannot independently drift apart --
+    `future_only` is exactly what `_future_only_figures` used to compute standalone, and `current`
+    is the CURRENT-rule figure set the BLOCK-vs-INSERT split (module docstring) tests a firing
+    sentence's own figures against.
+    """
+
+    future_only: dict[str, set[date]]
+    current: set[str]
+
+
+def _figure_sets(chunks: list[RetrievedChunk], *, today: date) -> _FigureSets:
+    """One pass over `chunks`, extracting each one's figures with `_extract_figures` exactly once,
+    and sorting them into `future_only` (ALGORITHM step 1: a figure found in a future-dated chunk
+    and in NO chunk that is undated or dated on/before `today`) and `current` (every figure found in
+    a chunk that is undated or dated on/before `today` -- regardless of whether that same figure is
+    ALSO future-only for some other chunk). `_future_only_figures` and `_current_rule_figures` below
+    are both thin wrappers over this one function, rather than two independent loops, specifically
+    so the two sets can never disagree about which chunks count as "future-dated" or how a chunk's
+    figures are extracted.
     """
     future_dates_by_figure: dict[str, set[date]] = {}
-    other_figures: set[str] = set()
+    current_figures: set[str] = set()
     for chunk in chunks:
         figures = _extract_figures(chunk.content)
         if chunk.rule_effective_date is not None and chunk.rule_effective_date > today:
             for figure in figures:
                 future_dates_by_figure.setdefault(figure, set()).add(chunk.rule_effective_date)
         else:
-            other_figures |= figures
-    return {
+            current_figures |= figures
+    future_only = {
         figure: dates
         for figure, dates in future_dates_by_figure.items()
-        if figure not in other_figures
+        if figure not in current_figures
     }
+    return _FigureSets(future_only=future_only, current=current_figures)
+
+
+def _future_only_figures(chunks: list[RetrievedChunk], *, today: date) -> dict[str, set[date]]:
+    """Every FUTURE-ONLY figure (ALGORITHM step 1), mapped to the set of future
+    `rule_effective_date` values of the chunk(s) it was found in -- a figure could in principle come
+    from more than one future-dated chunk carrying different dates, so this is a set, not a single
+    date. A thin wrapper over `_figure_sets` (see that function's own docstring for why this and
+    `_current_rule_figures` share one loop rather than each running their own).
+    """
+    return _figure_sets(chunks, today=today).future_only
+
+
+def _current_rule_figures(chunks: list[RetrievedChunk], *, today: date) -> set[str]:
+    """Every figure appearing in a chunk that is NOT future-dated -- `rule_effective_date` is
+    `None` or on/before `today` -- the CURRENT-rule figure set the BLOCK-vs-INSERT split (module
+    docstring, "BLOCK VS INSERT") tests a firing sentence's own figures against. A thin wrapper over
+    `_figure_sets`, sharing its one loop and its one `_extract_figures` call per chunk with
+    `_future_only_figures` above, so the two sets cannot drift apart via two independently
+    maintained implementations.
+    """
+    return _figure_sets(chunks, today=today).current
+
+
+def _future_chunks_for_figure(
+    chunks: list[RetrievedChunk], figure: str, *, today: date
+) -> list[RetrievedChunk]:
+    """Every chunk in `chunks` that is future-dated (`rule_effective_date` strictly after `today`)
+    and whose own content contains `figure` (via the same `_extract_figures` every other figure
+    extraction in this module uses) -- the chunk(s) a BLOCK signal blames for a given firing
+    sentence's future-only figure, so `qualify_future_dated_figures` can name their `source_url` in
+    `TemporalQualification.blocked_source_urls`.
+    """
+    return [
+        chunk
+        for chunk in chunks
+        if chunk.rule_effective_date is not None
+        and chunk.rule_effective_date > today
+        and figure in _extract_figures(chunk.content)
+    ]
+
+
+def _citation_url(chunk: RetrievedChunk) -> str:
+    """Duplicated from app/pipeline.py's own `_citation_url` (not imported -- app/pipeline.py
+    imports THIS module, so importing the other way would be circular): `resolved_url` if set, else
+    `source_url`, so a BLOCK message names the exact URL a citation to the same chunk would use.
+    """
+    return chunk.resolved_url or chunk.source_url
 
 
 @dataclass(frozen=True)
 class TemporalQualification:
     """`text` is `answer_text` with zero or more derived sentences inserted (see this module's
     docstring); `insertion_count` is exactly how many were inserted, for telemetry and tests --
-    `insertion_count == 0` implies `text == answer_text`, unchanged.
+    `insertion_count == 0` implies `text == answer_text`, unchanged. Both are computed
+    UNCONDITIONALLY, exactly as before the BLOCK/INSERT split existed, regardless of `blocked`.
+
+    `blocked` (module docstring, "BLOCK VS INSERT") is True if at least one firing sentence states a
+    future-dated rule's figure with no accompanying CURRENT-rule figure anywhere in that same
+    sentence -- asserting the future rule alone, as though it were already in force, rather than
+    merely misplacing the date. `blocked_source_urls` is the `source_url` (`chunk.resolved_url` if
+    set, else `chunk.source_url`) of every future-dated chunk whose figure triggered a BLOCK,
+    first-encountered order, deduplicated; empty whenever `blocked` is False. This function only
+    reports both signals truthfully -- app/pipeline.py is the caller that decides what to do with
+    `blocked` (discard `text` and render a fixed safe message instead; see that module's call site).
     """
 
     text: str
     insertion_count: int
+    blocked: bool = False
+    blocked_source_urls: tuple[str, ...] = ()
 
 
 def qualify_future_dated_figures(
     answer_text: str, chunks: list[RetrievedChunk], *, today: date
 ) -> TemporalQualification:
-    """See this module's docstring for the defect this closes and the exact algorithm. Pure: no
-    network, no DB, no model -- `chunks` is the already-retrieved list app/pipeline.py has in hand
-    by the time this runs.
+    """See this module's docstring for the defect this closes and the exact algorithm, including
+    "BLOCK VS INSERT" for how a firing sentence is additionally classified. Pure: no network, no DB,
+    no model -- `chunks` is the already-retrieved list app/pipeline.py has in hand by the time this
+    runs.
     """
-    future_only = _future_only_figures(chunks, today=today)
+    figure_sets = _figure_sets(chunks, today=today)
+    future_only = figure_sets.future_only
+    current_figures = figure_sets.current
     if not future_only:
         return TemporalQualification(text=answer_text, insertion_count=0)
 
@@ -348,9 +462,13 @@ def qualify_future_dated_figures(
 
     result: list[str] = []
     insertion_count = 0
+    blocked = False
+    blocked_urls: list[str] = []
+
     for i, sentence in enumerate(sentences):
+        sentence_figures = _extract_figures(sentence)
         relevant_dates: set[date] = set()
-        for figure in _extract_figures(sentence):
+        for figure in sentence_figures:
             relevant_dates |= future_only.get(figure, set())
 
         unstated_dates = sorted(
@@ -365,10 +483,33 @@ def qualify_future_dated_figures(
             )
             result.append(f"{sentence} {derived}")
             insertion_count += 1
+
+            # BLOCK VS INSERT (module docstring): this firing sentence also asserts the future
+            # rule alone, as current, if none of ITS OWN figures is a current-rule figure -- a
+            # different sentence elsewhere in the same answer stating "60" does not save this one,
+            # by design (a reader skimming this sentence never reaches that other one either).
+            if not (sentence_figures & current_figures):
+                blocked = True
+                unstated_date_set = set(unstated_dates)
+                firing_figures = {
+                    figure
+                    for figure in sentence_figures
+                    if future_only.get(figure, set()) & unstated_date_set
+                }
+                for figure in firing_figures:
+                    for chunk in _future_chunks_for_figure(chunks, figure, today=today):
+                        url = _citation_url(chunk)
+                        if url not in blocked_urls:
+                            blocked_urls.append(url)
         else:
             result.append(sentence)
 
         if i < len(separators):
             result.append(separators[i])
 
-    return TemporalQualification(text="".join(result), insertion_count=insertion_count)
+    return TemporalQualification(
+        text="".join(result),
+        insertion_count=insertion_count,
+        blocked=blocked,
+        blocked_source_urls=tuple(blocked_urls),
+    )

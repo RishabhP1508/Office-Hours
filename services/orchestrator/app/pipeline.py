@@ -73,7 +73,11 @@ Concretely, in order:
    (never the notice, which has not been appended yet) and inserts a date-qualifying sentence
    directly after any sentence that states a future-dated rule's figure with no date of its own --
    see that module's own docstring for why this has to be sentence-scoped rather than a check of
-   whether the date appears anywhere in the rendered answer.
+   whether the date appears anywhere in the rendered answer. 2026-09-12: a firing sentence with no
+   accompanying CURRENT-rule figure anywhere in it (see that module's docstring, "BLOCK VS INSERT")
+   asserts the future rule alone, as current, rather than merely misplacing the date; this returns
+   BLOCKED_UNVERIFIED with refusal_reason="answer_states_future_rule_as_current" instead of
+   inserting a correction, the same early-return shape step 7's own BLOCKED_UNVERIFIED returns use.
 
 Phase 6 addition: an optional, keyword-only `on_event` callback (app/main.py's POST /query/stream
 uses it to drive the frontend's progress UI; POST /query passes nothing, so its behavior is
@@ -187,6 +191,32 @@ _AUTHORITY_BLOCKED_MESSAGE = (
     "guidance, which this tool is not and cannot claim to be, so I'm not showing it. Please try "
     "rephrasing the question."
 )
+
+
+def _future_rule_blocked_message(source_urls: tuple[str, ...]) -> str:
+    """app/guardrails/temporal.py's BLOCK signal (refusal_reason="answer_states_future_rule_as_
+    current"): the generated answer stated a future-dated rule's figure as though it were already in
+    force, with nothing in that sentence naming the rule still in force today (see that module's own
+    docstring, "BLOCK VS INSERT", for the measured production evidence and the exact split from the
+    INSERT case). Unlike _BLOCKED_MESSAGE and _AUTHORITY_BLOCKED_MESSAGE, this message is not a
+    fixed constant: rephrasing does not fix a genuinely dated rule the way it might fix a citation
+    slip, so instead of only asking the reader to try again, this names the real, retrieved source
+    that carries the dated rule -- as a markdown link, so services/frontend/components/Message.tsx
+    can render it clickable -- derived entirely from `source_urls` (app/guardrails/temporal.py::
+    TemporalQualification.blocked_source_urls, itself derived from the triggering chunk's own
+    resolved_url/source_url), never hardcoded here.
+    """
+    links = (
+        ", ".join(f"[the official source]({url})" for url in source_urls) or "the official source"
+    )
+    return (
+        "I generated an answer to this, but it stated a rule that takes effect on a future date as "
+        "though it were already the rule in force today, and I could not tell both versions apart "
+        "clearly enough to trust here, so I'm not showing it. A rule affecting this answer is "
+        f"changing on a specific date -- check {links} directly for the current and upcoming "
+        "figures, or talk to your DSO or a licensed immigration attorney."
+    )
+
 
 # Phase 8 round 3: the daily generation budget cap's degraded response (Settings.DAILY_GENERATION_
 # CAP, app/usage.py::budget_exceeded). Reuses ResponseType.NO_ANSWER rather than adding a sixth
@@ -313,14 +343,22 @@ def _is_predominantly_non_latin(question: str) -> bool:
     return not any(_is_latin_letter(ch) for word in content_words(question) for ch in word)
 
 
-def _blocked_message_for_reason(reason: str | None) -> str:
+def _blocked_message_for_reason(
+    reason: str | None, *, future_rule_source_urls: tuple[str, ...] = ()
+) -> str:
     """Which safe message renders for a BLOCKED_UNVERIFIED response -- selected by `reason`, not by
     which check happened to run last, so this stays correct even if step 7's checks are ever
     reordered. "answer_claims_official_authority" (app/guardrails/authority.py) gets the honest
-    authority message; every other reason (both of verify_citations's own reasons, and anything
-    else that might reuse this response type in the future) keeps the existing citation-check
-    wording.
+    authority message; "answer_states_future_rule_as_current" (app/guardrails/temporal.py's BLOCK
+    signal) gets a message built from `future_rule_source_urls` -- the only one of the three reasons
+    whose message is not a fixed constant, since it has to name the real retrieved source rather
+    than only ask the reader to rephrase (see _future_rule_blocked_message's own docstring). Every
+    other reason (both of verify_citations's own reasons, and anything else that might reuse this
+    response type in the future) keeps the existing citation-check wording; those call sites (step
+    7, below) never pass `future_rule_source_urls`, leaving it at its default empty tuple.
     """
+    if reason == "answer_states_future_rule_as_current":
+        return _future_rule_blocked_message(future_rule_source_urls)
     if reason == "answer_claims_official_authority":
         return _AUTHORITY_BLOCKED_MESSAGE
     return _BLOCKED_MESSAGE
@@ -770,6 +808,31 @@ async def answer_question(
     trace.get_current_span().set_attribute(
         "temporal_qualification_insertions", qualification.insertion_count
     )
+    trace.get_current_span().set_attribute("temporal_qualification_blocked", qualification.blocked)
+
+    # BLOCK (app/guardrails/temporal.py's own docstring, "BLOCK VS INSERT"): a sentence asserted a
+    # future-dated rule's figure alone, as current, with nothing in it naming the rule still in
+    # force today. That is a false statement, not merely a misplaced date, so the whole generated
+    # answer is discarded here -- same shape as step 7's BLOCKED_UNVERIFIED returns above, reusing
+    # _empty_response (zero citations, zero contexts: unlike step 7's own BLOCKED_UNVERIFIED
+    # returns, which still point at every retrieved source, this reason has nothing to safely point
+    # at -- the guard's whole complaint is that it cannot tell which of the retrieved sources this
+    # generated sentence was even faithfully describing). Any insertions `qualification.text` would
+    # otherwise have made are discarded along with the rest of `answer_text` -- a firing sentence
+    # elsewhere in the same answer that ALSO qualifies for INSERT does not save this response.
+    if qualification.blocked:
+        trace.get_current_span().set_attribute(
+            "response_type", ResponseType.BLOCKED_UNVERIFIED.value
+        )
+        return _empty_response(
+            answer=_blocked_message_for_reason(
+                "answer_states_future_rule_as_current",
+                future_rule_source_urls=qualification.blocked_source_urls,
+            ),
+            response_type=ResponseType.BLOCKED_UNVERIFIED,
+            refusal_reason="answer_states_future_rule_as_current",
+        )
+
     answer_text = qualification.text
 
     notice_text = freshness_notice_text(freshness.notices)
