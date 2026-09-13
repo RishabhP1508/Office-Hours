@@ -3,6 +3,7 @@ module.exports = {
   content: ["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}"],
   theme: {
     extend: {
+      screens: { rail: "980px" },
       colors: {
         espresso: "#241B12",
         "espresso-2": "#30251A",

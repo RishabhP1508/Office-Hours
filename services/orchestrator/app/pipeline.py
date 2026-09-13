@@ -1,26 +1,37 @@
 """The query pipeline.
 
-classify (clarify, then advice-vs-information) -> retrieve (hybrid RRF, Phase 3 -- see
-app/db.py::hybrid_search) -> no-answer check -> generate -> verify citations -> freshness -> render.
-This is the full Phase 5 pipeline:
+classify (script gate, then clarify, then advice-vs-information) -> retrieve (hybrid RRF, Phase 3
+-- see app/db.py::hybrid_search) -> no-answer check -> generate -> verify citations -> freshness ->
+render. This is the full Phase 5 pipeline:
 
     classify -> clarify -> retrieve -> generate -> verify -> freshness
 
 Concretely, in order:
 
-1. Clarify: if the query is too vague to retrieve against at all (app/guardrails/clarifier.py),
-   return CLARIFY immediately -- one question, empty citations, empty contexts, no embedding call,
-   no database query.
-1.5. STOPGAP (2026-09-08), see the loud comment at the check itself (just below, in
-   answer_question) and docs/adr/0018-non-latin-script-no-answer-stopgap.md for the full record:
-   a question that is predominantly non-Latin script -- it contains a non-Latin letter AND has no
-   bare Latin content word (an anchor like "STEM OPT") for retrieval to key off -- returns
-   NO_ANSWER with refusal_reason="non_latin_script_unsupported", before any embedding call and
-   before classification. A mixed-script question that DOES carry a Latin anchor (Chinese, Spanish,
-   or Cyrillic all measured working, see the comment at the check) is unaffected and retrieves
-   exactly as before this existed. This trades away the ability to gate a pure non-Latin question
-   that MIGHT have retrieved something reasonable, in exchange for never handing out a confident,
-   wrong, cited number in a language the reader cannot easily verify against the English sources.
+1. Non-Latin script gate (STOPGAP, 2026-09-08; moved ahead of the clarify check on 2026-09-12 --
+   see docs/adr/0021-script-gate-before-clarifier.md for the measurement behind the reorder), see
+   the loud comment at the check itself (just below, in answer_question) and
+   docs/adr/0018-non-latin-script-no-answer-stopgap.md for the full original record, which ADR 0021
+   supersedes on ORDERING ONLY: a question that is predominantly non-Latin script -- it contains a
+   non-Latin letter AND has no bare Latin content word (an anchor like "STEM OPT") for retrieval to
+   key off -- returns NO_ANSWER with refusal_reason="non_latin_script_unsupported", before any
+   embedding call, before the clarify check below, and before classification. A mixed-script
+   question that DOES carry a Latin anchor (Chinese, Spanish, or Cyrillic all measured working, see
+   the comment at the check) is unaffected and retrieves exactly as before this existed. This
+   trades away the ability to gate a pure non-Latin question that MIGHT have retrieved something
+   reasonable, in exchange for never handing out a confident, wrong, cited number in a language the
+   reader cannot easily verify against the English sources.
+1.5. Clarify: if the question got past the gate above (Latin script, or a non-Latin question
+   carrying a Latin anchor) and is still too vague to retrieve against at all
+   (app/guardrails/clarifier.py), return CLARIFY immediately -- one question, empty citations,
+   empty contexts, no embedding call, no database query. This ran FIRST until 2026-09-12: the gate
+   above and this check are both pure functions of the question string alone, so the set of
+   questions whose outcome the reorder changes is exactly computable rather than estimated, and it
+   was computed -- of 28 measured production probes, 6 bare, short, non-Latin questions with no
+   Latin anchor used to reach this check first and get "your question is unclear"
+   (refusal_reason="query_too_vague") when the accurate reason was that this tool cannot read the
+   script at all. See docs/adr/0021-script-gate-before-clarifier.md for the full accounting,
+   including why the other 22 probed questions are unaffected either way.
 2. Classify: advice vs. information (app/guardrails/classifier.py). An advice verdict does NOT skip
    retrieval or return a canned template -- see step 3 onward and docs/adr/0002-advice-vs-
    information-line.md for why.
@@ -398,7 +409,11 @@ def _snippet(content: str, max_len: int = 240) -> str:
 
 
 def _empty_response(
-    *, answer: str, response_type: ResponseType, refusal_reason: str | None
+    *,
+    answer: str,
+    response_type: ResponseType,
+    refusal_reason: str | None,
+    question_non_latin_script: bool,
 ) -> AnswerResponse:
     return AnswerResponse(
         answer=answer,
@@ -407,6 +422,7 @@ def _empty_response(
         response_type=response_type.value,
         refusal_reason=refusal_reason,
         generated_at=datetime.now(UTC),
+        question_non_latin_script=question_non_latin_script,
     )
 
 
@@ -422,6 +438,15 @@ async def answer_question(
 ) -> AnswerResponse:
     tracer = get_tracer()
 
+    # Computed exactly ONCE, here, near the top, for AnswerResponse.question_non_latin_script
+    # (app/schemas.py -- see that field's own docstring for what it does and does not mean). Every
+    # return point below -- both through _empty_response and the direct AnswerResponse(...)
+    # constructions further down -- passes this SAME value, never recomputes it and never leaves
+    # it implicit: this field states a fact about the question, so a response where it is False
+    # must always mean "the question had no non-Latin letter", never "this code path did not
+    # bother to compute it".
+    question_non_latin_script = _has_non_latin_letter(question)
+
     async def _emit(event: dict) -> None:
         # No-op when on_event is None (the default, and what POST /query passes) -- see this
         # module's docstring. Every call site below awaits this unconditionally so the emission
@@ -429,27 +454,31 @@ async def answer_question(
         if on_event is not None:
             await on_event(event)
 
-    # --- Step 1: clarify. Must not touch pool or embedder at all if it fires. ---
+    # --- Step 1 (STOPGAP, 2026-09-08; moved ahead of clarify on 2026-09-12 -- see
+    # --- docs/adr/0021-script-gate-before-clarifier.md): non-Latin-script no-answer gate. Must
+    # --- not touch pool or embedder at all if it fires -- there is nothing to retrieve against
+    # --- yet, so nothing should be spent trying. See the large comment above
+    # --- _is_predominantly_non_latin (this module, just above answer_question) and
+    # --- docs/adr/0018-non-latin-script-no-answer-stopgap.md for the full record of what this
+    # --- trades, why it exists, and the exact condition for removing it.
+    # ---
+    # --- WHY THIS NOW RUNS BEFORE STEP 1.5's CLARIFY CHECK, WITH THE MEASUREMENT BEHIND IT: this
+    # --- gate and the clarifier's own vague check below are both pure functions of the question
+    # --- string alone, so the set of questions whose outcome the ordering changes is exactly
+    # --- computable, not estimated -- it was computed, not guessed. Until 2026-09-12 the clarifier
+    # --- ran first, so of 28 measured production probes (7 scripts x 4 question-density tiers), 6
+    # --- bare, short, non-Latin questions with no Latin anchor got CLARIFY / "query_too_vague" --
+    # --- "your question is unclear" -- when the real, accurate reason was that this tool cannot
+    # --- read the script at all. This reorder fixes ONLY the message on those 6; it does not
+    # --- change the outcome for the other 22 of the 28: 8 non-Latin questions (7 bare-long, plus
+    # --- 1 bare-short question already long enough to clear the clarifier's own count) already hit
+    # --- this gate first either way, because the clarifier would not have caught them regardless of
+    # --- order, and the 14 questions carrying a Latin anchor ("OPT", "STEM OPT", "E-Verify", "F-1",
+    # --- ...) pass both checks in either order, because _is_predominantly_non_latin returns False
+    # --- the moment any content word contains a Latin letter. See
+    # --- docs/adr/0021-script-gate-before-clarifier.md for the full accounting (8 + 14 = 22).
     await _emit({"event": "stage", "stage": "classify", "status": "start"})
     with tracer.start_as_current_span("classify") as classify_span:
-        vague = is_too_vague(question, min_content_words=settings.CLARIFY_MIN_CONTENT_WORDS)
-        classify_span.set_attribute("clarify_triggered", vague)
-        if vague:
-            classify_span.set_attribute("response_type", ResponseType.CLARIFY.value)
-            await _emit({"event": "stage", "stage": "classify", "status": "done"})
-            return _empty_response(
-                answer=CLARIFY_QUESTION,
-                response_type=ResponseType.CLARIFY,
-                refusal_reason="query_too_vague",
-            )
-
-        # --- Step 1.5 (STOPGAP, 2026-09-08): non-Latin-script no-answer gate. Must not touch
-        # --- pool or embedder at all if it fires -- same "no embedding call, no database query"
-        # --- property as the clarify path directly above, and for the same reason: there is
-        # --- nothing to retrieve against yet, so nothing should be spent trying. See the large
-        # --- comment above _is_predominantly_non_latin (this module, just above answer_question)
-        # --- and docs/adr/0018-non-latin-script-no-answer-stopgap.md for the full record of what
-        # --- this trades, why it exists, and the exact condition for removing it.
         non_latin = _is_predominantly_non_latin(question)
         classify_span.set_attribute("non_latin_script_gate_triggered", non_latin)
         if non_latin:
@@ -468,6 +497,32 @@ async def answer_question(
                 answer=_NON_LATIN_UNSUPPORTED_MESSAGE,
                 response_type=ResponseType.NO_ANSWER,
                 refusal_reason="non_latin_script_unsupported",
+                question_non_latin_script=question_non_latin_script,
+            )
+
+        # --- Step 1.5: clarify. Must not touch pool or embedder at all if it fires -- same
+        # --- "no embedding call, no database query" property the gate above has, and for the
+        # --- same reason: there is nothing to retrieve against yet, so nothing should be spent
+        # --- trying. Runs SECOND now (see docs/adr/0021-script-gate-before-clarifier.md and the
+        # --- comment on the gate above for the measurement behind the swap). A question that is
+        # --- BOTH non-Latin with no anchor AND vague never reaches this check any more -- the gate
+        # --- above already returned NO_ANSWER for it, since it has no Latin anchor to rescue it
+        # --- either way. That is a deliberate, measured consequence of this reorder, not an
+        # --- oversight: such a question is unclear to a human reader too, but this tool cannot
+        # --- read its script at all, and that is the more accurate of the two true things to say.
+        # --- A vague ENGLISH question (or a vague question carrying a Latin anchor, which also
+        # --- never trips the gate above) still reaches this check exactly as before and still
+        # --- gets CLARIFY -- see the reachability tests in tests/test_guardrails.py.
+        vague = is_too_vague(question, min_content_words=settings.CLARIFY_MIN_CONTENT_WORDS)
+        classify_span.set_attribute("clarify_triggered", vague)
+        if vague:
+            classify_span.set_attribute("response_type", ResponseType.CLARIFY.value)
+            await _emit({"event": "stage", "stage": "classify", "status": "done"})
+            return _empty_response(
+                answer=CLARIFY_QUESTION,
+                response_type=ResponseType.CLARIFY,
+                refusal_reason="query_too_vague",
+                question_non_latin_script=question_non_latin_script,
             )
 
         # --- Step 2: classify advice vs. information. Sees only the question text. Routed to
@@ -539,7 +594,21 @@ async def answer_question(
                 # cache_version gates), so the original, already-verified response is still
                 # accurate. No generate or verify event ever fires for this path -- the same
                 # "early return after retrieve" shape NO_ANSWER already has (see module docstring).
-                return cached_response
+                #
+                # question_non_latin_script is the ONE field that is NOT replayed verbatim:
+                # generated_at and freshness are facts about the cached ANSWER, correctly replayed
+                # as they were computed, but question_non_latin_script is a fact about the
+                # QUESTION -- and on a cache hit the question is the INCOMING one, not the stored
+                # one (a semantic-cache hit means "similar enough", not "identical text"). Replaying
+                # it verbatim would let an English question inherit a cached Korean question's
+                # flag (rendering the "this answer is in English" note on an English answer) or the
+                # reverse (hiding the note from a Korean question that hit an English entry) -- the
+                # same "False for two different reasons" problem this field's own docstring in
+                # app/schemas.py warns against. Overwritten here so it means the same thing on every
+                # path, including this one.
+                return cached_response.model_copy(
+                    update={"question_non_latin_script": question_non_latin_script}
+                )
 
         chunks = await hybrid_search(
             pool,
@@ -613,6 +682,7 @@ async def answer_question(
                 answer=_NO_ANSWER_MESSAGE,
                 response_type=ResponseType.NO_ANSWER,
                 refusal_reason=reason,
+                question_non_latin_script=question_non_latin_script,
             )
 
     # Computed once and reused at step 8 (build_freshness) below, rather than calling the clock
@@ -670,6 +740,7 @@ async def answer_question(
             response_type=ResponseType.NO_ANSWER.value,
             refusal_reason="daily_generation_cap_reached",
             generated_at=datetime.now(UTC),
+            question_non_latin_script=question_non_latin_script,
         )
 
     # --- Step 5: generate, with the refusal-shaped prompt for an advice verdict. ---
@@ -809,6 +880,7 @@ async def answer_question(
             response_type=ResponseType.BLOCKED_UNVERIFIED.value,
             refusal_reason=failed.reason,
             generated_at=datetime.now(UTC),
+            question_non_latin_script=question_non_latin_script,
         )
 
     # Append the DSO/attorney redirect to an advice response if the model did not already include
@@ -873,6 +945,7 @@ async def answer_question(
             ),
             response_type=ResponseType.BLOCKED_UNVERIFIED,
             refusal_reason="answer_states_future_rule_as_current",
+            question_non_latin_script=question_non_latin_script,
         )
 
     answer_text = qualification.text
@@ -891,6 +964,7 @@ async def answer_question(
         refusal_reason=refusal_reason,
         generated_at=datetime.now(UTC),
         freshness=freshness,
+        question_non_latin_script=question_non_latin_script,
     )
 
     # Phase 8 round 3: cache this fully verified ANSWER/REFUSAL_ADVICE response. Off by default

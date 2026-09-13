@@ -1913,24 +1913,6 @@ async def test_specific_non_latin_question_is_still_gated_though_clarifier_alone
     assert response.refusal_reason == "non_latin_script_unsupported"
 
 
-async def test_vague_non_latin_query_still_clarifies_ahead_of_the_non_latin_gate():
-    """Ordering guarantee: step 1 (clarify) runs before step 1.5 (this gate), so a query that is
-    BOTH vague AND non-Latin still gets CLARIFY, not NO_ANSWER -- the same one-clarifying-question
-    behavior test_clarifier_still_flags_genuinely_vague_non_latin_queries already asserts at the
-    clarifier level, checked here end to end through the whole pipeline.
-    """
-    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
-    response = await answer_question(
-        "도와주세요",  # Korean "please help" -- vague, and non-Latin, and has no Latin anchor
-        pool=ExplodingPool(),
-        embedder=ExplodingEmbedder(),
-        llm=ExplodingLLM(),
-        settings=settings,
-    )
-    assert response.response_type == ResponseType.CLARIFY.value
-    assert response.refusal_reason == "query_too_vague"
-
-
 async def test_mixed_script_question_with_latin_anchor_reaches_retrieval_not_the_gate(
     pool, embedder, llm, settings
 ):
@@ -1943,6 +1925,258 @@ async def test_mixed_script_question_with_latin_anchor_reaches_retrieval_not_the
         "STEM OPT 延期可以延长多少个月？", pool=pool, embedder=embedder, llm=llm, settings=settings
     )
     assert response.refusal_reason != "non_latin_script_unsupported"
+
+
+# --- REACHABILITY tests (docs/adr/0021-script-gate-before-clarifier.md, the non-Latin-script gate
+# --- now runs before the clarifier's own vague check). Every guardrail test in this file up to
+# --- this point calls its own guard directly (is_too_vague(...), _is_predominantly_non_latin(...),
+# --- verify_citations(...), and so on), which can prove a predicate returns the right boolean but
+# --- can never prove the real pipeline actually REACHES that guard, in the right order, for a
+# --- given question -- an ordering defect is invisible to a test that calls the guard directly.
+# --- These three drive the real entry point, app.pipeline.answer_question, end to end and assert
+# --- on the refusal_reason that comes back. All three questions are pure functions of the question
+# --- string alone (see the STOPGAP comment ahead of _is_predominantly_non_latin in app/pipeline.py
+# --- and app/guardrails/clarifier.py's own module docstring), so none of them needs a live corpus,
+# --- a real embedder, or a real LLM: pool/embedder/llm are the same Exploding* fakes the existing
+# --- CLARIFY and non-Latin-gate tests above already use, proving each response was produced before
+# --- any of the three was ever touched.
+
+
+async def test_bare_non_latin_question_reaches_no_answer_not_clarify():
+    """Regression test for the reorder itself, and the direct successor to
+    test_vague_non_latin_query_still_clarifies_ahead_of_the_non_latin_gate, which used to live here
+    and asserted the pre-ADR-0021 ordering on this exact same question ("clarify runs before the
+    gate, so a vague non-Latin question still gets CLARIFY"). docs/adr/0021-script-gate-before-
+    clarifier.md deliberately reverses that ordering, so that test's contract no longer holds; it
+    was removed as superseded rather than edited to pass -- the coverage did not drop, only the
+    expected value moved, and it moved because the ADR moved it. This test is that same input with
+    the new, correct expectation: the gate now sees this question first, finds a non-Latin letter
+    and zero Latin content words, and returns NO_ANSWER / "non_latin_script_unsupported" instead of
+    CLARIFY -- the accurate reason, since the real problem is not that the question is unclear, it
+    is that this tool cannot read the script at all. The clarifier's own verdict on this question,
+    independent of ordering, is still separately asserted by
+    test_clarifier_still_flags_genuinely_vague_non_latin_queries.
+    """
+    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+    response = await answer_question(
+        "도와주세요",  # Korean "please help" -- vague, non-Latin, no Latin anchor anywhere
+        pool=ExplodingPool(),
+        embedder=ExplodingEmbedder(),
+        llm=ExplodingLLM(),
+        settings=settings,
+    )
+    assert response.response_type == ResponseType.NO_ANSWER.value
+    assert response.refusal_reason == "non_latin_script_unsupported"
+
+
+async def test_short_vague_english_question_still_clarifies_control():
+    """Control proving the reorder did not disable or shadow the clarifier: a short, vague, plain
+    ENGLISH question (nothing non-Latin in it at all, so the gate above can never fire on it) must
+    still reach the clarifier's own vague check and return CLARIFY / "query_too_vague", exactly as
+    it did before this change (see test_vague_query_returns_clarify_without_retrieving above, the
+    same assertion, kept as its own case here specifically as a control for THIS reorder).
+    """
+    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+    response = await answer_question(
+        "help",
+        pool=ExplodingPool(),
+        embedder=ExplodingEmbedder(),
+        llm=ExplodingLLM(),
+        settings=settings,
+    )
+    assert response.response_type == ResponseType.CLARIFY.value
+    assert response.refusal_reason == "query_too_vague"
+
+
+async def test_non_latin_question_with_latin_anchor_and_too_few_content_words_still_clarifies():
+    """The interaction the reorder could plausibly have broken, confirmed directly rather than
+    inferred from the other cases: a non-Latin question that also carries a bare Latin anchor
+    ("OPT") declines the gate above for the same reason any anchored mixed-script question does
+    (see docs/adr/0018-non-latin-script-no-answer-stopgap.md's zero-Latin-anchor rule) -- but it is
+    ALSO too short to pass the clarifier's own check on its own separate terms, so it must still
+    fall through to, and be caught by, the clarifier's vague check, not slip through ungated.
+
+    "OPT 延期?" ("OPT extension?"): the Han characters make this a scriptio-continua question (see
+    app/guardrails/clarifier.py's own module docstring), so `is_too_vague` counts CONTENT
+    CHARACTERS, not content words, for this question, and applies no anchor rescue at all on that
+    branch -- "OPT 延期?" has 5 content characters (O, P, T, 延, 期), under the 10-character floor,
+    so it is genuinely vague on the clarifier's own terms, independent of the anchor. Meanwhile the
+    bare Latin word "OPT" is enough, on its own, to make `_is_predominantly_non_latin` return False
+    -- the gate declines, exactly as it does for any other anchored mixed-script question. Asserted
+    directly against both predicates first, so a future change to either one that broke this
+    specific combination would fail here at the predicate level, not only end to end.
+    """
+    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+    question = "OPT 延期?"
+    assert _is_predominantly_non_latin(question) is False  # gate declines: anchor present
+    assert is_too_vague(question) is True  # but the clarifier still finds it too vague
+    response = await answer_question(
+        question,
+        pool=ExplodingPool(),
+        embedder=ExplodingEmbedder(),
+        llm=ExplodingLLM(),
+        settings=settings,
+    )
+    assert response.response_type == ResponseType.CLARIFY.value
+    assert response.refusal_reason == "query_too_vague"
+
+
+# --- AnswerResponse.question_non_latin_script (app/schemas.py) -- a fact about the QUESTION
+# --- itself, computed once near the top of answer_question and set on every response type it
+# --- returns (see that field's own docstring, and the comment above `question_non_latin_script =
+# --- _has_non_latin_letter(question)` in app/pipeline.py::answer_question). The four tests below
+# --- exercise it end to end: True on a mixed-script question that reaches retrieval, False on a
+# --- plain English question, False on a Spanish question carrying a Latin anchor (the documented
+# --- script-not-language limitation), and True on the bare non-Latin question the gate itself
+# --- refuses -- the control proving this is set on the gated path too, not only on answered ones.
+
+
+async def test_mixed_script_question_with_anchor_sets_question_non_latin_script_true(
+    pool, embedder, llm, settings
+):
+    """A mixed-script question carrying a Latin anchor ("STEM OPT") declines the non-Latin gate
+    (see test_mixed_script_question_with_latin_anchor_reaches_retrieval_not_the_gate above) and
+    reaches retrieval exactly as an equivalent English question would -- but it still contains a
+    real non-Latin letter, so AnswerResponse.question_non_latin_script must be True on the response
+    that comes back, regardless of which of the five response types retrieval and generation
+    ultimately produce.
+    """
+    response = await answer_question(
+        "STEM OPT 延期可以延长多少个月？", pool=pool, embedder=embedder, llm=llm, settings=settings
+    )
+    assert response.question_non_latin_script is True
+
+
+async def test_plain_english_question_sets_question_non_latin_script_false(
+    pool, embedder, llm, settings
+):
+    question = "What is a Form I-515A and when is it issued?"
+    response = await answer_question(
+        question, pool=pool, embedder=embedder, llm=llm, settings=settings
+    )
+    assert response.response_type == ResponseType.ANSWER.value
+    assert response.question_non_latin_script is False
+
+
+async def test_spanish_question_with_latin_anchor_is_a_documented_miss_for_non_latin_script_field(
+    pool, embedder, llm, settings
+):
+    """DOCUMENTS A LIMITATION, not desired behavior: Spanish is written in Latin script, so
+    `_has_non_latin_letter` -- the only thing `question_non_latin_script` reports (see that
+    field's own docstring in app/schemas.py) -- cannot see it, no matter how clearly the question
+    itself is in Spanish. A Spanish speaker who writes "¿Cuántos meses dura la extensión STEM
+    OPT?" gets an English answer back with no note explaining why, because this signal is blind to
+    LANGUAGE and only ever looks at SCRIPT. Closing this gap would need a separate answer-language
+    check, which does not exist yet; this test records the current, real behavior so a future
+    change to this field cannot quietly claim otherwise.
+    """
+    response = await answer_question(
+        "¿Cuántos meses dura la extensión STEM OPT?",
+        pool=pool,
+        embedder=embedder,
+        llm=llm,
+        settings=settings,
+    )
+    assert response.question_non_latin_script is False
+
+
+async def test_bare_non_latin_question_gate_refusal_sets_question_non_latin_script_true():
+    """The control proving `question_non_latin_script` is set on the GATED path too, not only on
+    answered ones: a bare non-Latin question with no Latin anchor never reaches retrieval at all
+    (Exploding* fakes prove that, as in test_non_latin_gate_returns_no_answer_without_retrieving
+    above), but the field must still come back True, because it describes the QUESTION, not
+    whether this code path "bothered" to compute it.
+    """
+    settings = Settings(LLM_PROVIDER="stub", EMBED_PROVIDER="stub")
+    response = await answer_question(
+        "옵티 연장은 몇 개월인가요?",
+        pool=ExplodingPool(),
+        embedder=ExplodingEmbedder(),
+        llm=ExplodingLLM(),
+        settings=settings,
+    )
+    assert response.response_type == ResponseType.NO_ANSWER.value
+    assert response.refusal_reason == "non_latin_script_unsupported"
+    assert response.question_non_latin_script is True
+
+
+class _FixedVectorEmbedder:
+    """Returns the SAME precomputed vector for every question it is given, regardless of the
+    question's own text -- used only to force a genuine semantic-cache HIT between two DIFFERENT
+    question strings whose real embeddings would otherwise differ, so the test below exercises the
+    cache-hit path itself, not retrieval. Distinct from app.providers.embeddings.StubEmbedder,
+    whose vector is a deterministic hash of each text (different text, different vector) -- exactly
+    what would make forcing a hit across two different questions impossible without this.
+    """
+
+    def __init__(self, vector: list[float]):
+        self._vector = vector
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._vector for _ in texts]
+
+
+async def test_cache_hit_overwrites_question_non_latin_script_from_the_incoming_question(pool, llm):
+    """Coordinator-directed fix: app/pipeline.py's semantic-cache-hit return must NOT replay a
+    cached `question_non_latin_script` verbatim the way it replays `generated_at`/`freshness` --
+    see the comment at that return site. `generated_at` and `freshness` are facts about the cached
+    ANSWER, correctly replayed as originally computed; `question_non_latin_script` is a fact about
+    the QUESTION, and on a cache HIT the question is the INCOMING one, not the stored one (a
+    semantic-cache hit means "similar enough", not "identical text").
+
+    This forces a real cache hit between two DIFFERENT question strings -- a plain English one and
+    a mixed-script one carrying a Latin anchor -- by handing both calls the SAME fixed embedding
+    vector via `_FixedVectorEmbedder` above, so the real (dis)similarity of their actual content
+    never enters into it; only the cache-hit path is under test. The first call is a genuine miss
+    (empty cache) that generates and caches a real ANSWER with `question_non_latin_script=False`
+    (its question is plain English); the second call, a different, non-Latin-but-anchored
+    question, must be served that SAME cached answer -- proved by an identical `generated_at`, the
+    same technique test_cache.py::test_cache_is_invalidated_when_the_corpus_changes uses -- but
+    with `question_non_latin_script` now True, reflecting the SECOND call's own question, not the
+    cached one.
+    """
+    settings = Settings(
+        LLM_PROVIDER="stub",
+        EMBED_PROVIDER="stub",
+        NO_ANSWER_MAX_DISTANCE=2.0,
+        SEMANTIC_CACHE_ENABLED=True,
+        SEMANTIC_CACHE_SIMILARITY_THRESHOLD=0.15,
+    )
+    fixed_embedder = _FixedVectorEmbedder([1.0] + [0.0] * 767)
+    try:
+        first = await answer_question(
+            "What is a Form I-515A and when is it issued?",
+            pool=pool,
+            embedder=fixed_embedder,
+            llm=llm,
+            settings=settings,
+        )
+        assert first.response_type == ResponseType.ANSWER.value
+        assert first.question_non_latin_script is False
+
+        second = await answer_question(
+            "STEM OPT 延期可以延长多少个月？",
+            pool=pool,
+            embedder=fixed_embedder,
+            llm=llm,
+            settings=settings,
+        )
+        assert second.generated_at == first.generated_at, (
+            "expected the second call to be served from the cache (identical generated_at); a "
+            "different timestamp means this test did not actually exercise a cache hit"
+        )
+        assert second.response_type == first.response_type
+        assert second.question_non_latin_script is True, (
+            "a semantic-cache hit replayed question_non_latin_script from the CACHED question "
+            "instead of reflecting the INCOMING one"
+        )
+    finally:
+        # Leaves no row behind for a later test/run to trip over -- this file has no autouse
+        # cache-clearing fixture the way test_cache.py does, since no other test here touches the
+        # cache at all.
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM query_cache")
 
 
 # --- full_corpus: calibrates NO_ANSWER_MAX_DISTANCE against the live 216-chunk corpus and the

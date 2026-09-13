@@ -30,6 +30,14 @@ rather than given a wrong answer.
 
 ## Decision
 
+**Superseded on ordering only, by ADR 0021 (2026-09-12):** this decision originally called the gate
+directly after the clarifier's own vague check, on the reasoning that the clarifier should get first
+look at a question. ADR 0021 measured that ordering against 28 production probes, found it produced
+the wrong refusal reason on 6 of them (a bare, non-Latin question with no Latin anchor got
+"query_too_vague" instead of the more accurate "non_latin_script_unsupported"), and swapped the two
+checks so the gate now runs first. Nothing else below -- the zero-Latin-anchor rule, the measured
+retrieval evidence, the tradeoffs, or the removal condition -- is revisited by that change.
+
 `app/pipeline.py::_is_predominantly_non_latin`, called directly after the clarifier's own vague
 check (Step 1.5, before classification, before any embedding call): a question is gated to
 `ResponseType.NO_ANSWER` / `refusal_reason="non_latin_script_unsupported"` when it contains at

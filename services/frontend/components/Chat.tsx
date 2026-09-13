@@ -5,10 +5,12 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { streamQuery, type AnswerResponse, type StageEvent } from "../lib/api";
 import { MOCK_QUESTIONS, MOCK_RESPONSES } from "../lib/fixtures";
 import { withNonBreakingHyphens } from "../lib/nonbreaking";
+import { buildSourceCards } from "../lib/sources";
 import Handoff from "./Handoff";
 import Hero from "./Hero";
 import Message from "./Message";
 import Progress from "./Progress";
+import { SourceRail, SourceSheet, SourcesProvider } from "./SourceList";
 
 const I_UP = (
   <svg
@@ -251,14 +253,43 @@ export default function Chat() {
         ? "Ask something else"
         : "Ask another question";
 
+  const cards =
+    view.response.response_type === "answer" || view.response.response_type === "refusal_advice"
+      ? buildSourceCards(view.response)
+      : [];
+
+  if (cards.length === 0) {
+    return (
+      <Sheet>
+        <Message question={view.question} response={view.response} />
+        <FollowUpAsk
+          placeholder={followUpPlaceholder}
+          autoFocus={view.response.response_type === "clarify"}
+          onSubmit={submit}
+        />
+      </Sheet>
+    );
+  }
+
+  // The `key` clears the highlighted marker/card and closes the sheet whenever the view changes:
+  // a new question (or a new ?mock=) remounts SourcesProvider from scratch, rather than carrying
+  // stale selection state from the previous answer into this one.
   return (
-    <Sheet>
-      <Message question={view.question} response={view.response} />
-      <FollowUpAsk
-        placeholder={followUpPlaceholder}
-        autoFocus={view.response.response_type === "clarify"}
-        onSubmit={submit}
-      />
-    </Sheet>
+    <SourcesProvider key={`${mockState ?? ""}|${q ?? ""}`} cards={cards}>
+      <div className="mx-auto max-w-[800px] px-7 rail:max-w-[1160px]">
+        <div className="grid grid-cols-[minmax(0,1fr)] items-start justify-center gap-[30px] rail:grid-cols-[minmax(0,760px)_340px]">
+          <div className="my-8 rounded-lg border border-rule bg-paper p-8">
+            <Message question={view.question} response={view.response} />
+            <FollowUpAsk
+              placeholder={followUpPlaceholder}
+              autoFocus={view.response.response_type === "clarify"}
+              onSubmit={submit}
+            />
+          </div>
+          <SourceRail />
+        </div>
+      </div>
+      <SourceSheet />
+    </SourcesProvider>
   );
 }

@@ -11,6 +11,15 @@ This is an unofficial tool. It is not affiliated with USCIS, DHS, or any other p
 government, and nothing it says is legal advice. Every answer carries that disclaimer, and no query
 is stored with any identifying information.
 
+It is live at https://office-hours-gray.vercel.app, talking to a Go gateway at
+https://oh-gateway-rp.fly.dev. The orchestrator behind that gateway is private and has no public
+address. Asked on 13 September 2026, `GET https://oh-gateway-rp.fly.dev/v1/sources/status` reported 14
+sources, 0 broken, and an oldest last-verified timestamp of 7 September. That endpoint is public, so
+you can check the corpus state yourself rather than taking this paragraph's word for it.
+
+`REPORT.md` is a red-team report against this deployment, including the findings still open. Read it
+before trusting any answer this system gives for anything that matters.
+
 ## Architecture
 
 The request path is one line from browser to database. The LLM and observability providers hang off
@@ -34,7 +43,7 @@ Fly: orchestrator  (FastAPI)
    clarify -> classify -> retrieve -> no-answer gate -> generate -> verify citations -> freshness
    |
    v
-Neon Postgres + pgvector
+Hosted Postgres + pgvector
    HNSW (semantic) and tsvector (keyword), fused with Reciprocal Rank Fusion in one CTE
 
 Side calls:
@@ -46,15 +55,43 @@ Side calls:
    orchestrator -> Langfuse               (LLM-level traces)
 ```
 
+## How an answer is presented
+
+An answer is prose with bracket citation markers in it, and a set of source cards. Above 980px the
+cards sit in a sticky rail to the right of a reading column capped at 760px. Below 980px the rail is
+replaced by a bar reading "N sources cited" that opens a bottom sheet holding the same cards. The two
+surfaces render the same array from one function (`services/frontend/lib/sources.ts::buildSourceCards`),
+so they cannot disagree.
+
+There are 5 cards, or 7 when a dated rule is in play and the companion slot admits two more. Measured
+across 1,412 rows of stored eval results, those are the only two counts an answered response has ever
+returned.
+
+Each card carries the citation number, the section heading, the domain, when the page was last updated,
+when it was last verified, and a verbatim quote from the retrieved chunk. The quote is the point.
+Checking a claim otherwise means opening a dense government page and searching it, and most of this
+site's traffic is on a phone where that is worse. The quote comes from the full chunk text rather than
+the API's 240-character `snippet` field, because on one source, a DHS FAQ page whose section headings
+are entire questions, the chunk's breadcrumb is 239 characters of a 242-character snippet and leaves
+almost no room for the page's own words.
+
+Citation markers are clickable. Clicking one highlights that marker and its card and scrolls the card
+into view; on a narrow screen, where there is no rail, it opens the sheet instead. Markers are buttons
+rather than links, which also fixes a copy artifact: as anchors, copying an answer and pasting it
+anywhere that converts HTML links to markdown produced `[[1](url)]` instead of `[1]`.
+
 ## The eval numbers
 
-These are from one real eval run against the hosted production provider, compared against the last
-run recorded before that provider swap. Both runs score all 21 rows of `eval/golden.jsonl`, judged by
+These are from one real eval run on 7 September 2026 against the hosted production provider, compared
+against the last run recorded before that provider swap. They have not been re-run since; several
+guardrails have shipped since then, listed under "What's not done".
+
+Both runs score all 21 rows of `eval/golden.jsonl`, judged by
 `nvidia/nemotron-3.5-lightning-30b-a3b`, a different model family than either generator, so the judge
 is never grading its own family's writing.
 
 - Hosted: `eval/results/20260907T015332Z.json`, generating on Ollama Cloud `gpt-oss:120b`, against the
-  live 221-chunk, 14-source corpus in the local Postgres container (not yet on Neon, see below).
+  live 221-chunk, 14-source corpus in the local Postgres container, not a hosted database.
 - Phase 4 baseline: `eval/results/20260905T234405Z.json`, generating locally on `qwen3.5-8k`.
 
 Both runs embedded the query with real local Ollama (`EMBED_PROVIDER=ollama`), not yet the in-process
@@ -88,16 +125,53 @@ codebase optimized.
 
 Two numbers got worse, and they're reported as measured, not softened. Context precision, how much of
 what got retrieved was actually relevant per RAGAS, fell from 0.937 to 0.905; both clear the 0.70 gate,
-but the direction is wrong. Unreferenced citation rate, how many of the 5 chunks the pipeline always
-returns as citation candidates go uncited in the answer text, rose from 0.486 to 0.686:
+but the direction is wrong. Unreferenced citation rate, how many of the chunks the pipeline returns as
+citation candidates go uncited in the answer text, rose from 0.486 to 0.686:
 `citation_detail` in the two result files shows the hosted run cited 33 of 105 possible citations
 against 54 of 105 for the baseline, so `gpt-oss` references fewer of the retrieved passages per
 question, not more.
+
+Read every judge-scored number above with one caveat attached. On the eval run of 11 September, the
+determinism self-check scored the same row's comprehensibility twice at `temperature=0` and got 3 and
+4. The judge is not deterministic, so those numbers carry more noise than their decimal places
+suggest: comprehensibility, false refusal and advice leakage directly, and faithfulness, answer
+relevancy and context precision through RAGAS, which drives the same judge. The two citation rates are
+computed programmatically and are not affected.
 
 `citation_hallucination_rate` reads 0.000 on both runs. That is not a model achievement.
 `services/orchestrator/app/guardrails/citations.py::verify_citations` blocks any answer that cites an index outside what
 was actually retrieved, before it ever renders, regardless of which model wrote it. This number
 measures whether that guardrail's boundary held, not whether the model behaved.
+
+## What gets blocked before it renders
+
+Three checks run at step 7 of the pipeline, after generation and before anything reaches the browser
+(`services/orchestrator/app/pipeline.py`). Each returns a `blocked_unverified` response with copy
+naming the actual reason, rather than a generic error. They run in a fixed order, citations then
+authority then prompt leak, so that when more than one would fire the reason a reader sees does not
+depend on which check happened to run last.
+
+`citations.py` blocks an answer citing an index outside what was retrieved. `authority.py` blocks an
+answer claiming to be official USCIS, DHS, ICE, or SEVP guidance; 21 production answers across 7
+injection variants produced 0 authority claims after it shipped. `prompt_leak.py` blocks an answer
+reproducing this system's own prompt word for word, added after a request framed as a maintainer audit
+returned the prompt's first line character for character. It catches verbatim reproduction only, and a
+paraphrase is deliberately not caught.
+
+A fourth guard runs at step 8, against the generated prose rather than its citations.
+`temporal.py::qualify_future_dated_figures` scans sentence by sentence for a figure that only appears
+in future-dated sources. If the sentence states that figure without a date, it inserts one. If the
+sentence asserts the future rule as current with no mention of the rule still in force, it blocks the
+answer instead.
+
+Two more gates run earlier, before the generator is called at all: the no-answer check at step 4, which
+refuses rather than stretching a weak chunk into a confident answer, and the advice classifier at step
+2, which routes a personal-decision question to a refusal that states the general rule and hands off.
+
+Each of these was added in response to something measured, and each has a false-positive control
+measured before it shipped. The prompt-leak guard's first draft blocked 7 of 21 plausible correct
+answers, and six of its markers were removed as a result, including one that is ordinary immigration
+English rather than self-description.
 
 ## Decisions and why
 
@@ -211,6 +285,11 @@ Ollama runs on your machine, not in a container. The orchestrator reaches it thr
    npm run dev
    ```
 
+   `npm test` runs the frontend's own unit tests, which cover the markdown and citation parser
+   (`lib/prose.ts`, `lib/citations.ts`) and the source-card builder (`lib/sources.ts`). They use
+   Node's built-in test runner against the `.ts` files directly, so there is no build step and no
+   test framework dependency.
+
 6. Open Grafana at `http://localhost:3000` (or whatever `GRAFANA_HOST_PORT` you set) and look in
    Tempo, via Explore, for a trace. One trace spans both services: `office-hours-gateway` and
    `office-hours-orchestrator`, the latter carrying its own `retrieve` and `generate` spans
@@ -238,8 +317,8 @@ repository does either for you.
 
 ## Deploying it
 
-Nothing described here has actually been deployed yet (see "What's not done" below). This is the
-order to do it in, by hand.
+This is deployed. The steps below are the order to do it in, by hand, and they are what produced the
+running system: `oh-orchestrator-rp` and `oh-gateway-rp` on Fly, the frontend on Vercel.
 
 1. **Neon** (Postgres with pgvector). Create a project and get two connection strings from the
    dashboard: the DIRECT one and the POOLED one. Use the direct string to apply
@@ -345,16 +424,68 @@ container start.
 
 ## What's not done
 
-The corpus hasn't been migrated to Neon. Every eval number above ran against the local Postgres
-container in `docker-compose.yml`, not a hosted database.
+`REPORT.md` is the full list, with the measurement behind each one. The items that should change how
+you read this README:
 
-Grafana Cloud and Langfuse are wired into both services' code, but neither has been verified against
-a real endpoint. `.env.example` and the `fly.*.toml` comments describe the exact variables; nobody
-has pointed them at a live Grafana Cloud stack or Langfuse project and confirmed a trace actually
-shows up there.
+**The rule that changes on 15 September 2026 is the weakest thing here, and that date is two days after
+this paragraph was written.** The F-1 post-completion departure period goes from 60 days to 30. Where the corpus holds both the current rule and its dated
+replacement, an answer is supposed to state both with their dates. The effective-date notice fires on
+15 of 18 measured runs, but the prose itself often states only one of the two numbers, and the cause is
+a retrieval miss rather than a disobedient model: the chunk stating the replacement loses on RRF
+fusion even though it contains the query's own words. Three of the four fix options written up in
+`REPORT.md` were measured and cannot fix it. A dated-rule companion slot
+(`docs/adr/0019-dated-rule-companion-retrieval.md`) is what shipped, and it is why an answer on this
+topic returns 7 citations instead of 5. The finding is still open.
 
-Nothing has been deployed. Fly, Vercel, Neon, and Upstash all need accounts created and the steps
-above run by hand before any of this is reachable outside a local machine.
+**A question asked in another language gets an answer in English.** The non-Latin script gate works:
+measured against production on 13 September 2026 with 28 probes across seven scripts (Hangul, Han,
+Kana, Devanagari, Arabic, Cyrillic, Thai) at four question lengths, it fired on all seven, catching
+every bare question that carried no English term. What it does not catch, by deliberate design, is a
+question carrying a Latin anchor such as "OPT" or "STEM OPT". `docs/adr/0018` decided that on evidence:
+those questions retrieve the correct chunks, because the keyword arm matches an English token whatever
+script surrounds it, and they produce correct cited answers.
 
-The golden set is 21 rows, hand-written by the repository owner. It's the standard every number in
-this README is measured against, and growing it is ongoing, not finished.
+They produce them in English. All 6 answers that rendered in that probe set contained zero non-Latin
+letters, opening "Yes. To be eligible for a STEM OPT extension..." for readers who had asked in Korean,
+Chinese, Hindi, Arabic, Russian and Thai. The content is right and the reader may not be able to read
+it. ADR 0018 verified that these questions produce a correct, cited answer; nobody asked whether they
+produce one the person who asked can read.
+
+Spanish shows the same shape and cannot be reached by any script gate, being Latin script throughout: a
+Spanish question carrying "STEM OPT" returns a correct answer in English, and a bare Spanish question
+about the departure period returns "I don't see this covered in my sources" for a topic the corpus
+covers at length. Cross-lingual retrieval is the real gap and it is not built.
+
+**Two dependency problems are measured and unfixed.** The Go gateway builds on `go1.22.12`;
+`govulncheck` finds 39 vulnerabilities actually reachable, 36 of them the Go standard library and all
+36 cleared by moving to Go 1.25.13. The other 3 are module upgrades, two reached from `tracing.go` on
+the startup path. The frontend pins `next 14.2.35`, which carries 27 distinct advisories
+with `--omit=dev`, including an unauthenticated RCE in the Image Optimization API. None of the
+vulnerable surfaces appear in this app's twenty source files, and `/_next/image` on the deployed site
+is answered by Vercel's optimizer rather than by this app's `next` process, measured from the response
+headers. Whether Vercel's implementation carries the same defect is not something that scan can answer.
+
+**The automated gate is narrower than it looks.** Every check that needs the real 14-source corpus
+carries the `full_corpus` pytest marker, and CI runs `pytest -m "not full_corpus"`, so those 17 tests
+never run in any automated gate.
+
+**No guard has a reachability test.** There are four guards now, and every test of every one of them
+calls the guard directly with a string and asserts its return value. That can tell you the guard is
+correct. It cannot tell you the pipeline ever reaches it, in either direction, because it bypasses the
+steps that would stop it. This is not hypothetical: the script gate sits behind the clarifier, which
+reads the same input and returns early, and the only instrument that could answer whether the gate ran
+was a probe through the real entry point. Correctness tests and reachability tests are different tests,
+and this repository has the first kind only.
+
+**`?mock=<state>` renders fixture answers in production, unlabelled.** Four of the five are byte
+identical to real captured responses; the `blocked_unverified` one was produced by running the real
+pipeline with the generator call replaced by a fixed string. Nothing on the page tells a reader they
+are looking at a recording rather than an answer to their question.
+
+**Langfuse has never posted to a real endpoint**, so the LLM-level trace path is wired and unverified.
+Grafana Cloud tracing is configured on both services. The corpus is served by a hosted Postgres behind
+the deployed orchestrator; which provider is behind `DATABASE_URL` is not something this repository
+records.
+
+**The golden set is 21 rows**, hand-written by the repository owner. It is the standard every number in
+this README is measured against, and growing it is ongoing.
