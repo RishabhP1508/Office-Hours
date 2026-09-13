@@ -276,6 +276,19 @@ const _BLOCKED_COPY_BY_REASON: Record<string, { heading: string; body: React.Rea
       </>
     ),
   },
+  // app/guardrails/prompt_leak.py: the generated answer reproduced this tool's own system prompt
+  // word for word. Its citations may have been perfectly valid, so the default citation-check copy
+  // would state the wrong cause, which is the same reason the authority copy above exists.
+  answer_reproduces_system_prompt: {
+    heading: "This answer repeated our own instructions, so we blocked it",
+    body: (
+      <>
+        The answer we generated quoted the instructions this tool runs on instead of sticking to
+        the sources it retrieved, so we’re withholding it rather than showing it. Ask your
+        immigration question on its own and it should come back answered.
+      </>
+    ),
+  },
   // app/guardrails/temporal.py's BLOCK signal (that module's own docstring, "BLOCK VS INSERT"):
   // the generated answer stated a rule that changes on a known future date as though it were
   // already the rule in force, with nothing in it naming the version still in force today.

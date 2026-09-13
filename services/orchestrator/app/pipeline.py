@@ -52,14 +52,15 @@ Concretely, in order:
    (app/prompts.py::strip_source_list_block) -- BOTH BEFORE verification, not after (see the
    comment at the call site for why the order matters).
 7. Verify citations (app/guardrails/citations.py), then verify no authority claim
-   (app/guardrails/authority.py): block the generated text and return BLOCKED_UNVERIFIED if a cited
-   index falls outside the retrieved range, if an ANSWER carries no citation at all, or if the
-   answer claims (or implies) that it is official, authoritative, government guidance, or legal
-   advice. Both checks run against the SAME `answer_text`, post-normalization and post-strip; on a
-   citation failure the existing citation-check message renders, on an authority-only failure an
-   honest authority-check message renders instead (see `_blocked_message_for_reason`). Then, only if
-   both checks passed, append the DSO/attorney redirect sentence to an advice response if the model
-   did not already include one.
+   (app/guardrails/authority.py), then verify no prompt leak (app/guardrails/prompt_leak.py): block
+   the generated text and return BLOCKED_UNVERIFIED if a cited index falls outside the retrieved
+   range, if an ANSWER carries no citation at all, if the answer claims (or implies) that it is
+   official, authoritative, government guidance, or legal advice, or if it reproduces this tool's
+   own system prompt verbatim. All three checks run against the SAME `answer_text`,
+   post-normalization and post-strip, and each failure renders its own honest message rather than a
+   reused one (see `_blocked_message_for_reason`); precedence when more than one would fail is
+   citations, then authority, then prompt leak. Then, only if all three passed, append the
+   DSO/attorney redirect sentence to an advice response if the model did not already include one.
 8. Freshness (app/guardrails/freshness.py): build the structured freshness block from the same
    retrieved chunks and, for ANSWER and REFUSAL_ADVICE only, append the effective-date notice
    sentence to the answer text for EVERY distinct retrieved source that carries a
@@ -139,6 +140,7 @@ from app.guardrails.citations import parse_cited_indices, verify_citations
 from app.guardrails.clarifier import CLARIFY_QUESTION, content_words, is_too_vague
 from app.guardrails.classifier import classify_advice
 from app.guardrails.freshness import build_freshness, freshness_notice_text
+from app.guardrails.prompt_leak import verify_no_prompt_leak
 from app.guardrails.temporal import qualify_future_dated_figures
 from app.langfuse_telemetry import record_generation_trace
 from app.prompts import (
@@ -190,6 +192,16 @@ _AUTHORITY_BLOCKED_MESSAGE = (
     "I generated an answer to this, but it claimed to be official, authoritative, or government "
     "guidance, which this tool is not and cannot claim to be, so I'm not showing it. Please try "
     "rephrasing the question."
+)
+
+# app/guardrails/prompt_leak.py's failure case: the generated answer reproduced this tool's own
+# instructions word for word instead of, or alongside, answering the question. Neither of the two
+# messages above is true here -- the citations may be perfect and nothing claimed authority -- so
+# this is a third honest message rather than a reused one.
+_PROMPT_LEAK_BLOCKED_MESSAGE = (
+    "I generated an answer to this, but it repeated my own instructions back word for word "
+    "instead of sticking to the sources, so I'm not showing it. Ask the immigration question on "
+    "its own and I should answer it."
 )
 
 
@@ -349,18 +361,26 @@ def _blocked_message_for_reason(
     """Which safe message renders for a BLOCKED_UNVERIFIED response -- selected by `reason`, not by
     which check happened to run last, so this stays correct even if step 7's checks are ever
     reordered. "answer_claims_official_authority" (app/guardrails/authority.py) gets the honest
-    authority message; "answer_states_future_rule_as_current" (app/guardrails/temporal.py's BLOCK
-    signal) gets a message built from `future_rule_source_urls` -- the only one of the three reasons
-    whose message is not a fixed constant, since it has to name the real retrieved source rather
-    than only ask the reader to rephrase (see _future_rule_blocked_message's own docstring). Every
-    other reason (both of verify_citations's own reasons, and anything else that might reuse this
-    response type in the future) keeps the existing citation-check wording; those call sites (step
-    7, below) never pass `future_rule_source_urls`, leaving it at its default empty tuple.
+    authority message; "answer_reproduces_system_prompt" (app/guardrails/prompt_leak.py) gets the
+    honest prompt-leak message; "answer_states_future_rule_as_current" (app/guardrails/temporal.py's
+    BLOCK signal) gets a message built from `future_rule_source_urls` -- the only one of the four
+    reasons whose message is not a fixed constant, since it has to name the real retrieved source
+    rather than only ask the reader to rephrase (see _future_rule_blocked_message's own docstring).
+    Every other reason (both of verify_citations's own reasons, and anything else that might reuse
+    this response type in the future) keeps the existing citation-check wording; those call sites
+    (step 7, below) never pass `future_rule_source_urls`, leaving it at its default empty tuple.
+
+    Each message says what actually happened. A wrong-but-reassuring message is its own defect: the
+    authority message exists because the citation wording said the opposite of the real cause, and
+    the same reasoning applies here -- an answer withheld for reproducing the prompt has nothing
+    wrong with its citations.
     """
     if reason == "answer_states_future_rule_as_current":
         return _future_rule_blocked_message(future_rule_source_urls)
     if reason == "answer_claims_official_authority":
         return _AUTHORITY_BLOCKED_MESSAGE
+    if reason == "answer_reproduces_system_prompt":
+        return _PROMPT_LEAK_BLOCKED_MESSAGE
     return _BLOCKED_MESSAGE
 
 
@@ -728,22 +748,34 @@ async def answer_question(
     answer_text = normalize_native_citation_markup(answer_text)
     answer_text = strip_source_list_block(answer_text)
 
-    # --- Step 7: verify citations, then verify no authority claim. Both run against the SAME
-    # --- answer_text and both feed the one "verify" stage event; blocks rendering the generated
-    # --- text if either fails. Citation failure takes precedence over an authority failure when
-    # --- picking which reason/message renders if, somehow, both would fail on the same answer --
-    # --- see tests/test_guardrails.py's Test A/B for why that fixture is deliberately built so
-    # --- verify_citations passes and the authority guard is the only thing that can block it. ---
+    # --- Step 7: verify citations, then verify no authority claim, then verify no prompt leak.
+    # --- All three run against the SAME answer_text and feed the one "verify" stage event; any
+    # --- one failing blocks the generated text from rendering. Precedence when more than one
+    # --- would fail on the same answer is citations, then authority, then prompt leak -- fixed
+    # --- here rather than left to whichever check ran last, so the reason and the message a
+    # --- reader sees do not depend on ordering. See tests/test_guardrails.py's Test A/B pairs for
+    # --- why each guard's fixture is deliberately built so the other checks pass and the guard
+    # --- under test is the only thing that can block it.
+    #
+    # The prompt-leak check is the newest of the three and closes a measured production hole: on
+    # 12 September 2026 three blended probes returned prompt material, passed both of the checks
+    # above, and rendered. They were not near misses against a guard; nothing here checked for it.
+    # See app/guardrails/prompt_leak.py and REPORT.md, "OWASP LLM07, System Prompt Leakage".
     await _emit({"event": "stage", "stage": "verify", "status": "start"})
     verification = verify_citations(
         answer_text, num_contexts=len(chunks), response_type=candidate_response_type.value
     )
     authority_verification = verify_no_authority_claim(answer_text)
-    verify_ok = verification.ok and authority_verification.ok
+    prompt_leak_verification = verify_no_prompt_leak(answer_text)
+    verify_ok = verification.ok and authority_verification.ok and prompt_leak_verification.ok
     await _emit({"event": "stage", "stage": "verify", "status": "done", "ok": verify_ok})
 
     if not verify_ok:
-        failed = verification if not verification.ok else authority_verification
+        failed = next(
+            check
+            for check in (verification, authority_verification, prompt_leak_verification)
+            if not check.ok
+        )
         trace.get_current_span().set_attribute(
             "response_type", ResponseType.BLOCKED_UNVERIFIED.value
         )
@@ -759,6 +791,16 @@ async def answer_question(
             trace.get_current_span().set_attribute("authority_claim_blocked", True)
             trace.get_current_span().set_attribute(
                 "authority_claim_predicate", authority_verification.detail or "unknown"
+            )
+        if failed is prompt_leak_verification:
+            # Same discipline as the authority branch above, for a second reason on top of it:
+            # `prompt_leak_verification.detail` is a class label from
+            # app.guardrails.prompt_leak.PROMPT_LEAK_CLASS_LABELS ("rule_text", "context_format",
+            # "version_hash"), never the matched span. Exporting the span would write the system
+            # prompt's own text into telemetry, which is the thing this guard exists to keep in.
+            trace.get_current_span().set_attribute("prompt_leak_blocked", True)
+            trace.get_current_span().set_attribute(
+                "prompt_leak_class", prompt_leak_verification.detail or "unknown"
             )
         return AnswerResponse(
             answer=_blocked_message_for_reason(failed.reason),
