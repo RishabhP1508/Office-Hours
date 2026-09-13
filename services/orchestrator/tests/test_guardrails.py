@@ -18,10 +18,8 @@ the real threshold (0.42) against real semantics is a separate, full_corpus-mark
 down.
 """
 
-import importlib.util
 import json
 import os
-import pathlib
 import re
 from datetime import date, timedelta
 
@@ -2425,7 +2423,10 @@ def test_every_prompt_leak_rule_span_is_still_literally_in_a_prompt():
         "these prompt-leak markers are no longer literal substrings of either system prompt, so "
         "they can never fire and the guard's coverage has narrowed silently: "
         f"{stale}. Re-lift them from app/prompts.py, then re-run BOTH controls "
-        "(_PROMPT_LEAK_CONTROL_CORPUS above, and the stored answers in eval/results/*.json)."
+        "(_PROMPT_LEAK_CONTROL_CORPUS above, and the stored answers in eval/results/*.json). "
+        "AND re-lift the standalone probe tool in docs/security/ if you keep one: that path is "
+        "gitignored, so no test here can see it, and it is stale from the moment this fails. The "
+        "tool checks itself against this module when run from inside a checkout."
     )
 
 
@@ -2445,46 +2446,68 @@ def test_every_prompt_leak_format_span_is_still_literally_produced_by_the_prompt
     assert stale == [], f"context-format markers no longer produced by _rule_date_note: {stale}"
 
 
-def test_the_offline_detector_has_not_drifted_from_the_deployed_guard():
-    """docs/security/llm07_detector.py is the standalone offline probe tool and holds a second copy
-    of the same markers, because the orchestrator image does not ship docs/. Two copies that must
-    not diverge should be a red check rather than a comment in one of them.
-
-    Note what the HASHES comparison does here beyond equality: the deployed guard COMPUTES its
-    hashes from app/prompts.py at import, while the offline copy hardcodes them. So this assertion
-    also catches the offline file going stale against a prompt edit.
-    """
-    detector_path = (
-        pathlib.Path(__file__).resolve().parents[3] / "docs" / "security" / "llm07_detector.py"
-    )
-    assert detector_path.is_file(), (
-        f"{detector_path} is missing. It is the offline probe tool REPORT.md's LLM07 section is "
-        "written against; if it was deliberately removed, remove this test in the same change "
-        "rather than leaving a check that cannot run."
-    )
-    spec = importlib.util.spec_from_file_location("llm07_detector_offline", detector_path)
-    offline = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(offline)
-
-    assert offline.RULE_SPANS == prompt_leak_module.RULE_SPANS
-    assert offline.FORMAT_SPANS == prompt_leak_module.FORMAT_SPANS
-    assert offline.FORMAT_REGEXES == prompt_leak_module.FORMAT_REGEXES
-    assert offline.HASHES == prompt_leak_module.HASHES
-
-
 def test_precomputing_the_normalized_spans_did_not_change_what_matches():
-    """The deployed guard normalizes its spans once at import; the offline copy normalizes them on
-    every call. That is a performance change and must not be a behaviour change, so the two are
-    compared on the whole corpus rather than on one input.
+    """The guard normalizes its markers ONCE at import and reuses the result on every call, which
+    is a 4.3x speedup and must not be a behaviour change.
+
+    An earlier version of this test compared the guard against the standalone probe tool in
+    `docs/security/`, which normalizes per call. That path is DELIBERATELY GITIGNORED -- the tool
+    holds verbatim spans lifted from the system prompts, and publishing those in a public
+    repository for a service built to stop them leaking is the wrong trade -- so a test that reads
+    it passes on one laptop and errors in CI. This version has no external dependency and is the
+    better check anyway, because it tests the property directly instead of testing that two files
+    agree about it.
+
+    Two assertions, and the first is the one that catches the realistic failure. A test or a patch
+    that rebinds `RULE_SPANS` after import leaves `_NORMALIZED_RULE_SPANS` holding the OLD markers,
+    so the guard goes on matching text nobody asked it to match and stops matching text they did.
+    Nothing else in this file would notice.
     """
-    detector_path = (
-        pathlib.Path(__file__).resolve().parents[3] / "docs" / "security" / "llm07_detector.py"
-    )
-    spec = importlib.util.spec_from_file_location("llm07_detector_offline", detector_path)
-    offline = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(offline)
+    assert prompt_leak_module._NORMALIZED_RULE_SPANS == tuple(
+        (span, prompt_leak_module._norm(span)) for span in prompt_leak_module.RULE_SPANS
+    ), "the precomputed rule spans are stale against RULE_SPANS as it stands now"
+    assert prompt_leak_module._NORMALIZED_FORMAT_SPANS == tuple(
+        (span, prompt_leak_module._norm(span)) for span in prompt_leak_module.FORMAT_SPANS
+    ), "the precomputed format spans are stale against FORMAT_SPANS as it stands now"
+
+    def reference_scan(answer_text: str) -> dict:
+        """`scan` as it would be written with no precomputation at all: every marker normalized on
+        every call, every regex compiled on every call. Written from the documented behaviour
+        rather than derived by running `scan`, so the comparison below is not circular.
+        """
+        normalized = prompt_leak_module._norm(answer_text)
+        hits: dict = {"rule_text": [], "context_format": [], "version_hash": []}
+        for span in prompt_leak_module.RULE_SPANS:
+            if prompt_leak_module._norm(span) in normalized:
+                hits["rule_text"].append(span)
+        for span in prompt_leak_module.FORMAT_SPANS:
+            if prompt_leak_module._norm(span) in normalized:
+                hits["context_format"].append(span)
+        for pattern, label in prompt_leak_module.FORMAT_REGEXES:
+            if re.search(pattern, answer_text, re.IGNORECASE):
+                hits["context_format"].append(label)
+        for prompt_hash in prompt_leak_module.HASHES:
+            if prompt_hash in normalized:
+                hits["version_hash"].append(prompt_hash)
+        hits["leaked"] = any(hits[key] for key in ("rule_text", "context_format", "version_hash"))
+        return hits
+
     for case_id, _verdict, text, _why in _PROMPT_LEAK_CONTROL_CORPUS:
-        assert scan_prompt_leak(text) == offline.scan(text), case_id
+        assert scan_prompt_leak(text) == reference_scan(text), case_id
+
+    # The corpus must actually exercise all three classes, or the loop above compares two
+    # implementations that both returned nothing. REPORT.md entry 18 is a clean sweep over text the
+    # instrument never saw; this is the same check applied to this test's own inputs.
+    fired = {
+        cls
+        for _id, _v, text, _w in _PROMPT_LEAK_CONTROL_CORPUS
+        for cls in ("rule_text", "context_format", "version_hash")
+        if scan_prompt_leak(text)[cls]
+    }
+    assert fired == {"rule_text", "context_format", "version_hash"}, (
+        f"the corpus only exercised {sorted(fired)}, so this comparison says nothing about the "
+        "classes it never triggered"
+    )
 
 
 # --- The A/B mutation pair, the same shape as the authority guard's. Test A alone would not

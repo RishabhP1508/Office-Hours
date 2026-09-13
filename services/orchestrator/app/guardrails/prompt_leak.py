@@ -47,13 +47,23 @@ tests/test_guardrails.py:
   * `test_every_prompt_leak_rule_span_is_still_literally_in_a_prompt` asserts each span below is a
     substring of a real prompt, which catches the narrower case the hash pin cannot: someone edits
     a prompt, dutifully updates both pinned hashes, and leaves a span stale.
-  * `test_the_offline_detector_has_not_drifted_from_the_deployed_guard` ties
-    docs/security/llm07_detector.py's copy of these markers to this one, because two copies that
-    must not diverge should be a red check and not a note.
+  * `test_precomputing_the_normalized_spans_did_not_change_what_matches` asserts the import-time
+    snapshot below still matches the marker lists it was built from, and that the guard agrees
+    with an unoptimized reference implementation across the whole control corpus.
 
 `HASHES` is COMPUTED from app/prompts.py at import rather than hardcoded, so the guard can never
 look for a version hash the prompts stopped having. The pinning lives in the test, where a stale
 value fails loudly, instead of in this module, where it would fail silently.
+
+THIS MODULE IS THE ONLY COPY OF THESE MARKERS IN THE REPOSITORY, and that is deliberate. A
+standalone offline probe tool with its own copy used to live at docs/security/llm07_detector.py;
+that path is gitignored on purpose, because the markers are verbatim system-prompt text and
+publishing them in a public repository for a service built to stop them leaking is the wrong trade.
+No test here can reach a gitignored file, so the drift check moved INTO that tool: run from inside
+a checkout it imports this module, compares its markers against these, and exits nonzero on a
+mismatch; run from outside one it says in its own output that it could not verify them. If you
+re-lift the markers below, that tool is stale until you re-lift it too, and
+`test_every_prompt_leak_rule_span_is_still_literally_in_a_prompt` says so in its failure message.
 """
 
 import re
@@ -202,8 +212,8 @@ def scan(answer_text: str) -> dict:
     if any class is non-empty.
 
     Kept as a public function alongside `verify_no_prompt_leak` below because the offline probe
-    work in docs/security/ needs the per-class breakdown, and because a test asserting WHICH class
-    fired is a stronger test than one asserting only that something did.
+    tool needs the per-class breakdown, and because a test asserting WHICH class fired is a
+    stronger test than one asserting only that something did.
 
     FORMAT_REGEXES are matched against the RAW text, not the normalized form, because both depend
     on layout -- one on a bracket-digit-bracket sequence, the other on a line boundary -- and
