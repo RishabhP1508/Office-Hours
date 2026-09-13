@@ -66,6 +66,13 @@ export interface AnswerResponse {
   response_type: ResponseType;
   refusal_reason: string | null;
   freshness: Freshness | null;
+  // app/schemas.py::AnswerResponse.question_non_latin_script -- a fact about the QUESTION, not the
+  // language of the answer (see that field's own docstring for the script-vs-language limitation).
+  // OPTIONAL here, not required: lib/fixtures.ts holds responses captured byte-identically from
+  // the real API before this field existed, and making it required would force edits into those
+  // fixtures, breaking the "byte-identical to what the API returned" property their header comment
+  // claims. An absent field and `false` mean the same thing throughout this app.
+  question_non_latin_script?: boolean;
 }
 
 export type FreshnessState = "current" | "recent" | "stale" | "unknown";

@@ -178,6 +178,23 @@ class AnswerResponse(BaseModel):
     refusal_reason: str | None = None
     freshness: Freshness | None = None
 
+    # A fact about the QUESTION, not a decision about how this response should be presented: True
+    # iff the question text contained at least one non-Latin-script letter, per
+    # app/pipeline.py::_has_non_latin_letter. Computed exactly once, near the top of
+    # app/pipeline.py::answer_question, and set on EVERY response type that function returns
+    # (CLARIFY, NO_ANSWER, BLOCKED_UNVERIFIED, the budget-cap degradation, and the non-Latin gate
+    # itself, not only ANSWER/REFUSAL_ADVICE) -- a response where this is False must always mean
+    # "the question had no non-Latin letter", never "this response type did not bother to compute
+    # it". A field that can be False for two different reasons is a field nobody can trust.
+    #
+    # FIRES ON SCRIPT, NOT ON LANGUAGE. A question written in Spanish, French, Portuguese, German,
+    # or any other Latin-script language leaves this False, so a Spanish speaker who writes "STEM
+    # OPT" gets an English answer with no note about it at all. That is a known, deliberate
+    # limitation of this signal, not a bug: this field only ever answers "did the question contain
+    # a non-Latin letter", never "what language is the question (or the answer) actually in".
+    # Closing that gap would need a separate answer-LANGUAGE check, which does not exist here.
+    question_non_latin_script: bool = False
+
 
 class BrokenSource(BaseModel):
     """One `sources` row app/guardrails/freshness.py::source_health_state has classified "broken"

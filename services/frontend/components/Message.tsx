@@ -13,7 +13,7 @@ import {
 import Citation from "./Citation";
 import Freshness from "./Freshness";
 import Handoff from "./Handoff";
-import SourceList from "./SourceList";
+import { SourceBar } from "./SourceList";
 
 /** Renders one `parseInline` node tree as React elements -- never as an HTML string, so there is
  * no `dangerouslySetInnerHTML` and no injection surface. `bold`/`italic` recurse over their own
@@ -22,7 +22,7 @@ import SourceList from "./SourceList";
  * `link` is only ever produced by `parseInline` after it already passed the http(s)-only scheme
  * check, so no second check is needed here; a `citation` node renders the same `<Citation>`
  * component every bracket marker has always rendered as. */
-function InlineNodes({ nodes, citations }: { nodes: InlineNode[]; citations: CitationType[] }) {
+export function InlineNodes({ nodes, citations }: { nodes: InlineNode[]; citations: CitationType[] }) {
   return (
     <>
       {nodes.map((node, i) => {
@@ -145,6 +145,21 @@ function AnsweredProse({
   return (
     <div>
       <YouEcho question={question} />
+      {/* Sits ABOVE the prose, not below it: a reader who struggles with English needs this
+          explanation before they start reading, not after -- and below-the-fold goes unread on a
+          phone anyway (the old inline source list measured 936px down a 1711px page at 375x812).
+          Keyed on response.question_non_latin_script, i.e. on SCRIPT, not on language, so a
+          Spanish question (Latin script) never trips this even though the answer is still in
+          English -- see that field's own docstring in app/schemas.py for the limitation. Reuses
+          Handoff exactly as written and deliberately does NOT use Freshness's saffron left border:
+          that styling means "a rule here is changing"; nothing here is wrong with the answer. */}
+      {response.question_non_latin_script && (
+        <Handoff heading="This answer is in English because its sources are">
+          Office Hours reads fourteen U.S. government pages, all of them published in English
+          only, and quotes them word for word rather than translating. If any of this is hard to
+          follow, your DSO can go through it with you.
+        </Handoff>
+      )}
       <div className="max-w-[62ch] font-serif text-lg leading-[1.85] text-body">
         {lead && (
           <span className="mb-[15px] block text-[23px] font-semibold leading-[1.3] text-ink">
@@ -163,12 +178,10 @@ function AnsweredProse({
           take it further if you need that.
         </Handoff>
       )}
-      <SourceList
-        citations={response.citations}
-        contexts={response.contexts}
-        freshness={response.freshness}
-      />
-      <Stamp response={response} />
+      <div className="mt-7 border-t border-rule pt-5">
+        <Stamp response={response} />
+      </div>
+      <SourceBar />
     </div>
   );
 }
