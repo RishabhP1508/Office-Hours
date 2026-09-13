@@ -35,7 +35,7 @@ import (
 // appends exactly "/v1/traces" itself, then passes the FULL result to
 // otlptracehttp.WithEndpointURL -- deliberately NOT otlptracehttp.WithEndpoint(host), because
 // WithEndpointURL takes whatever path the given URL carries VERBATIM as the request path
-// (confirmed against otlptracehttp v1.35.0 source, internal/otlpconfig/options.go:280 --
+// (confirmed against otlptracehttp v1.35.0 source and re-confirmed at v1.43.0, internal/otlpconfig/options.go:282 --
 // `cfg.Traces.URLPath = u.Path`), with no automatic "/v1/traces" append the way the OTLP spec's
 // general-endpoint convention implies.
 //
