@@ -3258,6 +3258,12 @@ inferred from the Dockerfile: the binary was extracted from `office-hours-gatewa
 
 A bump to Go 1.25.13 clears all 36. Nothing else on this list moves them.
 
+**Done 13 September, fifth session.** The toolchain bump and all three module upgrades are applied and
+re-measured: 39 called becomes 0, with the toolchain accounting for exactly 36 and the module upgrades
+for exactly 3, each half confirmed by its own scan rather than by a release note. See "The gateway's
+39 called vulnerabilities are 0, and the toolchain and the modules each cleared exactly what they
+should" below. Still NOT DEPLOYED.
+
 The other 3 are real module upgrades:
 
 | OSV | Module | Installed | Fixed in | What it is |
@@ -3549,6 +3555,208 @@ once, and mostly for things nobody can fix in the pull request that happens to b
 `recrawl.yml` already runs on `cron` and exits non-zero only on a condition this project chose
 deliberately. That remains a recommendation. **Nothing was added to `.github/workflows`.**
 
+
+### The gateway's 39 called vulnerabilities are 0, and the toolchain and the modules each cleared exactly what they should
+
+**Status, 13 September 2026, fifth session. APPLIED to the repository. NOT DEPLOYED: the gateway
+serving `oh-gateway-rp.fly.dev` right now is still the `go1.22.12` binary carrying all 39.** Closing
+this in production needs a `fly deploy`, which is the user's to run, with the rate limiter and tracing
+to be verified against production afterwards. Everything below describes the repository.
+
+Changed: `services/gateway/go.mod`, `services/gateway/go.sum`, one line of
+`services/gateway/Dockerfile`, and a new `services/gateway/internal/middleware/tracing_test.go`. One
+comment line in `internal/middleware/tracing.go` was updated because the bump made its version
+reference stale; nothing executable in that file moved.
+
+#### The headline, decomposed rather than just reported
+
+One analyzer version throughout (govulncheck v1.7.0, database updated 2026-09-10), run across three
+configurations, so the 39 comes apart into its causes instead of merely vanishing:
+
+    code                       Go environment   called   imported   required   exit
+    old (otel 1.35/grpc 1.71)  go1.22.12           39        10         22       3
+    old (otel 1.35/grpc 1.71)  go1.25.13            3         5         14       3
+    new (otel 1.43/grpc 1.82)  go1.25.13            0         3         10       0
+
+**Row 1 re-anchors the baseline, and it was worth doing.** The 39 recorded in "govulncheck: 39 of 71
+are actually called" was measured in a previous session with govulncheck v1.1.3 against a live
+database that has moved since. Re-measured today with a *different* analyzer against a *newer*
+database, it is still 39 called of 71 surfaced, with the same 10 and 22 split. The before-number is
+not stale, so the after-number is comparable to it.
+
+**Row 2 is the control that makes row 3 mean something.** Old code, new toolchain only: the 36
+standard-library findings drop to zero and exactly three remain, and they are the three the previous
+session named, at the versions it named:
+
+    GO-2026-6061   google.golang.org/grpc@v1.71.0                fixed in v1.82.1
+    GO-2026-4985   otlptrace/otlptracehttp@v1.35.0               fixed in v1.43.0
+    GO-2026-4394   go.opentelemetry.io/otel/sdk@v1.35.0          fixed in v1.40.0
+
+So the toolchain bump is responsible for exactly 36 and the module upgrades for exactly 3. Neither
+number is inferred from a release note. `govulncheck` exits 3 when it finds called vulnerabilities and
+0 when it does not, so the exit column is a gate rather than decoration.
+
+#### Why "0 called" is not the clean sweep of entry 18
+
+Entry 18 records a correct instrument pointed at the wrong surface reporting a clean sweep in the same
+voice as a real one. A zero here has exactly that shape, so it carries four separate guards.
+
+**The positive control fired in the same image that produced the zero.** A throwaway module pinning
+`golang.org/x/text v0.3.0` and calling `language.Parse` returns GO-2021-0113 with its call trace and
+exit 3, run in the `go1.25.13` scanner image and again in the `go1.22.12` one. The instrument can
+still find a called vulnerability where one exists.
+
+**The same control shows the scan reads the toolchain rather than the Dockerfile.** On byte-identical
+source, the `go1.22.12` environment additionally reports a standard-library finding (GO-2025-3750,
+`os@go1.22.12`, fixed in `os@go1.23.10`) that the `go1.25.13` environment does not. The Go version of
+the environment is what drives the standard-library column, which is the entire mechanism the 36
+depends on.
+
+**The scan still surfaces 13 advisories.** A scan that silently loaded no packages reports zero in
+every column. This one reports 0 called, 3 imported but not called and 10 required but not imported,
+so it is demonstrably walking the dependency graph and finding nothing vulnerable on a call path.
+
+**Row 2 is an in-situ positive control on this exact module.** The `x/text` control proves the
+analyzer works on *a* module; row 2 proves it reports called findings on *this* module, in *this*
+image, with the *same* command that later returns zero. The only difference between rows 2 and 3 is
+the dependency versions.
+
+**Confirmed from the artifact, not the Dockerfile.** The image was built from the repository
+Dockerfile, the binary extracted with `docker cp`, and `go version -m` on it reads `go1.25.13` (the
+baseline's `go1.22.12` was established the same way). A binary-mode scan of that same binary agrees
+with the source-mode scan: 0 called, exit 0.
+
+#### An instrument finding: govulncheck v1.1.3 cannot measure a Go 1.25 surface at all
+
+The plan was to hold the analyzer at v1.1.3 across before and after, so the only variable would be the
+code. That proved impossible, in two stages.
+
+v1.1.3 will not **compile** under Go 1.25.13; its `golang.org/x/tools v0.23.0` fails with
+`invalid array length -delta * delta (constant -256 of type int64)`. Building the v1.1.3 binary under
+Go 1.22 and running that binary in a Go 1.25.13 environment gets further, then fails on package
+loading:
+
+    govulncheck: Loading packages failed, possibly due to a mismatch between the Go version
+    used to build govulncheck and the Go version on PATH.
+    /usr/local/go/src/slices/iter.go:51:17: cannot range over seq (variable of type iter.Seq[E])
+
+**It failed loudly, with exit 1, which is the only reason this is a footnote rather than a table
+entry.** An analyzer whose source processing predates range-over-func cannot parse the Go 1.25
+standard library. Had it degraded to skipping the files it could not parse, the output would have been
+"No vulnerabilities found" over a standard library it never read, which is entry 18 exactly. The
+resolution was to hold the analyzer constant at the *newest* version instead: v1.7.0 is the newest
+that installs under Go 1.25.13, it was built once, and that one binary was run in both environments,
+which is what makes rows 1 to 3 a single instrument.
+
+The operational note from the previous session still stands and is now sharper. `govulncheck@latest`
+is v1.8.0 and requires Go >= 1.26, so it still cannot run in the container this project builds in,
+even at Go 1.25.13. Scanning in a Go 1.26 container would report standard-library findings against a
+Go version this binary is not built with, which is the wrong surface. The scanner container and the
+build container must differ in the scanner only.
+
+#### What moved, and one deviation from the approved plan
+
+No module path changed, so none of the three chosen upgrades is a major-version move.
+
+| Module | From | To | Advisory floor |
+|---|---|---|---|
+| `go.opentelemetry.io/otel/sdk` | v1.35.0 | v1.43.0 | v1.40.0, GO-2026-4394 |
+| `otlptrace/otlptracehttp` | v1.35.0 | v1.43.0 | v1.43.0, GO-2026-4985 |
+| `google.golang.org/grpc` | v1.71.0 | v1.82.2 | v1.82.1, GO-2026-6061 |
+| `otel`, `otel/trace`, `otel/metric`, `otlptrace` | v1.35.0 | v1.43.0 | lockstep with the above |
+| `contrib/.../otelhttp` | v0.60.0 | v0.68.0 | pairs with otel v1.43.0 |
+| `golang.org/x/net` (indirect) | v0.35.0 | v0.53.0 | v0.36.0, GO-2025-3503 |
+
+The contrib pairing was measured rather than assumed: otelhttp v0.68.0's own `go.mod` requires otel
+v1.43.0, where v0.67.0 requires v1.42.0 and v0.69.0 requires v1.44.0.
+
+`go.mod`'s `go` directive rose from 1.22.0 to 1.25.0 on its own, raised by the new requirements, and
+`toolchain` was set to go1.25.13. `github.com/cenkalti/backoff` moved from v4 to v5, which **is** a
+major-version move; it is transitive rather than chosen, and arrives with otlptrace v1.43.0.
+`go.opentelemetry.io/otel/trace` moved from the indirect block to the direct one, which is `go mod
+tidy` correcting a stale annotation rather than a new dependency, since
+`internal/middleware/ratelimit.go:18` has always imported it.
+
+**The deviation: grpc went to v1.82.2, not the v1.83.2 in the approved plan.** grpc v1.83.0 and above
+require `go.opentelemetry.io/otel v1.44.0`, so v1.83.2 is not installable alongside the otel v1.43.0
+that was deliberately chosen:
+
+    go: google.golang.org/grpc@v1.83.2 requires go.opentelemetry.io/otel@v1.44.0,
+        not go.opentelemetry.io/otel@v1.43.0
+
+v1.82.2 is the newest grpc compatible with otel v1.43.0 and is still above the v1.82.1 advisory floor.
+The otel version was the reasoned decision (minimum sufficient, because `tracing.go` is the one
+surface nothing watches); the grpc version was an incidental "latest stable", so the conflict was
+resolved in favour of the reasoned one.
+
+**One advisory is now carried knowingly.** `GO-2026-5158` affects `go.opentelemetry.io/otel@v1.43.0`
+and is fixed in v1.44.0. It is **imported but not called**, so it is not part of the 0, and it is the
+predictable cost of sitting exactly on a fix boundary. The un-called remainder also holds three
+`go-chi/chi/v5@v5.2.5` advisories fixed in v5.3.0 and six `golang.org/x/net@v0.53.0` advisories fixed
+in v0.55.0 or v0.56.0. None is called; all are one `go get` away whenever that is worth a round.
+
+#### Does the gateway still work, and which of the four behaviours is actually tested
+
+`go build`, `go vet` and `go test ./...` all ran from the **repository** files, not from the scratch
+copy they were developed against, because this report already records a CRLF conversion that broke a
+build without looking like a change:
+
+    go version go1.25.13 linux/amd64
+    BUILD_EXIT=0   VET_EXIT=0   TEST_EXIT=0
+    ?   office-hours/gateway/cmd/gateway            [no test files]
+    ok  office-hours/gateway/internal/config        0.005s
+    ok  office-hours/gateway/internal/middleware    6.687s
+    ok  office-hours/gateway/internal/proxy         0.008s
+    --- PASS: 53    --- FAIL: 0    --- SKIP: 0
+
+53 passing is not the same as four behaviours covered, and the gap matters more than the number:
+
+| Behaviour | Covered? | What the suite actually asserts |
+|---|---|---|
+| PII redaction before anything reaches the orchestrator | **Yes, at the middleware** | Email, phone, SSN and A-number redaction, JSON validity, four pass-through cases, redactor swappability. **Not** that the middleware is wired into the chain: `cmd/gateway/main.go` has no test file. |
+| Upstream timeouts | **Yes** | Deadline set on the request context, cancellation once elapsed, the time-to-first-byte bound, and that its cancellation cause is distinguishable from a parent cancel. |
+| Rate limiting against Upstash over TLS | **Half** | 14 tests cover the bucket, 429 with `Retry-After`, per-key independence, clock-injected refill, the Redis-down fallback bucket and trusted-proxy XFF handling. All of it runs against **miniredis, an in-process fake speaking plaintext**. The TLS half is only `redis.ParseURL` returning a non-nil `*tls.Config` with `ServerName` set. No handshake, no Upstash, no network. |
+| One trace across gateway and orchestrator | **Newly, and only in part** | Had **zero** tests before this session. |
+
+The last row is why a test was written before the upgrade rather than after. Both otel advisories are
+reached through `tracing.go`, which is on the startup path, and a broken trace export fails nothing:
+the exporter still builds, still batches and still returns no error, and spans simply stop appearing
+in Grafana.
+
+`tracing_test.go` asserts the two properties that carry production. First, the URL rule: with an
+endpoint carrying a path segment (`.../otlp`, the production shape) spans must POST to
+`/otlp/v1/traces`; with a trailing slash they must not produce `//`; with no path (the dev shape) they
+must POST to `/v1/traces`. It asserts this by standing up a local OTLP receiver and reading the
+request path off a real export, rather than by inspecting a string. Second, the propagator: after
+`SetupTracing`, injecting into a carrier must produce a `traceparent` header carrying the live span's
+trace ID, which is what makes the orchestrator join this trace instead of starting its own.
+
+**It was written against otel v1.35.0 and confirmed passing there before anything was upgraded**, so
+it encodes the behaviour that was already correct rather than ratifying whatever the new version does.
+It was then confirmed to fail, for the right reasons, in both directions:
+
+    deleting the "/v1/traces" append   ->  the two production-shape tests FAIL
+                                           (spans were exported to "/otlp", want "/otlp/v1/traces")
+                                           and the dev-shape test still PASSES
+    swapping TraceContext for Baggage  ->  the propagator test FAILS
+                                           (no traceparent header was injected)
+
+The dev-shape test surviving the first mutation is the precise discrimination the corrected comment in
+`tracing.go` predicts: `cleanPath` substitutes the default only when the path is **empty**, so dev was
+never broken and production was. A test that failed there too would have been measuring something
+else.
+
+The rule that behaviour depends on was also re-read in the upgraded source. In otlptracehttp v1.43.0,
+`WithEndpointURL` still assigns `cfg.Traces.URLPath = u.Path` verbatim
+(`internal/otlpconfig/options.go:282`), and `cleanPath` still substitutes the default only for `""` or
+`"."`. The rule did not move between v1.35.0 and v1.43.0, by reading and by test.
+
+**What this still does not cover.** No test exercises a real TLS connection to Upstash, and none
+exercises a trace crossing both services; `tracing_test.go` covers the gateway's own export URL and
+propagator, not the orchestrator joining the trace. Both remain production verifications after
+`fly deploy`. The gateway also has no CI at all: `.github/workflows/` holds `eval.yml` and
+`recrawl.yml`, and neither runs `go test` or `govulncheck`, so these 53 tests run only when someone
+runs them by hand.
 
 ---
 
@@ -5474,6 +5682,94 @@ showed a markdown table as raw pipes: `"| If you are applying based on a... | Fo
 | --- | --- | --- |"`. 1 of the 34 real chunks sampled carries a table. The rail did not cause this
 and the renderer has never handled tables, but the rail puts it in front of the reader where the
 inline list did not.
+
+## Two items reopened on a second sighting, 13 September
+
+### Orphaned citation markers: reopened, and now reproduced deterministically
+
+**Second sighting.** A Korean-anchored STEM OPT question rendered "The STEM OPT extension is for 24
+months." as the lead, then `[1][3]` alone on the next line with no prose attached to it. The same shape
+was reported on an English question several rounds earlier and closed above under "One observation
+deliberately not chased", on one observation against ten counter-samples.
+
+**It is not intermittent.** Run against the real `lib/prose.ts::deriveLead`, not a reconstruction:
+
+| Input | Lead | Remaining paragraphs |
+|---|---|---|
+| `The STEM OPT extension is for 24 months. [1][3]` | `The STEM OPT extension is for 24 months.` | `["[1][3]"]` |
+| `The STEM OPT extension lasts 24 months.  [1][3]` | `The STEM OPT extension lasts 24 months.` | `["[1][3]"]` |
+| long opening, control | `null` | unsplit, correct |
+| short opening with real prose after, control | `It is 24 months.` | `["You apply with Form I-765..."]`, correct |
+
+Deterministic given the input shape. The mechanism is one line. `deriveLead` promotes a first sentence
+of 90 characters or fewer to a standalone 23px lead **provided more content follows**, and it decides
+that with:
+
+    const moreContentFollows = remainderOfFirstParagraph.length > 0 || rest.length > 0;
+
+`"[1][3]"` has length greater than zero, so bare citation markers count as content. The lead is
+promoted, the markers are left behind as their own paragraph, and they render as a line of citation
+numbers with nothing to cite. The earlier entry named `deriveLead` as the candidate mechanism and was
+right; what it lacked was an input that triggers it.
+
+**Why ten counter-samples proved nothing, which is the part worth keeping.** The earlier note records
+that "all ten opened with a full lead sentence and none triggered the frontend's lead-promotion path."
+Read that again: **zero of the ten entered the code path under suspicion.** They were ten samples of
+the healthy case. A corpus containing none of the thing under test cannot refute it, and this was
+written up as "closed as unreproduced... on one observation against ten counter-samples", which reads
+like a refutation and was not one. That is entry 2 in this table's own terms, applied by me to a live
+user report, and it is the second time in this build that a real observation was closed against
+counter-samples drawn from a distribution that could not contain it.
+
+The generalisable form: **before counting counter-samples, check how many of them reached the branch
+you are trying to exonerate.** Ten samples that never entered the path have the same evidential weight
+as zero samples.
+
+Not fixed. Recorded with the mechanism so the fix is a one-line decision when it is taken: whether
+`moreContentFollows` should require content that is not solely citation markers.
+
+### Tables: the decision was measured on one surface and now applies to another
+
+**The decision, as recorded above:** "Tables are a known gap, left deliberately. 7 occurrences on 7
+September, 0 on 12 September, across 10 answers each time... This is a measured decision, not an
+oversight... Revisit it if a sample shows tables returning."
+
+Every number in it was counted over **generated answers**. The two questions that produced tables were
+judged acceptable to let degrade. That was a sound decision about the text the model writes.
+
+**The rail renders a different corpus.** It quotes retrieved chunk text, which was never counted for
+this and which is far denser in tables than answer prose is. Measured over 31 distinct real chunks from
+6 live production responses:
+
+| | Count | Rate |
+|---|---|---|
+| Chunks containing a markdown table anywhere | 7 of 31 | 22.6% |
+| Chunks whose rail quote actually renders pipes | 3 of 31 | 9.7% |
+| P(at least one of 5 cards shows pipes) | | **40%** |
+| P(at least one of 7 cards shows pipes) | | **51%** |
+
+So roughly every other answer now puts raw `| --- | --- |` in front of a reader, in a sticky card at
+eye level. One rendered during verification: `"| If you are applying based on a... | For... | Then
+you... | | --- | --- | --- |"`.
+
+**Before the rail, reader-visible table exposure was zero.** The old inline source list rendered a
+section heading, a domain and two dates. It never rendered source text at all, so no chunk-level table
+could reach a reader through it. The rail did not make an existing problem worse; it created a surface
+where that problem is visible for the first time. Moving the quote from the 240-character API snippet
+to the full chunk body added a little on top of that, 2 of 31 to 3 of 31, because the body window
+reaches deeper into the chunk where the tables sit. That change was right for other reasons and this is
+a side effect worth knowing rather than a reason to undo it.
+
+**The stated revisit condition does not cover this.** "Revisit it if a sample shows tables returning"
+means returning in answers. Tables never left the chunks; nothing was rendering them. A condition
+written for one surface does not fire for another.
+
+The generalisable form, and it is why this is in the instrument section rather than only the open list:
+**a measured decision carries an implicit scope, the corpus it was measured on and the surface it was
+measured for, and neither is written in the decision.** When a new surface begins rendering different
+text, the decision transfers to it silently and without its evidence, still labelled "measured". The
+number stays true and stops being the relevant number. Worth asking of any deliberate gap when a new
+rendering surface lands: what was this counted over, and is that still what the reader sees?
 
 ---
 

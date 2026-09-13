@@ -469,6 +469,20 @@ headers. Whether Vercel's implementation carries the same defect is not somethin
 carries the `full_corpus` pytest marker, and CI runs `pytest -m "not full_corpus"`, so those 17 tests
 never run in any automated gate.
 
+**Citation markers can render orphaned, with no prose.** When the generator writes a first sentence of
+90 characters or fewer followed by nothing but citation markers, `lib/prose.ts::deriveLead` promotes
+the sentence to a standalone lead and leaves the markers behind as their own paragraph, so the answer
+shows a line of citation numbers citing nothing. Reproduced deterministically against the real
+function. Seen twice in production, on an English question and on a Korean one. The cause is one
+condition treating bare markers as content.
+
+**Tables render as raw pipes in the source rail.** The renderer has never handled markdown tables, a
+decision measured over generated answers and recorded as deliberate. The rail quotes retrieved chunk
+text instead, which is denser in tables: 7 of 31 sampled real chunks contain one, and 3 of 31 put pipes
+inside the rendered quote, so roughly half of seven-card answers show at least one. Before the rail no
+source text was rendered at all, so this surface is new. The decision to skip tables was sound for the
+corpus it was measured on and has not been re-examined for this one.
+
 **No guard has a reachability test.** There are four guards now, and every test of every one of them
 calls the guard directly with a string and asserts its return value. That can tell you the guard is
 correct. It cannot tell you the pipeline ever reaches it, in either direction, because it bypasses the
