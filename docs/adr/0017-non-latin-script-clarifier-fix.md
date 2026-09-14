@@ -89,6 +89,9 @@ Getting past the clarifier is necessary, not sufficient. Measured directly again
 216-chunk corpus (`nomic-embed-text`, hybrid RRF retrieval, local `qwen3.5-8k` generator), asking
 the equivalent of "how many months is the STEM OPT extension" in five languages plus one control:
 
+**Note, 14 September 2026:** the corpus held 216 chunks when this ran; it holds 221 today. The table
+below is the record of that measurement, not a description of the corpus as it stands.
+
 | question (paraphrase) | min distance | NO_ANSWER fires (0.50) | response_type | answer language |
 | --- | --- | --- | --- | --- |
 | Hindi, "STEM OPT" transliterated phonetically, no Latin | 0.5167 | yes | no_answer | n/a |

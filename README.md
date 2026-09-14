@@ -1,24 +1,25 @@
 # Office Hours
 
-Office Hours answers factual questions about F-1, OPT, STEM OPT, and H-1B rules for international
-students and workers, using only official U.S. government sources, and it cites the specific source
-behind every claim. It tells you what a rule says and where it's written. It does not tell you what
-to do, whether your case will be approved, or which status fits your situation: questions like that
-get a refusal that points to your school's designated school official (DSO) or a licensed
-immigration attorney.
+I built Office Hours to answer factual questions about F-1, OPT, STEM OPT, and H-1B rules for
+international students and workers from official U.S. government sources only, and to cite the
+specific source behind every claim. It tells you what a rule says and where it's written. It does not
+tell you what to do, whether your case will be approved, or which status fits your situation: I made
+questions like that return a refusal that points to your school's designated school official (DSO) or
+a licensed immigration attorney.
 
 This is an unofficial tool. It is not affiliated with USCIS, DHS, or any other part of the U.S.
-government, and nothing it says is legal advice. Every answer carries that disclaimer, and no query
-is stored with any identifying information.
+government, and nothing it says is legal advice. Every answer carries that disclaimer, and I store
+no query with any identifying information.
 
 It is live at https://office-hours-gray.vercel.app, talking to a Go gateway at
 https://oh-gateway-rp.fly.dev. The orchestrator behind that gateway is private and has no public
-address. Asked on 13 September 2026, `GET https://oh-gateway-rp.fly.dev/v1/sources/status` reported 14
-sources, 0 broken, and an oldest last-verified timestamp of 7 September. That endpoint is public, so
-you can check the corpus state yourself rather than taking this paragraph's word for it.
+address. I asked `GET https://oh-gateway-rp.fly.dev/v1/sources/status` on 13 September 2026 and it
+reported 14 sources, 0 broken, and an oldest last-verified timestamp of 7 September. I left that
+endpoint public so you can check the corpus state yourself rather than taking this paragraph's word
+for it.
 
-`REPORT.md` is a red-team report against this deployment, including the findings still open. Read it
-before trusting any answer this system gives for anything that matters.
+`REPORT.md` is the red-team report I ran against this deployment, including the findings still open.
+Read it before trusting any answer this system gives for anything that matters.
 
 ## Architecture
 
@@ -59,36 +60,36 @@ Side calls:
 
 An answer is prose with bracket citation markers in it, and a set of source cards. Above 980px the
 cards sit in a sticky rail to the right of a reading column capped at 760px. Below 980px the rail is
-replaced by a bar reading "N sources cited" that opens a bottom sheet holding the same cards. The two
-surfaces render the same array from one function (`services/frontend/lib/sources.ts::buildSourceCards`),
+replaced by a bar reading "N sources cited" that opens a bottom sheet holding the same cards. I render
+both surfaces from the same array in one function (`services/frontend/lib/sources.ts::buildSourceCards`),
 so they cannot disagree.
 
-There are 5 cards, or 7 when a dated rule is in play and the companion slot admits two more. Measured
-across 1,412 rows of stored eval results, those are the only two counts an answered response has ever
-returned.
+There are 5 cards, or 7 when a dated rule is in play and the companion slot admits two more. I checked
+that across 1,412 rows of stored eval results: those are the only two counts an answered response has
+ever returned.
 
 Each card carries the citation number, the section heading, the domain, when the page was last updated,
-when it was last verified, and a verbatim quote from the retrieved chunk. The quote is the point.
-Checking a claim otherwise means opening a dense government page and searching it, and most of this
-site's traffic is on a phone where that is worse. The quote comes from the full chunk text rather than
+when it was last verified, and a verbatim quote from the retrieved chunk. The quote is the point:
+checking a claim without it means opening a dense government page and searching it, and most of this
+site's traffic is on a phone where that is worse. I take the quote from the full chunk text rather than
 the API's 240-character `snippet` field, because on one source, a DHS FAQ page whose section headings
 are entire questions, the chunk's breadcrumb is 239 characters of a 242-character snippet and leaves
 almost no room for the page's own words.
 
 Citation markers are clickable. Clicking one highlights that marker and its card and scrolls the card
-into view; on a narrow screen, where there is no rail, it opens the sheet instead. Markers are buttons
-rather than links, which also fixes a copy artifact: as anchors, copying an answer and pasting it
-anywhere that converts HTML links to markdown produced `[[1](url)]` instead of `[1]`.
+into view; on a narrow screen, where there is no rail, it opens the sheet instead. I made the markers
+buttons rather than links, which also fixed a copy artifact: as anchors, copying an answer and pasting
+it anywhere that converts HTML links to markdown produced `[[1](url)]` instead of `[1]`.
 
 ## The eval numbers
 
-These are from one real eval run on 7 September 2026 against the hosted production provider, compared
-against the last run recorded before that provider swap. They have not been re-run since; several
-guardrails have shipped since then, listed under "What's not done".
+These come from one real eval run I made on 7 September 2026 against the hosted production provider,
+compared against the last run I recorded before that provider swap. I have not re-run them since, and
+several guardrails have shipped since then, listed under "What's not done".
 
 Both runs score all 21 rows of `eval/golden.jsonl`, judged by
-`nvidia/nemotron-3.5-lightning-30b-a3b`, a different model family than either generator, so the judge
-is never grading its own family's writing.
+`nvidia/nemotron-3.5-lightning-30b-a3b`. I picked a judge from a different model family than either
+generator, so the judge is never grading its own family's writing.
 
 - Hosted: `eval/results/20260907T015332Z.json`, generating on Ollama Cloud `gpt-oss:120b`, against the
   live 221-chunk, 14-source corpus in the local Postgres container, not a hosted database.
@@ -96,13 +97,13 @@ is never grading its own family's writing.
 
 Both runs embedded the query with real local Ollama (`EMBED_PROVIDER=ollama`), not yet the in-process
 GGUF embedder production now uses (`EMBED_PROVIDER=gguf`, decided below). That is deliberate, not an
-oversight: `GGUFEmbedder` is built to reproduce Ollama's own vectors, not a new embedding space, and
-the equivalence test (`services/orchestrator/tests/test_gguf_embedder.py`) checks that directly against
-the real stored corpus rather than by re-running the eval. What that check measured: against 25 real
-stored vectors the in-process embedder reproduces them at a minimum cosine of 0.99999412, and across
-five real queries both embedders retrieve the identical chunk set in the identical order, with the
-off-topic control returning `no_answer` under both. Retrieval is the same, so these numbers describe
-a GGUF-embedded run as well.
+oversight. I wrote `GGUFEmbedder` to reproduce Ollama's own vectors rather than to move to a new
+embedding space, so I checked that equivalence directly against the real stored corpus
+(`services/orchestrator/tests/test_gguf_embedder.py`) instead of re-running the eval. What that check
+measured: against 25 real stored vectors the in-process embedder reproduces them at a minimum cosine
+of 0.99999412, and across five real queries both embedders retrieve the identical chunk set in the
+identical order, with the off-topic control returning `no_answer` under both. Retrieval is the same,
+so these numbers describe a GGUF-embedded run as well.
 
 | metric | hosted | P4 baseline |
 | --- | --- | --- |
@@ -117,46 +118,46 @@ a GGUF-embedded run as well.
 | reading_grade_level | 15.128 | 17.603 |
 | median /query latency | 1.93s | 7.07s |
 
-Most of these moved the direction you'd want. False refusal dropped the most, from 40% of factual
-questions wrongly refused down to 6.7%; the same guardrail rule layer ran in both runs, so the gap is
-closer to how the generator writes near the advice/information boundary than a change in that rule
-layer itself. The 7x latency drop is the hosted API against a local reasoning model, not anything this
-codebase optimized.
+Most of these moved the direction I wanted. False refusal dropped the most, from 40% of factual
+questions wrongly refused down to 6.7%; the same guardrail rule layer ran in both runs, so I read the
+gap as closer to how the generator writes near the advice/information boundary than to a change in that
+rule layer itself. The 7x latency drop is the hosted API against a local reasoning model, not anything
+I optimized in this codebase.
 
-Two numbers got worse, and they're reported as measured, not softened. Context precision, how much of
-what got retrieved was actually relevant per RAGAS, fell from 0.937 to 0.905; both clear the 0.70 gate,
-but the direction is wrong. Unreferenced citation rate, how many of the chunks the pipeline returns as
-citation candidates go uncited in the answer text, rose from 0.486 to 0.686:
+Two numbers got worse, and I report them as measured rather than softened. Context precision, how much
+of what got retrieved was actually relevant per RAGAS, fell from 0.937 to 0.905; both clear the 0.70
+gate, but the direction is wrong. Unreferenced citation rate, how many of the chunks the pipeline
+returns as citation candidates go uncited in the answer text, rose from 0.486 to 0.686:
 `citation_detail` in the two result files shows the hosted run cited 33 of 105 possible citations
 against 54 of 105 for the baseline, so `gpt-oss` references fewer of the retrieved passages per
 question, not more.
 
 Read every judge-scored number above with one caveat attached. On the eval run of 11 September, the
-determinism self-check scored the same row's comprehensibility twice at `temperature=0` and got 3 and
-4. The judge is not deterministic, so those numbers carry more noise than their decimal places
+determinism self-check I added scored the same row's comprehensibility twice at `temperature=0` and got
+3 and 4. The judge is not deterministic, so those numbers carry more noise than their decimal places
 suggest: comprehensibility, false refusal and advice leakage directly, and faithfulness, answer
 relevancy and context precision through RAGAS, which drives the same judge. The two citation rates are
 computed programmatically and are not affected.
 
 `citation_hallucination_rate` reads 0.000 on both runs. That is not a model achievement.
 `services/orchestrator/app/guardrails/citations.py::verify_citations` blocks any answer that cites an index outside what
-was actually retrieved, before it ever renders, regardless of which model wrote it. This number
-measures whether that guardrail's boundary held, not whether the model behaved.
+was actually retrieved, before it ever renders, regardless of which model wrote it. That number
+measures whether the guardrail's boundary held, not whether the model behaved.
 
 ## What gets blocked before it renders
 
 Three checks run at step 7 of the pipeline, after generation and before anything reaches the browser
 (`services/orchestrator/app/pipeline.py`). Each returns a `blocked_unverified` response with copy
-naming the actual reason, rather than a generic error. They run in a fixed order, citations then
+naming the actual reason, rather than a generic error. I run them in a fixed order, citations then
 authority then prompt leak, so that when more than one would fire the reason a reader sees does not
 depend on which check happened to run last.
 
 `citations.py` blocks an answer citing an index outside what was retrieved. `authority.py` blocks an
 answer claiming to be official USCIS, DHS, ICE, or SEVP guidance; 21 production answers across 7
 injection variants produced 0 authority claims after it shipped. `prompt_leak.py` blocks an answer
-reproducing this system's own prompt word for word, added after a request framed as a maintainer audit
-returned the prompt's first line character for character. It catches verbatim reproduction only, and a
-paraphrase is deliberately not caught.
+reproducing this system's own prompt word for word. I added it after a request framed as a maintainer
+audit returned the prompt's first line character for character. It catches verbatim reproduction only,
+and I deliberately left a paraphrase uncaught.
 
 A fourth guard runs at step 8, against the generated prose rather than its citations.
 `temporal.py::qualify_future_dated_figures` scans sentence by sentence for a figure that only appears
@@ -168,42 +169,48 @@ Two more gates run earlier, before the generator is called at all: the no-answer
 refuses rather than stretching a weak chunk into a confident answer, and the advice classifier at step
 2, which routes a personal-decision question to a refusal that states the general rule and hands off.
 
-Each of these was added in response to something measured, and each has a false-positive control
-measured before it shipped. The prompt-leak guard's first draft blocked 7 of 21 plausible correct
-answers, and six of its markers were removed as a result, including one that is ordinary immigration
-English rather than self-description.
+I added each of these in response to something I measured, and measured a false-positive control for
+each of them before it shipped. The prompt-leak guard's first draft blocked 7 of 21 plausible correct
+answers, so I removed six of its markers, including one that is ordinary immigration English rather
+than self-description.
 
 ## Decisions and why
 
+These are my calls. Claude Code wrote most of the code under my direction, one phase at a time against
+checks I fixed before the phase started, and I verified each phase against the running system myself
+rather than taking the agent's summary for it. `docs/reports/` holds those verification reports, and
+the measurements in this README are ones I ran.
+
 **One Postgres, no dedicated vector database.** Retrieval fuses a pgvector HNSW ranking and a
 `tsvector` keyword ranking with Reciprocal Rank Fusion, in a single SQL CTE, over one Postgres
-instance holding 14 sources. A separate vector store would add a second consistency problem and a
-second thing to deploy, for a corpus this size. `docs/adr/0001-rrf-vs-weighted-blend.md`.
+instance holding 14 sources. I skipped a dedicated vector store because it would add a second
+consistency problem and a second thing to deploy, for a corpus this size.
+`docs/adr/0001-rrf-vs-weighted-blend.md`.
 
 **A hard line between information and advice.** The system states what a rule says and where it's
-written. It refuses to say what someone personally should do, whether their case will be approved, or
-which status fits them, and redirects those questions to a DSO or an attorney.
+written. I drew the line there: it refuses to say what someone personally should do, whether their case
+will be approved, or which status fits them, and redirects those questions to a DSO or an attorney.
 `docs/adr/0002-advice-vs-information-line.md`.
 
-**Chunking follows document structure, not heading level numbers.** Sources are chunked on h2 through
-h4, and a chunk's parent comes from document order and empty group-label headings, never from
-comparing level numbers. One FAQ page nests h2 questions under h3 group labels; a couple of USCIS
-pages carry their real section boundaries in h4 with no h2 at all. A level-keyed stack mis-parents
-both. `ARCHITECTURE.md`, "Corpus and chunking."
+**Chunking follows document structure, not heading level numbers.** I chunk sources on h2 through h4,
+and a chunk's parent comes from document order and empty group-label headings, never from comparing
+level numbers. I did it that way because one FAQ page nests h2 questions under h3 group labels, and a
+couple of USCIS pages carry their real section boundaries in h4 with no h2 at all: a level-keyed stack
+mis-parents both. `ARCHITECTURE.md`, "Corpus and chunking."
 
 **Two freshness columns, not one.** `fetched_at` is when a page was last downloaded; `last_verified_at`
-is when it was last checked, changed or not. A re-crawl that finds nothing new updates only the second
-column, so a page checked this morning and found unchanged doesn't read as months stale.
-`ARCHITECTURE.md`, "Freshness fields."
+is when it was last checked, changed or not. I split them because a re-crawl that finds nothing new
+updates only the second column, so a page checked this morning and found unchanged doesn't read as
+months stale. `ARCHITECTURE.md`, "Freshness fields."
 
-**Go at the edge, Python behind it.** The gateway's job is concurrent connection handling under a rate
-limit; the orchestrator's job is IO-bound calls to a model and a database. Each language fits its own
-half. `docs/adr/0007-go-python-split.md`.
+**Go at the edge, Python behind it.** I split the two because the gateway's job is concurrent
+connection handling under a rate limit and the orchestrator's job is IO-bound calls to a model and a
+database. Each language fits its own half. `docs/adr/0007-go-python-split.md`.
 
 **CI checks a baseline, not the real target.** A pull request job gets no GPU and no judge API key, so
-it can't compute faithfulness or comprehensibility at all. It checks retrieval, citation mapping,
-refusal bookkeeping, and error handling against the last accepted CI run instead, and its own banner
-says plainly that a green result there isn't a passing quality eval. The real target,
+it can't compute faithfulness or comprehensibility at all. I have it check retrieval, citation
+mapping, refusal bookkeeping, and error handling against the last accepted CI run instead, and I made
+its own banner say plainly that a green result there isn't a passing quality eval. The real target,
 `eval/README.md`'s `THRESHOLDS`, is only ever checked by a full run, the kind this README's numbers
 came from. `docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md`.
 
@@ -211,37 +218,39 @@ came from. `docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md`.
 `assert_no_generator_judge_family_collision` (`services/orchestrator/app/providers/llm.py`) checks every model in the
 resolved generation chain, primary and fallback, against the judge's family before a single judge or
 generation call happens. A model grading its own family's writing tends to prefer it, for reasons that
-have nothing to do with the actual quality of the answer. The Layer 2 advice classifier is deliberately
-excluded from that check: its output is a parsed boolean that never reaches judged text, so it can't
+have nothing to do with the actual quality of the answer. I excluded the Layer 2 advice classifier from
+that check deliberately: its output is a parsed boolean that never reaches judged text, so it can't
 create the bias the guard exists to prevent.
 `docs/adr/0011-classifier-routing-excluded-from-family-guard.md`.
 
 **The semantic cache is partitioned by what the guardrail decided, not by how close two questions
 sound.** Cosine distance encodes what a question is about far more strongly than whether it's asking
-for a fact or asking for advice about that same fact: "does my employer need E-Verify" and "should I
-switch to an E-Verify employer" measured 0.0885 apart, well inside the cache's 0.15 threshold. No
-threshold separates that pair from a genuine paraphrase. The cache now only serves a cached response
-whose stored classification matches the incoming question's classification, so a cached factual answer
-can never be served to an advice-seeking question wearing similar words.
+for a fact or asking for advice about that same fact: I measured "does my employer need E-Verify" and
+"should I switch to an E-Verify employer" 0.0885 apart, well inside the cache's 0.15 threshold. No
+threshold separates that pair from a genuine paraphrase, so I partitioned the cache by classification
+instead of tuning the threshold. The cache now only serves a cached response whose stored
+classification matches the incoming question's classification, so a cached factual answer can never be
+served to an advice-seeking question wearing similar words.
 `docs/adr/0010-cache-classification-partition.md`.
 
 **A citation format is part of the prompt contract, and a model swap can break it silently.** Swapping
 the generator to `gpt-oss:120b` caused 5 of 21 golden rows to come back blocked, not because the
 answers were ungrounded but because that model cites in its own training-format markup, `【1†...】`,
-instead of this project's `[1]` convention. The fix normalizes that markup to `[N]` before verification
-runs and reinforces the prompt; verification itself never loosened.
+instead of this project's `[1]` convention. My fix normalizes that markup to `[N]` before verification
+runs and reinforces the prompt. I did not loosen verification itself.
 `docs/adr/0012-citation-markup-normalization.md`.
 
 **Production embeds in-process, from the same GGUF file Ollama itself uses.** Neither Ollama Cloud nor
 NVIDIA serves `nomic-embed-text`, and the 221 vectors already stored in `documents` were built by real
-local Ollama, so switching models would mean re-deriving `NO_ANSWER_MAX_DISTANCE` against a threshold
-that already sits knife-edge (0.4370 for a real off-topic control against a 0.50 cutoff). `GGUFEmbedder`
-(`services/orchestrator/app/providers/embeddings.py`) loads the identical GGUF file via
+local Ollama, so switching models would have meant re-deriving `NO_ANSWER_MAX_DISTANCE` against a
+threshold that already sits knife-edge (0.4370 for a real off-topic control against a 0.50 cutoff).
+`GGUFEmbedder` (`services/orchestrator/app/providers/embeddings.py`) loads the identical GGUF file via
 `llama-cpp-python` and calls it with the same batch configuration Ollama's own engine uses
-internally. That last part is the finding that makes this safe rather than merely plausible:
-llama.cpp's default `n_batch` of 512 splits longer inputs and returns different vectors, and against
-25 real stored vectors it produced 5 below cosine 0.9999, the worst at 0.974. The boundary is exact,
-not approximate. Every chunk of 485 tokens or fewer matched; every chunk of 583 or more diverged.
+internally. That last part is what makes this safe rather than merely plausible, and I found it by
+measuring instead of assuming the defaults matched: llama.cpp's default `n_batch` of 512 splits longer
+inputs and returns different vectors, and against 25 real stored vectors it produced 5 below cosine
+0.9999, the worst at 0.974. The boundary is exact, not approximate. Every chunk of 485 tokens or fewer
+matched; every chunk of 583 or more diverged.
 `docs/adr/0013-in-process-gguf-embeddings.md`.
 
 ## Running it locally
@@ -254,9 +263,9 @@ ollama pull qwen3.5
 ollama create qwen3.5-8k -f Modelfile
 ```
 
-The last command builds `qwen3.5-8k:latest` from the `Modelfile` at the repository root, which is
-just `qwen3.5` with `num_ctx` raised to 8192; the default tag's context window is too small for this
-project's retrieval-heavy prompts, so there's no way to pull it ready-made.
+The last command builds `qwen3.5-8k:latest` from the `Modelfile` at the repository root, which is just
+`qwen3.5` with `num_ctx` raised to 8192. I raised it because the default tag's context window is too
+small for this project's retrieval-heavy prompts, and there's no way to pull that ready-made.
 
 Ollama runs on your machine, not in a container. The orchestrator reaches it through Docker's
 `host.docker.internal` hostname.
@@ -286,7 +295,7 @@ Ollama runs on your machine, not in a container. The orchestrator reaches it thr
    ```
 
    `npm test` runs the frontend's own unit tests, which cover the markdown and citation parser
-   (`lib/prose.ts`, `lib/citations.ts`) and the source-card builder (`lib/sources.ts`). They use
+   (`lib/prose.ts`, `lib/citations.ts`) and the source-card builder (`lib/sources.ts`). I run them on
    Node's built-in test runner against the `.ts` files directly, so there is no build step and no
    test framework dependency.
 
@@ -317,7 +326,7 @@ repository does either for you.
 
 ## Deploying it
 
-This is deployed. The steps below are the order to do it in, by hand, and they are what produced the
+This is deployed. The steps below are the order I did them in, by hand, and they are what produced the
 running system: `oh-orchestrator-rp` and `oh-gateway-rp` on Fly, the frontend on Vercel.
 
 1. **Neon** (Postgres with pgvector). Create a project and get two connection strings from the
@@ -428,71 +437,73 @@ container start.
 you read this README:
 
 **The rule that changes on 15 September 2026 is the weakest thing here, and that date is two days after
-this paragraph was written.** The F-1 post-completion departure period goes from 60 days to 30. Where the corpus holds both the current rule and its dated
-replacement, an answer is supposed to state both with their dates. The effective-date notice fires on
-15 of 18 measured runs, but the prose itself often states only one of the two numbers, and the cause is
-a retrieval miss rather than a disobedient model: the chunk stating the replacement loses on RRF
-fusion even though it contains the query's own words. Three of the four fix options written up in
-`REPORT.md` were measured and cannot fix it. A dated-rule companion slot
-(`docs/adr/0019-dated-rule-companion-retrieval.md`) is what shipped, and it is why an answer on this
-topic returns 7 citations instead of 5. The finding is still open.
+I wrote this paragraph.** The F-1 post-completion departure period goes from 60 days to 30. Where the
+corpus holds both the current rule and its dated replacement, an answer is supposed to state both with
+their dates. The effective-date notice fires on 15 of 18 measured runs, but the prose itself often
+states only one of the two numbers, and the cause is a retrieval miss rather than a disobedient model:
+the chunk stating the replacement loses on RRF fusion even though it contains the query's own words. I
+measured three of the four fix options written up in `REPORT.md` and none of those three can fix it. A
+dated-rule companion slot (`docs/adr/0019-dated-rule-companion-retrieval.md`) is what I shipped
+instead, and it is why an answer on this topic returns 7 citations instead of 5. The finding is still
+open.
 
-**A question asked in another language gets an answer in English.** The non-Latin script gate works:
-measured against production on 13 September 2026 with 28 probes across seven scripts (Hangul, Han,
-Kana, Devanagari, Arabic, Cyrillic, Thai) at four question lengths, it fired on all seven, catching
-every bare question that carried no English term. What it does not catch, by deliberate design, is a
-question carrying a Latin anchor such as "OPT" or "STEM OPT". `docs/adr/0018` decided that on evidence:
-those questions retrieve the correct chunks, because the keyword arm matches an English token whatever
-script surrounds it, and they produce correct cited answers.
+**A question asked in another language gets an answer in English.** The non-Latin script gate works: I
+measured it against production on 13 September 2026 with 28 probes across seven scripts (Hangul, Han,
+Kana, Devanagari, Arabic, Cyrillic, Thai) at four question lengths, and it fired on all seven, catching
+every bare question that carried no English term. What it does not catch, by my own design, is a
+question carrying a Latin anchor such as "OPT" or "STEM OPT". I decided that in `docs/adr/0018` on
+evidence: those questions retrieve the correct chunks, because the keyword arm matches an English token
+whatever script surrounds it, and they produce correct cited answers.
 
 They produce them in English. All 6 answers that rendered in that probe set contained zero non-Latin
 letters, opening "Yes. To be eligible for a STEM OPT extension..." for readers who had asked in Korean,
 Chinese, Hindi, Arabic, Russian and Thai. The content is right and the reader may not be able to read
-it. ADR 0018 verified that these questions produce a correct, cited answer; nobody asked whether they
-produce one the person who asked can read.
+it. In ADR 0018 I verified that these questions produce a correct, cited answer, and I never asked
+whether they produce one the person who asked can read.
 
 Spanish shows the same shape and cannot be reached by any script gate, being Latin script throughout: a
 Spanish question carrying "STEM OPT" returns a correct answer in English, and a bare Spanish question
 about the departure period returns "I don't see this covered in my sources" for a topic the corpus
-covers at length. Cross-lingual retrieval is the real gap and it is not built.
+covers at length. Cross-lingual retrieval is the real gap, and I have not built it.
 
-**Two dependency problems are measured and unfixed.** The Go gateway builds on `go1.22.12`;
-`govulncheck` finds 39 vulnerabilities actually reachable, 36 of them the Go standard library and all
-36 cleared by moving to Go 1.25.13. The other 3 are module upgrades, two reached from `tracing.go` on
-the startup path. The frontend pins `next 14.2.35`, which carries 27 distinct advisories
-with `--omit=dev`, including an unauthenticated RCE in the Image Optimization API. None of the
-vulnerable surfaces appear in this app's twenty source files, and `/_next/image` on the deployed site
-is answered by Vercel's optimizer rather than by this app's `next` process, measured from the response
-headers. Whether Vercel's implementation carries the same defect is not something that scan can answer.
+**One dependency problem is open, and one closed on 13 September 2026.** The Go gateway built on
+`go1.22.12`, where `govulncheck` found 39 vulnerabilities actually reachable: 36 in the Go standard
+library, cleared by the move to Go 1.25.13, and 3 module upgrades, two of them reached from
+`tracing.go` on the startup path. Both landed together and the re-measured count is 0. The frontend
+pins `next 14.2.35`, which carries 27 distinct advisories with `--omit=dev`, including an
+unauthenticated RCE in the Image Optimization API. I checked that none of the vulnerable surfaces
+appear in this app's twenty source files, and that `/_next/image` on the deployed site is answered by
+Vercel's optimizer rather than by this app's `next` process, which I read off the response headers.
+Whether Vercel's implementation carries the same defect is not something that scan can answer.
 
-**The automated gate is narrower than it looks.** Every check that needs the real 14-source corpus
-carries the `full_corpus` pytest marker, and CI runs `pytest -m "not full_corpus"`, so those 17 tests
-never run in any automated gate.
+**The automated gate is narrower than it looks.** I marked every check that needs the real 14-source
+corpus with the `full_corpus` pytest marker, and CI runs `pytest -m "not full_corpus"`, so those 18
+tests never run in any automated gate.
 
 **Citation markers can render orphaned, with no prose.** When the generator writes a first sentence of
 90 characters or fewer followed by nothing but citation markers, `lib/prose.ts::deriveLead` promotes
 the sentence to a standalone lead and leaves the markers behind as their own paragraph, so the answer
-shows a line of citation numbers citing nothing. Reproduced deterministically against the real
-function. Seen twice in production, on an English question and on a Korean one. The cause is one
-condition treating bare markers as content.
+shows a line of citation numbers citing nothing. I reproduced it deterministically against the real
+function, and I have seen it twice in production, on an English question and on a Korean one. The cause
+is one condition treating bare markers as content.
 
-**Tables render as raw pipes in the source rail.** The renderer has never handled markdown tables, a
-decision measured over generated answers and recorded as deliberate. The rail quotes retrieved chunk
+**Tables render as raw pipes in the source rail.** The renderer has never handled markdown tables; I
+measured that over generated answers and recorded it as deliberate. The rail quotes retrieved chunk
 text instead, which is denser in tables: 7 of 31 sampled real chunks contain one, and 3 of 31 put pipes
 inside the rendered quote, so roughly half of seven-card answers show at least one. Before the rail no
-source text was rendered at all, so this surface is new. The decision to skip tables was sound for the
-corpus it was measured on and has not been re-examined for this one.
+source text was rendered at all, so this surface is new. My decision to skip tables was sound for the
+corpus I measured it on, and I have not re-examined it for this one.
 
-**No guard has a reachability test.** There are four guards now, and every test of every one of them
-calls the guard directly with a string and asserts its return value. That can tell you the guard is
-correct. It cannot tell you the pipeline ever reaches it, in either direction, because it bypasses the
-steps that would stop it. This is not hypothetical: the script gate sits behind the clarifier, which
-reads the same input and returns early, and the only instrument that could answer whether the gate ran
-was a probe through the real entry point. Correctness tests and reachability tests are different tests,
-and this repository has the first kind only.
+**No guard has a reachability test.** There are four guards now, and every test I wrote for them calls
+the guard directly with a string and asserts its return value. That can tell you the guard is correct.
+It cannot tell you the pipeline ever reaches it, in either direction, because it bypasses the steps
+that would stop it. This is not hypothetical: the script gate sits behind the clarifier, which reads
+the same input and returns early, and the only instrument that could answer whether the gate ran was a
+probe through the real entry point. Correctness tests and reachability tests are different tests, and I
+have written the first kind only.
 
 **`?mock=<state>` renders fixture answers in production, unlabelled.** Four of the five are byte
-identical to real captured responses; the `blocked_unverified` one was produced by running the real
+identical to real captured responses; I produced the `blocked_unverified` one by running the real
 pipeline with the generator call replaced by a fixed string. Nothing on the page tells a reader they
 are looking at a recording rather than an answer to their question.
 
@@ -501,5 +512,5 @@ Grafana Cloud tracing is configured on both services. The corpus is served by a 
 the deployed orchestrator; which provider is behind `DATABASE_URL` is not something this repository
 records.
 
-**The golden set is 21 rows**, hand-written by the repository owner. It is the standard every number in
-this README is measured against, and growing it is ongoing.
+**The golden set is 21 rows**, all of which I wrote by hand. It is the standard every number in this
+README is measured against, and I am still growing it.
