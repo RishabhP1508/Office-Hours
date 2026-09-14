@@ -108,7 +108,7 @@ check, the work is not done: report BLOCKED.
 
 ## Conventions
 - Python 3.12, FastAPI, Pydantic, async. ruff to lint, black to format, pytest for tests.
-- Go 1.22, chi router, go test.
+- Go 1.25, chi router, go test.
 - Every service has a Dockerfile. All config via environment variables; never hardcode secrets; use a
   gitignored .env and document required vars in the README.
 - NO VERSION CONTROL, BY ANY ROUTE. Never run git or the gh CLI, and never use a GitHub MCP or API tool
@@ -194,7 +194,7 @@ tags show the phase in which each file first appears.
     │   │   │   └── test_freshness.py   # source-change detection                            [P5]
     │   │   ├── Dockerfile                                                                   [P0]
     │   │   └── pyproject.toml          # deps, ruff, black, pytest config                   [P0]
-    │   ├── gateway/                    # Go 1.22 + chi                                      [P7]
+    │   ├── gateway/                    # Go 1.25 + chi                                      [P7]
     │   │   ├── cmd/gateway/main.go     # wires middleware + proxy
     │   │   ├── internal/
     │   │   │   ├── proxy/proxy.go      # reverse proxy to orchestrator

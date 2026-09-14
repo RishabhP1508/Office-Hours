@@ -1,41 +1,42 @@
 # Golden set and eval harness
 
-`golden.jsonl` is the standard the system is measured against: 21 hand-written rows, one JSON
-object per line. The user writes every row by hand; nothing in the build process authors, edits,
-reorders, or reformats a `ground_truth_answer` or any other field.
+`golden.jsonl` is what I measure the system against: 21 rows I wrote by hand, one JSON object per
+line. I write every row myself, and nothing in the build process authors, edits, reorders, or
+reformats a `ground_truth_answer` or any other field.
 
 ## Schema
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `question` | string | The question a student or worker would actually ask. |
-| `ground_truth_answer` | string | The correct answer, written by hand from the official sources. |
+| `ground_truth_answer` | string | The correct answer, which I write by hand from the official sources. |
 | `source_urls` | list of strings | The official source URL(s) that support the answer. Every row carries at least one, including the advice-seeking rows: the ground truth for an advice question is still grounded in the rule it points at (the deadline, the eligibility fact), even though the correct system response is a refusal rather than a sourced answer to the advice question itself. |
 | `is_advice` | boolean | `true` if the question asks what someone should do, whether something will be approved, or which option is best for them. The correct system response to these is a refusal that points to a DSO or a licensed immigration attorney, not an answer. |
-| `verified_on` | string (`YYYY-MM-DD`) | The date a human last confirmed the `ground_truth_answer` is still correct. |
+| `verified_on` | string (`YYYY-MM-DD`) | The date I last confirmed the `ground_truth_answer` is still correct. |
 | `volatility` | `"stable"` or `"volatile"` | Whether the rule behind this answer is currently in the middle of changing. |
 | `multi_part` | boolean | `true` when the answer requires facts from two or more different sections or pages, so no single retrieved chunk contains the whole answer. |
 
 ## Why `verified_on` and `volatility` exist
 
-A row can fail an eval run for two different reasons: retrieval or generation got worse, or the rule
-itself changed and the golden answer is now out of date. Without a way to tell these apart, every
-failure looks like a regression, and a rule change looks like a bug in the system.
+I added both fields because a row can fail an eval run for two different reasons: retrieval or
+generation got worse, or the rule itself changed and the golden answer is now out of date. Without a
+way to tell these apart, every failure looks like a regression, and a rule change looks like a bug in
+the system.
 
 The clearest case in this corpus is the DHS fixed-period-of-admission final rule. It takes effect
 September 15, 2026, and changes the F-1 post-completion departure period from 60 days to 30. A
 `ground_truth_answer` about the departure period written before that date and one written after it are
-both correct, for different dates. Marking a row `volatile` flags it as one to re-check against the
-current source before trusting a failure as a real regression, instead of re-verifying the whole file
-every time something looks off. `verified_on` records when that last check happened, so a stale
+both correct, for different dates. I mark such a row `volatile` to flag it as one to re-check against
+the current source before trusting a failure as a real regression, instead of re-verifying the whole
+file every time something looks off. `verified_on` records when that last check happened, so a stale
 volatile row is easy to find.
 
-**Default rule until after September 15, 2026:** any row sourced from a `studyinthestates.dhs.gov` or
-`ice.gov` page is `volatile`, regardless of topic. DHS has said content across both sites will be
-rewritten to reflect the final rule on and after that date, and six of the fourteen sources in
-`data/sources/sources.yaml` come from them. Cap-gap rows are volatile for a second reason: the
-timeliness test is written against "duration of status admission," a concept that stops existing for
-students admitted after the effective date.
+**Default rule until after September 15, 2026:** I mark any row sourced from a
+`studyinthestates.dhs.gov` or `ice.gov` page `volatile`, regardless of topic. DHS has said content
+across both sites will be rewritten to reflect the final rule on and after that date, and six of the
+fourteen sources in `data/sources/sources.yaml` come from them. Cap-gap rows are volatile for a second
+reason: the timeliness test is written against "duration of status admission," a concept that stops
+existing for students admitted after the effective date.
 
 ## Why `multi_part` exists
 
@@ -45,24 +46,24 @@ retrieval grabs the chunks matching the question's wording, misses the second ru
 answer comes back confident and half-complete. That is more dangerous than an obviously wrong answer,
 because nothing signals the omission.
 
-Rows marked `multi_part: true` are the ones that expose this. Score them as a separate subset, not
+Rows marked `multi_part: true` are the ones that expose this. I score them as a separate subset, not
 just in the overall average, where a handful of rows would be drowned out.
 
 The Phase 4 decision this feeds: if multi-part rows score materially worse than single-source rows,
 that justifies adding a bounded second retrieval pass (retrieve, check whether every part of the
 question is covered, retrieve once more with a refined query if not, with a hard cap on iterations).
-If they score comparably, skip it. The eval numbers decide, not the assumption that more retrieval is
-better.
+If they score comparably, I skip it. I let the eval numbers decide that, not the assumption that more
+retrieval is better.
 
-When writing a `multi_part` row, write the *combined* answer, not two facts placed side by side. For
+When I write a `multi_part` row, I write the *combined* answer, not two facts placed side by side. For
 example: "Nine months of post-completion OPT, plus 24 more with a STEM extension, so 33 total."
 Producing that combination is exactly what single-pass retrieval fails at, so the ground truth has to
 require it.
 
 ## Writing style for `ground_truth_answer`
 
-Write in plain language for a stressed non-expert, not in the wording of the source. Lead with the
-direct answer in one or two sentences, then any detail, and define jargon inline the first time. These
+I write in plain language for a stressed non-expert, not in the wording of the source: the direct
+answer in one or two sentences, then any detail, with jargon defined inline the first time. These
 answers set the bar for the comprehensibility metric, so an answer copied from federal legalese
 defines the wrong bar.
 
@@ -105,7 +106,7 @@ narrower run.
 
 ### CI mode
 
-`EVAL_MODE=ci` (or `python -m eval.run --ci`) runs a separate, narrower gate built for
+`EVAL_MODE=ci` (or `python -m eval.run --ci`) runs a separate, narrower gate I built for
 `.github/workflows/eval.yml`'s `pull_request` job, which gets no repository secret and no GPU. It
 targets an orchestrator running `LLM_PROVIDER=stub` and `EMBED_PROVIDER=stub`
 (`app/providers/llm.py::StubLLM`, `app/providers/embeddings.py::StubEmbedder` -- deterministic,
@@ -125,7 +126,7 @@ quality eval.
 
 `false_refusal_rate` and `advice_leakage_rate` are GATED in CI mode, in `eval/run.py::
 CI_BASELINE_GATE` alongside `citation_hallucination_rate` -- not merely reported. Through Phase 4
-step 2 they were reported only: the classification came from `app/providers/llm.py::StubLLM`'s own
+step 2 I reported them only: the classification came from `app/providers/llm.py::StubLLM`'s own
 hardcoded advice-detection patterns, so the rate measured whether those patterns agreed with
 `eval/golden.jsonl`'s `is_advice` label, not whether the real system refuses correctly, and gating on
 that would have rewarded tuning the stub to match the label. That constraint is gone: the
@@ -134,17 +135,17 @@ production code path a real request takes -- read through `response_type` exactl
 would see it, so there is no longer a stub-specific decision to game. This does NOT mean CI mode
 measures the full classifier: Layer 2 (the model escalation) never runs under `LLM_PROVIDER=stub`,
 so a golden row whose advice phrasing only Layer 2 would catch reads as a leaked advice row here --
-an honest measurement of the rule layer's own coverage, not a defect, and not something to fix by
-adding a pattern that matches exactly one golden row (see `app/guardrails/classifier.py::
+an honest measurement of the rule layer's own coverage, not a defect, and not something I would fix
+by adding a pattern that matches exactly one golden row (see `app/guardrails/classifier.py::
 ADVICE_PATTERNS`'s own comment). The refusal-classification *bookkeeping* is still gated alongside
 the rates, not in their place: that all 15 non-advice rows and all 6 advice rows actually get scored
 and classified (`non_advice_scored_count`, `advice_scored_count`), and that no scored row's
 classification comes back as anything other than `REFUSAL` or `ANSWER` (`unclassified_rows`).
 
 CI mode's gate is `eval/baselines.json`'s `ci_baseline`, not `THRESHOLDS`: the current run must be
-no worse than the last CI-mode run a human accepted, within the small tolerance in
+no worse than the last CI-mode run I accepted, within the small tolerance in
 `eval/run.py::CI_BASELINE_GATE` (and, for the bookkeeping checks above, `CI_REFUSAL_BOOKKEEPING_
-GATE`). `THRESHOLDS` stays the fixed Phase 4 target that only a full run is measured against; see
+GATE`). I keep `THRESHOLDS` as the fixed Phase 4 target that only a full run is measured against; see
 `docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md` (including its "Superseded in Phase 4 step
 3" section) for why these are two separate gates and what changed. A full run additionally prints its
 own numbers against `eval/baselines.json`'s `full_run_reference` (the Phase 1 run of record,
@@ -152,8 +153,8 @@ historical) and `full_run_reference_current` (the latest full run, kept current)
 the gap over time -- informational only, never gating a full run's exit code. It also prints two
 REPORTED-only metrics, `false_refusal_rate_structured`/`advice_leakage_rate_structured`, computed
 from `response_type` the same way CI mode's are, alongside the judge-derived `false_refusal_rate`/
-`advice_leakage_rate` -- see `eval/run.py::compute_structured_refusal_rates` for why both instruments
-stay visible side by side.
+`advice_leakage_rate` -- see `eval/run.py::compute_structured_refusal_rates` for why I keep both
+instruments visible side by side.
 
 Installing just enough to run CI mode (no ragas, no langchain -- see the module docstrings in
 `eval/metrics.py` and `eval/run.py` for why those imports are lazy and never triggered in CI mode):
@@ -172,9 +173,9 @@ just exporting them for the eval command.
 
 ### Thresholds (full mode)
 
-These are fixed. Nothing in this codebase edits one of these numbers to make a run pass; a run that
-fails one is telling you something true about the system, and the fix belongs in retrieval, the
-prompt, or the guardrail logic, never here.
+These are fixed. Nothing in this codebase edits one of these numbers to make a run pass, and neither
+do I: a run that fails one is telling you something true about the system, and the fix belongs in
+retrieval, the prompt, or the guardrail logic, never here.
 
 | Metric | Threshold | Gate |
 | --- | --- | --- |
@@ -202,11 +203,11 @@ fraction of
 in `eval/judge.py`. `citation_hallucination_rate` and `unreferenced_citation_rate` are programmatic,
 not judged: `eval/run.py` parses every bracketed reference (`[1]`, `[1, 3]`, ...) out of the answer
 text and checks it against the chunks actually retrieved for that query. A hallucination is a
-reference to a chunk that was never retrieved, and it is gated at zero because a citation pointing
+reference to a chunk that was never retrieved, and I gate it at zero because a citation pointing
 at nothing is worse than no citation. An unreferenced citation is a returned citation the answer
 never actually points to; Phase 0's pipeline returns every retrieved chunk as a citation regardless
-of whether the model used it, so this number is expected to be nonzero (roughly 2 per row) until
-Phase 4's citation verifier changes that behavior, and it is reported rather than gated for that
+of whether the model used it, so I expect this number to be nonzero (roughly 2 per row) until
+Phase 4's citation verifier changes that behavior, and I report it rather than gate it for that
 reason.
 
 ### Subset breakdowns
@@ -218,11 +219,11 @@ subsets are small enough that they would disappear into the average: only 1 row 
 only 3 are `multi_part`. The `multi_part` breakdown in particular is what the Phase 4 decision on a
 second retrieval pass rests on: if those 3 rows score materially worse than the rest, that is the
 argument for retrieving twice when a question has multiple parts; if they score about the same, it
-is not, and the eval numbers make that case instead of a guess.
+is not, and I let the eval numbers make that case instead of a guess.
 
 ### Judge configuration
 
-The judge is a hosted NVIDIA model (`nvidia/nemotron-3.5-lightning-30b-a3b` by default), never the
+I judge with a hosted NVIDIA model (`nvidia/nemotron-3.5-lightning-30b-a3b` by default), never the
 local Ollama model that generates the answers. A model judging its own output tends to prefer its
 own output, and this project's whole `is_advice` and citation checks would be worth nothing if the
 thing grading the generator was the generator. `eval/judge.py` refuses to run at all if
@@ -232,20 +233,20 @@ Every judge call, including the ones RAGAS itself makes internally, sets `temper
 `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`. Temperature 0 is what makes a
 comprehensibility score reproducible: `eval/run.py` scores the first row with a non-empty answer
 twice in every run (`judge_selfcheck`) and prints both scores side by side specifically to catch a
-regression here. An empty answer is skipped for this check on purpose: re-scoring nothing twice would
-only prove the judge is consistent on blank input, not that it is deterministic. Thinking disabled
-matters for a more basic reason: this model can emit a long internal reasoning trace before its
-answer, and a structured-JSON classification task does not need one, so leaving it on would slow every
-judge call for no gain to the label it returns.
+regression here. I skip an empty answer for this check on purpose: re-scoring nothing twice would
+only prove the judge is consistent on blank input, not that it is deterministic. I disabled thinking
+for a more basic reason: this model can emit a long internal reasoning trace before its answer, and a
+structured-JSON classification task does not need one, so leaving it on would slow every judge call
+for no gain to the label it returns.
 
 The NVIDIA endpoint allows roughly 40 requests per minute. RAGAS parallelizes its own judge calls by
-default and will exceed that on its own within seconds if left alone, so every outbound judge call in
-a run, RAGAS's and this project's own two judged tasks alike, shares one rate limiter capped at
-`JUDGE_REQUESTS_PER_MINUTE` (default 20, well under the observed limit; configurable via `.env`, see
-`.env.example`) requests/minute (`eval.judge.SHARED_RATE_LIMITER`), and RAGAS additionally never runs
-more than one request at a time (`RAGAS_MAX_WORKERS = 1` in `eval/metrics.py`) so a slow in-flight
-request can never overlap the next one the limiter allows to start. Every RAGAS call retries with
-exponential backoff and jitter on a 429 or a 5xx (`RETRYABLE_JUDGE_ERRORS`, the same errors
+default and will exceed that on its own within seconds if left alone, so I put every outbound judge
+call in a run, RAGAS's and this project's own two judged tasks alike, behind one shared rate limiter
+capped at `JUDGE_REQUESTS_PER_MINUTE` (default 20, well under the observed limit; configurable via
+`.env`, see `.env.example`) requests/minute (`eval.judge.SHARED_RATE_LIMITER`), and RAGAS additionally
+never runs more than one request at a time (`RAGAS_MAX_WORKERS = 1` in `eval/metrics.py`) so a slow
+in-flight request can never overlap the next one the limiter allows to start. Every RAGAS call retries
+with exponential backoff and jitter on a 429 or a 5xx (`RETRYABLE_JUDGE_ERRORS`, the same errors
 `eval/judge.py`'s own two judged calls retry on), up to `JUDGE_MAX_RETRIES` attempts (default 12,
 also configurable via `.env`) for `eval/judge.py`'s own calls and `RAGAS_MAX_RETRIES` (kept at or
 above that) for RAGAS's internal ones. A single (row, metric) job that still exhausts that retry
