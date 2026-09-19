@@ -45,17 +45,22 @@ THE BLAST RADIUS, stated exhaustively because this is the first tool outside app
 app/recrawl.py to write `documents` at all:
 
     WRITES, and nothing else:
-        sources.rule_effective_date     (1 row per annotated source)
         documents.rule_effective_date   (N rows per annotated source, one per chunk)
 
     READS ONLY:
-        sources.source_url, sources.rule_effective_date  (to compute the before/after diff)
+        documents.rule_effective_date   (to compute the before/after diff, and to tell a source
+                                         that is absent from the corpus from one that is present)
+
+    TOUCHES THE `sources` TABLE NOT AT ALL. It used to write `sources.rule_effective_date` and
+    read the before-value from there. Both were removed on 19 September 2026 under Option B: that
+    column is never being added to production, so every statement against it raised
+    UndefinedColumn and the tool could not run. `documents.rule_effective_date` is the one
+    retrieval actually reads (app/db.py selects `d.rule_effective_date`), and was always the
+    load-bearing copy.
 
     NEVER TOUCHED, by construction -- these columns appear in no UPDATE in this file:
-        fetched_at, last_verified_at, last_changed_at, last_success_at, change_count,
-        consecutive_failures, last_error, last_http_status, status, last_indexed_body,
-        resolved_url, page_last_updated, documents.content, documents.embedding,
-        documents.section_heading, documents.heading_level
+        every column of `sources` without exception, plus documents.content,
+        documents.embedding, documents.section_heading, documents.heading_level
 
 No row is ever INSERTed and no row is ever DELETEd. A manifest entry whose `source_url` has no
 `sources` row is reported and skipped, never created: this tool syncs annotations onto an existing
@@ -125,7 +130,14 @@ class SourceDiff:
     after: date | None = None
     changed: bool = False
     documents_rows: int = 0
-    missing_sources_row: bool = False
+    # No chunks in `documents` for this source_url: it is in the manifest but not in the corpus.
+    # Renamed from `missing_sources_row` on 19 September 2026, when the read moved off `sources`
+    # onto `documents` -- the old name described a `sources` row this tool no longer looks at.
+    not_in_corpus: bool = False
+    # True when this source's chunks do NOT all carry the same rule_effective_date. Impossible to
+    # observe while the value was read from `sources` (one row, one value), and worth surfacing
+    # rather than silently flattening: it means a previous partial write left the source split.
+    before_is_mixed: bool = False
 
 
 @dataclass
@@ -138,14 +150,14 @@ class SyncReport:
 
     @property
     def missing(self) -> list[SourceDiff]:
-        return [d for d in self.diffs if d.missing_sources_row]
+        return [d for d in self.diffs if d.not_in_corpus]
 
     def to_dict(self) -> dict:
         return {
             "sources_considered": len(self.diffs),
             "changed": len(self.changed),
             "unchanged": len(self.diffs) - len(self.changed) - len(self.missing),
-            "missing_sources_row": len(self.missing),
+            "not_in_corpus": len(self.missing),
             "documents_rows_updated": sum(d.documents_rows for d in self.diffs),
             "details": [
                 {
@@ -154,7 +166,8 @@ class SyncReport:
                     "after": d.after.isoformat() if d.after else None,
                     "changed": d.changed,
                     "documents_rows": d.documents_rows,
-                    "missing_sources_row": d.missing_sources_row,
+                    "not_in_corpus": d.not_in_corpus,
+                    "before_is_mixed": d.before_is_mixed,
                 }
                 for d in self.diffs
             ],
@@ -167,9 +180,9 @@ def sync_annotations(
     *,
     dry_run: bool = False,
 ) -> SyncReport:
-    """Sync `rule_effective_date` from `manifest` onto the matching `sources` and `documents` rows.
+    """Sync `rule_effective_date` from `manifest` onto the matching `documents` rows.
 
-    One transaction per source, wrapping the read and both writes, so each source is durable the
+    One transaction per source, wrapping the read and the write, so each source is durable the
     moment the loop moves on rather than riding an ambient transaction that some later unrelated
     call would have to commit. This is the same reasoning app/backfill_source_bodies.py documents
     for its own per-source `conn.transaction()` block, and it holds on an autocommit connection
@@ -184,27 +197,37 @@ def sync_annotations(
 
         with conn.transaction():
             with conn.cursor() as cur:
+                # Reads `documents`, not `sources`. That is not a stylistic choice: under Option B
+                # `sources.rule_effective_date` is never added to production, so a SELECT against
+                # it raises UndefinedColumn and this tool could not run at all. `documents` is also
+                # the correct place to read from on the merits -- it is what retrieval actually
+                # uses (app/db.py selects `d.rule_effective_date`), so it is the value whose
+                # before-and-after a curator cares about.
                 cur.execute(
-                    "SELECT rule_effective_date FROM sources WHERE source_url = %s",
+                    "SELECT DISTINCT rule_effective_date FROM documents WHERE source_url = %s",
                     (source_url,),
                 )
-                row = cur.fetchone()
+                existing = [row[0] for row in cur.fetchall()]
 
-                if row is None:
-                    diff.missing_sources_row = True
+                if not existing:
+                    diff.not_in_corpus = True
                     report.diffs.append(diff)
                     logger.warning(
-                        "%s: in the manifest but has no `sources` row -- skipped, NOT created "
-                        "(this tool syncs annotations onto an existing corpus, it is not an "
-                        "ingest)",
+                        "%s: in the manifest but has no chunks in `documents` -- skipped, NOT "
+                        "created (this tool annotates an existing corpus, it is not an ingest)",
                         source_url,
                     )
                     continue
 
-                (current,) = row
-                diff.before = current
+                # Normally every chunk of a source carries the same date, so `existing` holds one
+                # value. More than one means a previous write reached only part of the source; the
+                # tool treats that as needing a sync (the set is not {desired}) and says so, rather
+                # than picking one of them to call "before".
+                diff.before_is_mixed = len(existing) > 1
+                diff.before = existing[0] if len(existing) == 1 else None
+                current = diff.before
 
-                if current == desired:
+                if set(existing) == {desired}:
                     report.diffs.append(diff)
                     logger.info(
                         "%s: already %s -- no write",
@@ -230,10 +253,10 @@ def sync_annotations(
                     )
                     continue
 
-                cur.execute(
-                    "UPDATE sources SET rule_effective_date = %s WHERE source_url = %s",
-                    (desired, source_url),
-                )
+                # ONE table. The `UPDATE sources SET rule_effective_date` that used to run here
+                # was removed on 19 September 2026: under Option B that column never arrives in
+                # production, and `documents` is the one retrieval reads. Same removal, and the
+                # same reason, as app/backfill_source_bodies.py's.
                 cur.execute(
                     "UPDATE documents SET rule_effective_date = %s WHERE source_url = %s",
                     (desired, source_url),
@@ -255,7 +278,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m app.sync_annotations",
         description=(
-            "Push curator annotations from data/sources/sources.yaml into sources and documents. "
+            "Push curator annotations from data/sources/sources.yaml into documents. "
             "No fetch, no chunking, no re-embedding. See this module's own docstring for the "
             "exhaustive list of columns it writes and never writes."
         ),
@@ -370,7 +393,7 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"{counts['sources_considered']} considered, {counts['changed']} "
             f"{'would change' if args.dry_run else 'changed'}, {counts['unchanged']} unchanged, "
-            f"{counts['missing_sources_row']} missing a sources row, "
+            f"{counts['not_in_corpus']} not in the corpus, "
             f"{counts['documents_rows_updated']} documents rows"
         )
 

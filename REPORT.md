@@ -6183,6 +6183,23 @@ through the same process that produced the drift this whole section documents.
 **What is NOT done, so the half-state is legible.** `app/recrawl.py`'s `touch_last_verified` and
 `reindex_source` still write `sources.rule_effective_date`; `_diff_node` still reads it;
 `app/sync_annotations.py` still writes it. All of that is the rest of Option B and is untouched.
+
+**Update, later the same day: the second piece landed too, and it was not a one-line change.**
+`app/sync_annotations.py` now touches the `sources` table in NO statement at all. Removing its
+`UPDATE sources` alone would not have made it runnable, because its before-and-after diff read
+`SELECT rule_effective_date FROM sources`, against the same absent column: **the read was as fatal
+as the write, and only the write was obvious.** The read moved to
+`SELECT DISTINCT rule_effective_date FROM documents`, which is the copy retrieval actually uses and
+was always the load-bearing one. Three cascades came with it: a summary line in `main()` that read
+a dict key the rename had removed (a `KeyError` on every invocation, caught by lint and tests rather
+than by a user), the `missing_sources_row` field renamed to `not_in_corpus` because it no longer
+describes a `sources` row, and the module's exhaustive blast-radius list rewritten to one column in
+one table. **One capability arrived for free**: reading per-chunk instead of per-source makes a
+source whose chunks disagree about the date visible for the first time, which was structurally
+unobservable while the value came from a single `sources` row. It is reported as `before_is_mixed`
+rather than silently flattened. Still untouched and still the rest of Option B:
+`app/recrawl.py`'s `touch_last_verified` and `reindex_source` write the column, `_diff_node` reads
+it, and `infra/sql/init.sql` still declares it.
 Nothing has been removed from `infra/sql/init.sql`, and no migration has been written. The backfill
 was pulled forward alone because it is the only piece that blocks the next step.
 
