@@ -6672,6 +6672,164 @@ distinguished by severity rather than by separate checks.
 
 ---
 
+## Option B completed: the manifest is authoritative, and `sources.rule_effective_date` is gone
+
+Landed 19 September 2026, after the backfill and the schema drift check. This is the rest of Option B,
+the part the section above lists as "still untouched": `app/recrawl.py`'s `touch_last_verified` and
+`reindex_source` writing the column, `_diff_node` reading it, and `infra/sql/init.sql` declaring it.
+
+**The defect this closes is not the missing column. It is the loop.** `_diff_node` read
+`rule_effective_date` out of `sources` and wrote it back to `sources`, so the value re-derived itself
+from itself on every run. A curator editing `data/sources/sources.yaml` changed nothing, because the
+refresh job never looked there. That is the specific thing that blocks adding a `status` field for the
+court injunction: the manifest was tracked but not authoritative, and the difference only shows up when
+someone tries to change a value.
+
+**Nine edits, and three of them were not in the original brief.** The brief named `_initial_state`,
+`_diff_node` and `_ingest_from_manifest`. A search for the full set found three more sites, and leaving
+any of them would have left a manifest that is authoritative over a job that still cannot run, which is
+worse than the current state because it looks finished.
+
+| Site | What it did | Now |
+|---|---|---|
+| `recrawl.py::_initial_state` | seeded `rule_effective_date: None` | reads `manifest_annotation(entry, ...)`, `.isoformat()` |
+| `recrawl.py::_load_diff_baseline` | `SELECT last_indexed_body, rule_effective_date FROM sources` | drops the column; returns a 2-tuple |
+| `recrawl.py::_diff_node` | returned `rule_effective_date` from the DB | returns no such key; the manifest value survives |
+| `recrawl.py::touch_last_verified` | `UPDATE sources SET ... rule_effective_date = %s` | clause removed; the `documents` write stays |
+| `ingest.py::_embed_and_store` | upserted it into `sources` | removed from column list, VALUES and `DO UPDATE SET` |
+| `ingest.py::_ingest_from_manifest` | read it from snapshot frontmatter | reads it from the manifest entry |
+| `ingest.py::_ingest_from_snapshots` | read it from frontmatter | unchanged, documented exception |
+| `infra/sql/init.sql` | declared `sources.rule_effective_date` | declaration removed, no `DROP COLUMN` |
+| `sync_annotations.py::manifest_annotation` | defined here | moved to `ingest.py`, re-exported |
+
+**`init.sql` is the one that would have bitten on the day the secret goes in.** `app/check_schema.py`
+is strict on a MISSING column and report-only on an extra one. Leaving the declaration in place while
+production lacks the column means the drift check reports a fatal missing column the moment
+`DATABASE_URL` is set, which is the event this whole thread exists to unblock. Its own docstring
+already anticipated the other direction: "After Option B lands, `sources.rule_effective_date` is
+exactly this case on every developer database created before that change."
+
+**Two hazards, both measured before any code changed rather than reasoned about after.**
+
+    ...procedure-faq   -> datetime.date(2026, 9, 15)  date
+    ...procedure-quick -> datetime.date(2026, 9, 15)  date
+    entries with annotations: 3 of 14
+    json.dumps(date) raises: TypeError: Object of type date is not JSON serializable
+
+YAML parses an unquoted `2026-09-15` into a real `datetime.date`, and `_parse_iso_date` returns a
+`date` unchanged, so it is not a conversion point. `RefreshState` must hold serializable values because
+LangGraph's checkpointer persists them, a rule `app/recrawl.py`'s own module docstring already states
+("no `datetime`/`date` objects"). Without `.isoformat()` this would pass every test in the repository
+and fail the first time a real checkpointer persisted a source carrying the annotation.
+
+### What was verified, on a machine with no database and no langgraph
+
+Baseline taken before the change, with `RAW_SNAPSHOT_DIR` pointed at the real snapshots:
+
+    tests/test_freshness.py tests/test_chunking.py
+    2 failed, 59 passed, 15 skipped, 9 errors in 45.97s
+
+After:
+
+    2 failed, 69 passed, 15 skipped, 9 errors in 46.65s
+
+Ten new passes, no new failure. The 2 failures and 9 errors are the same tests, for the same
+environmental reasons, confirmed by reading the exception types rather than by assuming:
+
+    9  psycopg.InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run in async mode
+    1  httpx.ConnectTimeout                  (no Ollama on this machine)
+    1  psycopg_pool.PoolTimeout               (no Postgres on this machine)
+
+`tests/test_sync_annotations.py tests/test_check_schema.py tests/test_backfill_source_bodies.py`:
+`35 passed, 5 errors`, unchanged from before. `black --check`: 48 files unchanged.
+
+**The blast radius was checked against file modification times, not against the agent's summary.**
+Seven files changed: `app/recrawl.py`, `app/ingest.py`, `app/sync_annotations.py`, `infra/sql/init.sql`,
+`tests/test_freshness.py`, and the two ADRs. `eval/golden.jsonl` last modified 29 August.
+`app/db.py` last modified 12 September. `tests/test_guardrails.py` untouched, and
+`test_temporal_guard_blocks_the_real_dhs_fixed_admission_figure_as_of_today` still fails, still
+unmarked, still not skipped.
+
+**The two DB-backed tests were amended, not deleted.** `test_touch_last_verified_...` and the renamed
+`test_embed_and_store_first_index_writes_last_indexed_body_and_the_documents_annotation` each used to
+assert the `sources` write happened. Each now asserts what it can honestly establish against a
+database: that `last_indexed_body` and the `documents` annotation are written. The claim that the
+`sources` write is GONE moved to the fake-connection tests, where it is a statement-level fact rather
+than a property of whichever database happens to be open. Both DB tests still need a connection and
+neither runs here.
+
+**Four new tests run on this machine and each ships with a control.** Two fake-connection regression
+tests drive the real `touch_last_verified` and `_embed_and_store` against a connection that records
+every statement, and assert that NO statement touching `sources` names the column, checked across the
+whole class rather than against the one statement the fix changed. A fifth test reads the real
+`data/sources/sources.yaml` and asserts the annotation comes back as a `datetime.date`, pinning the
+premise `.isoformat()` exists for. It was run with `SOURCES_MANIFEST_PATH` unset as well, to confirm it
+finds the manifest by upward search and does not quietly skip.
+
+### What is NOT verified, and will not be called verified
+
+- **Nothing here was run against a database.** The change exists so the first live re-crawl does not
+  die on `_diff_node`'s opening SELECT and mark fourteen sources `fetch_failed` without fetching a
+  page. That outcome is unverifiable from this machine and is the only evidence that would settle it.
+- **All 14 `test_graph_*` tests need BOTH a connection and langgraph.** Neither exists here. The change
+  therefore ships through the graph untested end to end: no test that actually compiles the StateGraph,
+  runs `_initial_state` into `_diff_node`, and observes the manifest value surviving the node boundary
+  has ever been executed against this code.
+- **The `json.dumps` assertion approximates a boundary LangGraph crosses with ormsgpack.** It is a
+  stand-in for "no `date` objects in state", not a measurement of the checkpointer. The two libraries
+  do not reject the same set of types. The test says so in its own docstring.
+- **`infra/sql/init.sql` has not been applied to a Postgres.** The `ALTER TABLE sources` was re-read by
+  hand after the clause removal, and `last_indexed_body TEXT;` is correctly terminated, but the file's
+  validity is established by `drift-checks.yml` applying it to a `pgvector/pgvector:pg16` service
+  container, which has not run.
+- **`cur.rowcount` on the `documents` UPDATE, now that the `sources` statement no longer precedes it in
+  that cursor.** The fake connection returns a stubbed rowcount. Real psycopg semantics are unobserved.
+
+### Two things the verification found, both fixed the same day
+
+**The first version of these tests asserted a schema fact against the wrong database, and that was
+caught in review rather than by any check.** Both DB-backed tests originally ended by querying
+`information_schema.columns` for the absence of `sources.rule_effective_date`, with a message reading
+"must not be present on the reference schema". But the `conn` fixture points at a developer's
+long-lived scratch database (`officehours_freshness`), not at a fresh container with `init.sql`
+applied, and `init.sql` deliberately issues no `DROP COLUMN`. A developer whose scratch database
+predates this change still has the column, so both tests would have been red there for a condition
+that breaks nothing. **That is precisely the shape `app/check_schema.py` refuses on principle one
+layer up**, on the grounds that a check red everywhere for a harmless condition is how a check gets
+muted. Worse, a schema query cannot tell a harmless leftover apart from a restored write, which is
+the only thing worth catching.
+
+Both `information_schema` blocks were removed. The claim now lives where it can be made precisely: a
+statement-level assertion in the fake-connection tests, which need no database and run on the Windows
+machine that holds the snapshots.
+
+**The control was a re-implementation, and is now the real predicate.** Each control originally
+re-derived the "targets `sources` and names `rule_effective_date`" test inline against a hand-typed
+copy of the old statement, so the control and the regression test evaluated two separate pieces of
+logic that could drift apart while both stayed green. That is the `_SYNCED_ANNOTATIONS` decorative-
+constant defect this report already records, in a second place. One module-level predicate,
+`_statements_writing_sources_rule_effective_date`, is now called by both regression tests and both
+controls.
+
+**It was then mutation-checked rather than trusted.** Driving the real `touch_last_verified` through
+the fake connection and applying the shared predicate:
+
+    real code      -> violations: []
+                      sources stmts issued: 1
+    restored write -> violations: 1
+
+Green on the real code, red the moment the pre-Option-B `UPDATE sources ... rule_effective_date = %s`
+is put back, and the real code still issues one `sources` statement, so the "bookkeeping is still
+written" half is not vacuous either.
+
+**`data/sources/sources.yaml`'s header was corrected too.** Line 9 said the daily re-crawl "writes
+them to `sources` and `documents` on every run". Only `documents` is true now. That line was written
+as part of this work, so it was corrected as part of it, with a clause recording that the `sources`
+mirror was removed under Option B. No `url`, `title`, `topic` or annotation value was touched, and the
+manifest still parses to 14 sources with the same three annotation blocks.
+
+---
+
 ## Method, and what was not finished
 
 **How the testing ran.** Playwright against the live Vercel frontend for everything involving rendering, navigation, viewport, keyboard, contrast and the DOM. Direct HTTP to `https://oh-gateway-rp.fly.dev/v1/query` and `/v1/query/stream` for the bulk question batteries, because that is the same gateway and orchestrator the browser calls and it allowed six repeats of a question where the browser would have allowed one. Every finding that concerns what a user *sees* was confirmed in the browser; every finding that concerns *what the system returns* is quoted from the wire. Each finding says which is which.

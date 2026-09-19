@@ -7,9 +7,12 @@
 # at all. They are tracked here now. See docs/adr/0014-stateless-recrawl-diff.md's amendment.
 #
 # This file is AUTHORITATIVE for these values: the daily re-crawl reads them from here and writes
-# them to `sources` and `documents` on every run, so editing a value here and waiting for the next
-# run (or running `python -m app.sync_annotations`) is how a curator change reaches production.
-# Deleting a key writes NULL, which is how an annotation is removed.
+# them to `documents` on every run, so editing a value here and waiting for the next run (or running
+# `python -m app.sync_annotations`) is how a curator change reaches production. (Until Option B,
+# 19 September 2026, this also mirrored onto a `sources.rule_effective_date` column; that mirror was
+# removed, and `documents` is now the only table an annotation lands on -- see
+# docs/adr/0022-manifest-authoritative-annotations.md.) Deleting a key writes NULL, which is how an
+# annotation is removed.
 #
 # Known exception, deliberate: eval/fixtures/sources/ keeps its annotations in frontmatter. That
 # corpus is self-contained by design (docs/adr/0004) and is itself tracked, so the problem above

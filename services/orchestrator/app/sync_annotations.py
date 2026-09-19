@@ -97,7 +97,14 @@ from pathlib import Path
 import psycopg
 
 from app.config import Settings, get_settings
-from app.ingest import _parse_iso_date, read_manifest
+from app.ingest import manifest_annotation, read_manifest
+
+# `manifest_annotation` is re-exported from here (rather than only importable from app.ingest)
+# because it is public API of this module today -- tests/test_sync_annotations.py, and any other
+# caller written before 19 September 2026, imports it as `from app.sync_annotations import
+# manifest_annotation`. The single definition now lives in app/ingest.py (see that function's own
+# docstring for why it moved); this import keeps the old spelling working without a second copy of
+# the logic.
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("sync_annotations")
@@ -107,18 +114,6 @@ logger = logging.getLogger("sync_annotations")
 # have added a name to it and believed something would happen. `rule_effective_date` is the only
 # annotation with a database column, it is named explicitly at each site that uses it, and the
 # module docstring says what to do when a second one arrives.
-
-
-def manifest_annotation(entry: dict, key: str) -> date | None:
-    """The curator value for `key` on one manifest entry, or None when the entry has no
-    `annotations` block or does not set that key.
-
-    None is meaningful and is NOT the same as "leave it alone": deleting a key from the manifest is
-    how a curator removes an annotation, and that has to reach the database as NULL. This is the
-    behaviour the database-sourced path could never provide, because a value already stored there
-    would simply re-write itself on every run.
-    """
-    return _parse_iso_date((entry.get("annotations") or {}).get(key))
 
 
 @dataclass

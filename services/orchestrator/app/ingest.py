@@ -363,6 +363,29 @@ def read_manifest(path: Path) -> list[dict]:
     return data["sources"]
 
 
+def manifest_annotation(entry: dict, key: str) -> date | None:
+    """The curator value for `key` on one manifest entry, or None when the entry has no
+    `annotations` block or does not set that key.
+
+    None is meaningful and is NOT the same as "leave it alone": deleting a key from the manifest is
+    how a curator removes an annotation, and that has to reach the database as NULL. This is the
+    behaviour the database-sourced path could never provide, because a value already stored there
+    would simply re-write itself on every run.
+
+    THE SINGLE DEFINITION, shared by ingest, recrawl and sync_annotations. It lived only in
+    app/sync_annotations.py until 19 September 2026, when app/recrawl.py::_initial_state needed the
+    exact same None-versus-absent behaviour to seed a curator annotation from the manifest instead
+    of from a database column that is being removed (Option B; see
+    docs/adr/0022-manifest-authoritative-annotations.md). Importing it from sync_annotations would
+    have made app/recrawl.py -- a scheduled job -- depend on a module built to be run by hand from a
+    laptop; copying it a second time would have risked the None-versus-absent distinction being
+    re-derived slightly differently the second time someone wrote it out. This function is the one
+    place it is decided; app/sync_annotations.py now imports and re-exports this name rather than
+    defining its own copy.
+    """
+    return _parse_iso_date((entry.get("annotations") or {}).get(key))
+
+
 class RobotsCache:
     """Fetches and caches one robots.txt per host."""
 
@@ -583,12 +606,17 @@ async def _embed_and_store(
     now: datetime | None = None,
     mark_changed: bool = False,
 ) -> None:
-    """`rule_effective_date` is the curator annotation carried in a snapshot's own frontmatter
-    (e.g. `rule_effective_date: 2026-09-15` on both fixed_admission snapshots), never computed here
-    -- see infra/sql/init.sql's comment on the column. `now` defaults to the real current time; it
-    is an explicit parameter so app/recrawl.py::reindex_source (Phase 5) can pass one `now` value
-    for both `fetched_at` and `last_verified_at`, deterministically, instead of two separate calls
-    to datetime.now(UTC) that could disagree by a few microseconds.
+    """`rule_effective_date` is the curator annotation -- read out of the manifest entry's
+    `annotations` block by the caller (`_ingest_from_manifest` via `manifest_annotation`, or
+    app/recrawl.py::_initial_state before `reindex_source` ever runs), never computed here. It is
+    written ONLY onto `documents`, one row per chunk -- see infra/sql/init.sql's comment on
+    `documents.rule_effective_date`. It is NOT written onto `sources`: that column existed for a
+    while (docs/adr/0014-stateless-recrawl-diff.md) but was removed under Option B (see
+    docs/adr/0022-manifest-authoritative-annotations.md) because it is never being added to
+    production and `data/sources/sources.yaml` is authoritative for the value now. `now` defaults to
+    the real current time; it is an explicit parameter so app/recrawl.py::reindex_source (Phase 5)
+    can pass one `now` value for both `fetched_at` and `last_verified_at`, deterministically,
+    instead of two separate calls to datetime.now(UTC) that could disagree by a few microseconds.
 
     `body` is the raw markdown this source was just indexed from -- the same text a snapshot file
     holds, BEFORE chunking (never a chunk's own `text`, which chunk_markdown prefixes with a
@@ -632,9 +660,9 @@ async def _embed_and_store(
                 INSERT INTO sources
                     (source_url, resolved_url, page_last_updated, fetched_at, last_verified_at,
                      last_changed_at, last_success_at, change_count, consecutive_failures,
-                     last_error, last_http_status, status, last_indexed_body, rule_effective_date)
+                     last_error, last_http_status, status, last_indexed_body)
                 VALUES (%(source_url)s, %(resolved_url)s, %(page_last_updated)s, %(now)s, %(now)s,
-                        %(now)s, %(now)s, 0, 0, NULL, NULL, 'ok', %(body)s, %(rule_effective_date)s)
+                        %(now)s, %(now)s, 0, 0, NULL, NULL, 'ok', %(body)s)
                 ON CONFLICT (source_url) DO UPDATE SET
                     resolved_url = EXCLUDED.resolved_url,
                     page_last_updated = EXCLUDED.page_last_updated,
@@ -649,8 +677,7 @@ async def _embed_and_store(
                                             ELSE sources.last_changed_at END,
                     change_count = sources.change_count
                         + CASE WHEN %(mark_changed)s THEN 1 ELSE 0 END,
-                    last_indexed_body = EXCLUDED.last_indexed_body,
-                    rule_effective_date = EXCLUDED.rule_effective_date
+                    last_indexed_body = EXCLUDED.last_indexed_body
                 """,
                 {
                     "source_url": source_url,
@@ -659,7 +686,6 @@ async def _embed_and_store(
                     "now": now,
                     "mark_changed": mark_changed,
                     "body": body,
-                    "rule_effective_date": rule_effective_date,
                 },
             )
 
@@ -687,6 +713,12 @@ async def _ingest_from_manifest(
     conn: psycopg.AsyncConnection, embedder, settings: Settings, raw_dir: Path
 ) -> tuple[int, int]:
     """Phase 0's path: fetch every URL in SOURCES_MANIFEST_PATH, snapshot, chunk, embed, store.
+
+    `rule_effective_date` is read from the manifest entry's own `annotations` block
+    (`manifest_annotation`), not from the snapshot's frontmatter -- the manifest is authoritative
+    for curator annotations under Option B (docs/adr/0022-manifest-authoritative-annotations.md),
+    so a stale or hand-edited frontmatter value on disk can never disagree with what actually gets
+    written to the database.
 
     Returns (total_chunks, total_sources).
     """
@@ -720,7 +752,7 @@ async def _ingest_from_manifest(
                 resolved_url=frontmatter.get("resolved_url"),
                 page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
                 body=body,
-                rule_effective_date=_parse_iso_date(frontmatter.get("rule_effective_date")),
+                rule_effective_date=manifest_annotation(entry, "rule_effective_date"),
                 chunks=chunks,
             )
 
@@ -741,6 +773,16 @@ async def _ingest_from_snapshots(
     body), so there is nothing left to fetch. This reuses load_snapshot, chunk_markdown, and
     _embed_and_store unchanged -- only how a snapshot is obtained differs from
     _ingest_from_manifest, never the chunking or storage logic itself.
+
+    DELIBERATE, DOCUMENTED EXCEPTION: this path reads `rule_effective_date` out of the snapshot's
+    own YAML frontmatter below, NOT from a manifest entry's `annotations` block the way
+    `_ingest_from_manifest` does. `eval/fixtures/sources/` has no manifest entry at all -- it is a
+    self-contained, four-file CI fixture corpus tracked directly in git
+    (docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md), so the problem Option B exists to
+    solve (a curator annotation living only on one laptop, in a gitignored directory --
+    docs/adr/0022-manifest-authoritative-annotations.md) does not apply to it: the fixture file and
+    its frontmatter are both already checked in and travel together. `data/sources/sources.yaml`'s
+    own header comment documents the identical exception for the other direction of this same split.
 
     Returns (total_chunks, total_sources).
     """
