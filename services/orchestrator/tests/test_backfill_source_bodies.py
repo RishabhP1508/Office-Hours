@@ -106,19 +106,34 @@ def _write_snapshot(
     return path
 
 
-async def test_backfill_populates_null_body_and_leaves_rule_effective_date_alone(
+async def test_backfill_populates_null_body_from_local_snapshot(
     tmp_path, conn, sync_conn, database_url
 ):
-    """Renamed and re-pointed on 19 September 2026. It was
-    `..._populates_null_body_and_annotation_from_local_snapshot` and asserted that the backfill
-    copied `rule_effective_date` out of the snapshot frontmatter. That write was REMOVED as the
-    first piece of Option B (see the UPDATE's own comment in app/backfill_source_bodies.py), so the
-    old assertion tested behaviour the tool deliberately no longer has.
+    """Renamed TWICE on 19 September 2026, and the second rename is the interesting one.
 
-    The assertion is INVERTED rather than deleted. The snapshot below still carries
-    `rule_effective_date: 2026-09-15`, so the tool is handed the value it used to copy and must be
-    shown to ignore it. Deleting the line would have left nothing watching the removal; this way the
-    test fails if anyone puts the write back.
+    It was `..._populates_null_body_and_annotation_from_local_snapshot` and asserted the backfill
+    copied `rule_effective_date` out of the snapshot frontmatter. That write was removed as the
+    first piece of Option B, so the assertion was INVERTED to `row["rule_effective_date"] is None`:
+    the snapshot still carries the value, so the tool was handed what it used to copy and shown to
+    ignore it.
+
+    That inverted assertion is now GONE, and not because it was inconvenient. Option B also removed
+    `sources.rule_effective_date` from infra/sql/init.sql's declaration, so the CI database built
+    from that file has no such column and `SELECT ... rule_effective_date FROM sources` raises
+    UndefinedColumn before any assertion runs. **The assertion did not become wrong. Its subject
+    stopped existing.** There is no longer a value that could be NULL or not-NULL, so this is not a
+    claim a database test can make at all any more.
+
+    The claim itself did not move, because it was never only here:
+    `test_backfill_writes_last_indexed_body_and_never_rule_effective_date` below asserts, at the
+    STATEMENT level against a recording connection, that the UPDATE names no column in
+    `_NEVER_WRITTEN`, and `test_the_never_written_check_would_actually_catch_a_violation` proves
+    that predicate trips on the real pre-19-September statement. Both run with no database. Putting
+    the write back still fails the suite; it fails there instead of here, which is the only place it
+    can still be checked.
+
+    What this test proves now is the half that IS a database fact: a source whose
+    `last_indexed_body` is NULL gets the snapshot's body written into it.
     """
     source_url = "https://example.gov/backfill-test-basic"
     body = "# Test Page\n\n## Section\n\nThe extension is 24 months.\n"
@@ -149,14 +164,16 @@ async def test_backfill_populates_null_body_and_leaves_rule_effective_date_alone
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT last_indexed_body, rule_effective_date FROM sources WHERE source_url = %s",
+            "SELECT last_indexed_body FROM sources WHERE source_url = %s",
             (source_url,),
         )
         row = await cur.fetchone()
     assert row["last_indexed_body"] == body
-    # The snapshot DOES carry rule_effective_date: 2026-09-15. `_insert_test_row` left the column
-    # NULL. The backfill must have left it NULL: it writes last_indexed_body and nothing else.
-    assert row["rule_effective_date"] is None
+    # `rule_effective_date` is deliberately NOT selected or asserted here; the column is not in
+    # infra/sql/init.sql's declaration any more, so selecting it raises UndefinedColumn against the
+    # CI database rather than failing an assertion. See this test's docstring, and
+    # test_backfill_writes_last_indexed_body_and_never_rule_effective_date for where the claim
+    # that the backfill never writes it is actually made and controlled.
 
     await _delete_test_rows(conn, source_url)
 
