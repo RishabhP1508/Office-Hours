@@ -18,7 +18,7 @@ The agent read `docs/reports/phase-4.md`, `phase-5.md`, `phase-7.md`, `phase-8.m
 
 ## The pattern worth taking away from this build
 
-Thirty-one times in this build, an instrument was the thing worth writing down rather than the thing it measured, and in twenty-nine of those the instrument was the one that was broken. I directed this build and verified its results; Claude Code did the building and most of the measuring, and **fifteen of the first twenty-nine belong to the agent**, including the one that nearly closed a finding on a wrong diagnosis, and including entry 28, which did not merely risk a wrong write-up: it was written up, shipped into this report and into the README, and had to be retracted. I am keeping that ratio in the report rather than trimming it, because it is the point: whatever was doing the checking was wrong about as often as the thing being checked, and every one of them surfaced only because something forced the underlying data into view. The healthy case looked fine each time, which is why each survived as long as it did. **Entry 30 is deliberately outside that fifteen and assigned to neither of us.** It surfaced because an external event inverted an assumption the agent and I had both signed off on, and neither of us would have gone looking for it unprompted. The numerator is scoped, not stale. **Entry 31, added 19 September, is outside it too, and it is the first one where the instrument was a piece of this build's own shipping code being used as a probe.**
+Thirty-three times in this build, an instrument was the thing worth writing down rather than the thing it measured, and in thirty-one of those the instrument was the one that was broken. I directed this build and verified its results; Claude Code did the building and most of the measuring, and **fifteen of the first twenty-nine belong to the agent**, including the one that nearly closed a finding on a wrong diagnosis, and including entry 28, which did not merely risk a wrong write-up: it was written up, shipped into this report and into the README, and had to be retracted. I am keeping that ratio in the report rather than trimming it, because it is the point: whatever was doing the checking was wrong about as often as the thing being checked, and every one of them surfaced only because something forced the underlying data into view. The healthy case looked fine each time, which is why each survived as long as it did. **Entry 30 is deliberately outside that fifteen and assigned to neither of us.** It surfaced because an external event inverted an assumption the agent and I had both signed off on, and neither of us would have gone looking for it unprompted. The numerator is scoped, not stale. **Entry 31, added 19 September, is outside it too, and it is the first one where the instrument was a piece of this build's own shipping code being used as a probe.**
 
 | # | The instrument | What it could not see | How it surfaced |
 |---|---|---|---|
@@ -54,6 +54,8 @@ Thirty-one times in this build, an instrument was the thing worth writing down r
 | 29 | Every unit test of `_is_predominantly_non_latin`, as evidence that the gate runs, and the agent's prediction that it does not | A guard's unit tests call it directly with strings and assert its boolean. They pass, and not one of them can answer whether step 1.5 is ever *reached*: step 1 runs first, reads the same input, and returns early on an overlapping predicate. **Reachability is a property of the pipeline, and no unit test of the guard can report it in either direction.** This is entry 1 rearranged, a rule about a field the model was never shown, now a guard behind a guard that consumes the same input. What keeps it separate is that the measurement came out against that prediction: the agent expected unreachable and measured it firing 8 times of 28 across all seven scripts, so the lesson is not "guards behind guards are unreachable" but that you cannot know without probing the front door. | Probing `answer_question` end to end through the real entry point at four question-length tiers, rather than reasoning from the two predicates. The project has no reachability test for any guard; every existing guardrail test bypasses the pipeline that would stop it. |
 | 30 | The pinned `qualify_future_dated_figures` tests, and then the inference this report drew from them about the whole suite | **CORRECTED 19 September 2026. Two failures here, and the second one is this report's, not the suite's.** First, the real defect: eleven call sites in `test_guardrails.py` pin `today` to a literal (`_TODAY = date(2026, 9, 11)`) while the guard's only trigger is `chunk.rule_effective_date > today` against `datetime.now(UTC).date()`, so those eleven assert behaviour at a date that can never arrive again and cannot observe the one input that changes on its own. At 00:00 UTC on 15 September 2026 the strict `>` went false, `future_only` emptied, and both the BLOCK and the INSERT died. **Second: from those pinned call sites this entry concluded "Nothing goes red, the suite stays green", and that claim was false on the day it was written.** A twelfth path existed and was missed. `test_temporal_guard_block_path_returns_blocked_unverified_end_to_end` reaches the guard through `answer_question`, not by calling it directly, and `answer_question` computes `today` at `app/pipeline.py:690` from the real clock with no parameter to override. It began failing on 15 September, the same day this entry published the opposite, and was still failing when CI surfaced it four days later. The count was wrong too: eleven pinned call sites in the suite plus one in `app/pipeline.py`, not twelve in the suite; the pipeline's own call was counted as though it were a test. Worse than a silent expiry: `freshness.py` compares the same date with `<=`, so the appended notice did not stop, it inverted, from "takes effect on September 15, 2026" to "took effect on" -- a system-authored sentence, grounded in no retrieved chunk, asserting that a rule enjoined the previous day is in force. A court blocked the rule on 14 September; the code had no way to know. | The defect surfaced by reading the comparison operator after an external event inverted the assumption ADR 0020 had written down as self-resolving, measured by running the guard at 14, 15 and 16 September against the real chunk text: the same answer string that returns `BLOCKED_UNVERIFIED` on the 14th renders byte-for-byte on the 15th. **The bad inference surfaced four days later, the way it always does: CI went red on the path this entry said could not exist.** The lesson is not that pinning time hides things, which is only the mechanism. **It is that a property measured on most of a set was asserted of all of it.** Eleven call sites really do pin the clock; the conclusion drawn was about the SUITE, a different object, and the single member that behaved differently was the only one that could have mattered. Nothing about the eleven was wrong. The quantifier was. That is the same shape as entries 1, 8 and 29, and it is why the count error (eleven read as twelve) is the less interesting of the two mistakes: getting the number right would not have saved a conclusion that was about the wrong set. **Why the twelfth path caught it is worth stating exactly, because the flattering explanation is wrong: it is not that that test was written more carefully.** It is the only test that reaches the guard through `answer_question` instead of calling it directly, and that path reads the wall clock with no seam to pin, so it inherits the real date by construction rather than by intent. Entry 29 again: what a test can observe is decided by the path it takes to the code, not by the assertions it carries. **Resolution, 19 September:** the test was split rather than pinned or xfailed. The contract half now uses a relative future date on the FIXTURE (the decayed constant, not the clock) and is green, preserving the only end-to-end proof that the BLOCK path is wired through `answer_question`. The real-rule half keeps the actual 2026-09-15 date, stays RED deliberately, carries no marker, and names the injunction and this entry in its docstring. |
 | 31 | `app/ingest.py::fetch_page`, the build's own production fetcher, used on 19 September as the probe for "has DHS changed these pages?" | **It returned 403 on all 14 sources, which is a readable, plausible, entirely wrong finding: "fourteen government sources are refusing us."** The verdict table would have shown 14 `fetch_failed` rows with real reason codes and real HTTP statuses, and every one of them would have been an artefact of the probe. The tell was uniformity: 14 of 14 failing identically, including `ice.gov/robots.txt`, is a broken client, not fourteen broken pages, because these are four different hosts with different publishing schedules and they do not all break in the same hour. Controlled by holding everything constant but the client: same machine, same network, same URL, same declared bot UA, httpx 403 and curl 200. Then the natural next hypothesis, that the bot UA is being refused, was tested and also failed: httpx with no custom UA at all is still 403. The WAF is fingerprinting the client (httpx here is HTTP/1.1 only, `h2` is not installed), so the honest identification the project deliberately sends is not what is being rejected. | By refusing to report 14 identical failures as 14 findings. The same session then used the instrument correctly, and it discriminated: 12 `unchanged`, 2 `meaningful`, which is the control that the classifier is not simply flagging everything. **The general form, and it is the sharpest one in this table: when a tool you built is used to measure the world, a total failure reads as news about the world.** A partial failure would have been easier to catch, because some sources would have disagreed with the others. This one is outside the agent/author split because neither of us wrote the WAF rule, but the fetcher is ours and it is what production runs. **A second, sharper lesson arrived hours later and is recorded because the first write-up got it wrong:** the 403 was interesting enough that it was reported as the probable cause of production's twelve-day staleness, with the Actions history named as the thing that would confirm it. The history refuted it. Fourteen green runs at 24 to 37 seconds each, no fetch attempted in any of them, because the secret is unset and the job skips. **A vivid defect found in the room crowds out a dull one outside it**, and the fact that the 403 is genuinely real made it a better story and a worse explanation. The fix is not to distrust vivid findings but to notice when a cause is being assigned to an effect measured somewhere the cause has never run. |
+| 32 | The FAQ snapshot's `heading_note`, as the record of why that page's chunking is unusual | **A note whose entire job is to describe a structure has outlived the structure it describes, silently, because the mechanism preserving it was working exactly as designed.** The note says the page's group labels "(Transition Period, Understanding the Admit Until Date, Extensions of Stay, Maintaining Status, Departure Period) are h3". Measured against the file it sits in: all five are **h4**, and the real h3 layer (`General`, `F Students`, `School Officials`) is not mentioned at all. DHS evidently added a grouping level at some point; the note was written before that and has been wrong ever since. **The mechanism is the part worth keeping.** `build_frontmatter` preserves every non-base frontmatter key verbatim across a body rewrite, which is correct and is the behaviour ARCHITECTURE.md demands so curator annotations are never lost. The consequence is that an annotation which DESCRIBES the body is carried unchanged across exactly the event that invalidates it: the 5 September re-fetch rewrote the body and copied the note forward untouched. A preservation guarantee and a staleness guarantee are the same guarantee when the thing preserved is a description of the thing replaced. Nothing in the repo compares a `heading_note` to the headings, and no test could have gone red. | Not by any check, and not by anything looking for it. It surfaced only because the annotation was being MOVED to a tracked file, and the move was verified by reading the file it describes rather than by copying the string. A byte-identical round-trip check, which is what a careful migration would normally run and which this one did run, passes on a false value: it proves the move was faithful, which is a different claim from the value being true. **The general form, and it is the one to carry: curator annotations divide into facts about the world and observations about the artifact.** `rule_effective_date` and `federal_register` are facts; they survive any re-fetch unchanged because they never described the page in the first place. `heading_note` and the redirect `note` are observations; a re-fetch is precisely what can falsify them. Storing both classes in the same place, beside the body, gives the second class a guarantee of silent rot, and the fix is not better discipline about updating notes but recognising that the two classes have opposite relationships to the same event. |
+| 33 | The re-crawl's own failure reporting, as the account of why a run against production failed | **The error path is the only part of `app/recrawl.py` that still works against production's schema, so a total failure of the success path would have rendered as a specific, plausible, entirely wrong diagnosis.** Production's Postgres is frozen post-Phase-5, pre-ADR-0014: `documents.rule_effective_date` and `documents.content_tsv` exist, `sources.rule_effective_date` and `sources.last_indexed_body` do not (confirmed against `information_schema`: false, false, true, true). `infra/sql/init.sql` reaches a database only through the local compose mount at `docker-entrypoint-initdb.d`, which runs only on an empty data directory; nothing applies it to a hosted database, so Neon holds whatever was applied by hand at one moment and nothing since. Every success-path statement touches a column that is not there. `_diff_node`'s FIRST statement, before any fetch, is `SELECT last_indexed_body, rule_effective_date FROM sources`. `touch_last_verified` and `_embed_and_store` both write `rule_effective_date`. **`record_source_failure` touches only original-shape columns, so it succeeds.** The first run would therefore catch `UndefinedColumn` per source, route to the failure path, and write `status='fetch_failed'`, an incremented `consecutive_failures`, and the `UndefinedColumn` text into `last_error`, for **all 14 sources, without fetching a single page**. Not a crash. A corpus-wide health state that is confidently, specifically wrong. | **Not by running it, and it could not have been.** It surfaced sideways: `app/sync_annotations.py`, a new tool written against the same table, failed with a raw `UndefinedColumn` on its first SELECT, because it is small enough to have no failure handler standing between the database and the person reading the output. The re-crawl has one, and that handler would have converted the same error into a domain verdict. **The generalisable form, and it is the sharpest in this table: when the failure handler depends on LESS of the system than the success path does, it outlives the success path, and a total failure renders as a confident specific diagnosis in the failure handler's own vocabulary.** The vocabulary here is fetching, so a schema problem would have reported as fourteen fetch failures. That reading was available, adjacent, and already half-believed: the httpx TLS block (entry 31) is real, affects all 14 sources, and had nothing whatever to do with this. Two independent findings pointing at the same 14 rows, one of them the wrong explanation for the other's symptom. The defensive form: a failure handler that requires less than the thing it reports on is not a safety net, it is an unreliable narrator with better uptime than the narrator it replaced. |
 
 
 **A second layer on entry 18, found 12 September.** Entry 18 ends by naming the remedy: read the
@@ -190,8 +192,9 @@ measurements, after the redeploy" below. The table now reflects the deployed sta
 | Finding | Status |
 |---|---|
 | **NEW, 15 September: the fixed-period rule was enjoined, and the temporal guard went inert the same night** | **OPEN, deliberately not fixed. This is the first thing to address before the site goes public.** A nationwide preliminary injunction issued 14 September 2026 in *Presidents' Alliance v. DHS*, No. 1:26-cv-13799 (D. Mass., Saylor, J.), blocks the DHS fixed-period-of-admission rule. The rule did not take effect on the 15th and the duration of status framework remains in place. As of 00:00 UTC on 15 September the temporal guard is inert, the freshness notice has inverted to "took effect on", and the system will state the 30-day figure as current alongside an uncited system-generated sentence asserting the rule took effect. All of that is measured, not predicted. See "The injunction, and why this is not fixed" below, and instrument table entry 30. **Update, 19 September: the fail-open in item 2 of that section is CONFIRMED LIVE in production, not merely derived from the code. Production answers that the rule "took effect on September 15, 2026".** |
-| **NEW, 19 September: the scheduled refresh reports success daily while doing nothing, and that is why nothing has refreshed** | **OPEN, not fixed, and this is the actual cause of the twelve-day staleness.** Fourteen scheduled runs, one a day through today, all green, all 24 to 37 seconds. None attempted a fetch: `DATABASE_URL` is unset, so `recrawl.yml` sets `mode=dry-run`, the no-op step exits 0, `Re-crawl (live)` is skipped on its `if:`, and the missing artifact is ignored by `if-no-files-found: ignore`. 14 pages at a 2.0s delay cannot finish in 24s; those seconds are the pip install. The skip itself is correct and deliberate (Phase 8 has no hosted database). **The defect is that a job doing nothing and a job finding nothing changed are both a green check at 30 seconds**, which is the `sources` table's failed-vs-unchanged ambiguity one layer up. **Option D is now BUILT** in `recrawl.yml`: the skip step emits a `::warning title=Scheduled refresh did NOT run::` annotation and a summary block reading "Sources fetched: **0 of 14**", verified by executing the step against a temporary `GITHUB_STEP_SUMMARY`. It still exits 0 deliberately, because the skip is currently correct; option A (fail the run) lands with the `DATABASE_URL` secret. **Option E, the staleness watchdog, is approved and planned but NOT built** (see "Option E in detail": a separate scheduled workflow first, Grafana Cloud alerting as the better long-term home, alert at `age_hours > 48`, escalate at 7 days). **Corrects an earlier row that blamed the 403 for the staleness.** |
-| **NEW, 19 September: the fetcher is blocked at the TLS layer, latent until the secret is set** | **OPEN, not fixed, and it must be fixed BEFORE `DATABASE_URL` is set, not after.** `app/ingest.py::fetch_page` (httpx) returns 403 on all 14 sources including `ice.gov/robots.txt`. Never once reached in CI, because CI has never got past the gate above. Four causes eliminated: not the UA (httpx with no UA still 403s; curl with the project's exact bot UA is served), not the headers (httpx trimmed byte-identical to curl still 403s), not the HTTP version (the installed curl has no HTTP/2 at all, so every 200 was HTTP/1.1, same as httpx), not the client code (stdlib urllib fails identically). What remains is the TLS fingerprint: Python links OpenSSL 3.0.18, the curl that works uses Schannel. **All 14 URLs are explicitly ALLOWED by each host's live robots.txt under the project's real UA and parser, 14 allowed / 0 denied**, so a permitted, honestly-identified, rate-limited crawler is being refused by a bot-detection layer that never reads that permission. **No honest fix exists at the HTTP layer and none was applied**: every remaining lever (`curl_cffi impersonate=`, `tls-client`, a browser UA) works by forging the client's identity, which is outside this project's crawl policy and was refused. **The measurement that must come first has not been taken**: every number here is from Windows/Schannel, a TLS stack that does not exist on Linux, where CI and production run and where curl links the same OpenSSL Python does. See "The 19 September re-crawl" below. |
+| **NEW, 19 September: the scheduled refresh reports success daily while doing nothing, and that is why nothing has refreshed** | **OPEN, not fixed, and this is the actual cause of the twelve-day staleness.** Fourteen scheduled runs, one a day through today, all green, all 24 to 37 seconds. None attempted a fetch: `DATABASE_URL` is unset, so `recrawl.yml` sets `mode=dry-run`, the no-op step exits 0, `Re-crawl (live)` is skipped on its `if:`, and the missing artifact is ignored by `if-no-files-found: ignore`. 14 pages at a 2.0s delay cannot finish in 24s; those seconds are the pip install. The skip itself is correct and deliberate (Phase 8 has no hosted database). **The defect is that a job doing nothing and a job finding nothing changed are both a green check at 30 seconds**, which is the `sources` table's failed-vs-unchanged ambiguity one layer up. **Option D is now BUILT** in `recrawl.yml`: the skip step emits a `::warning title=Scheduled refresh did NOT run::` annotation and a summary block reading "Sources fetched: **0 of 14**", verified by executing the step against a temporary `GITHUB_STEP_SUMMARY`. It still exits 0 deliberately, because the skip is currently correct; option A (fail the run) lands with the `DATABASE_URL` secret. **Sequencing note, 19 September: do NOT set that secret yet.** The schema row above establishes that the first live run would die on `_diff_node`'s opening SELECT and mark all 14 sources `fetch_failed` without fetching anything. The skip is not merely correct today, it is currently the only thing preventing a corpus-wide corruption of the health state. **Option E, the staleness watchdog, is approved and planned but NOT built** (see "Option E in detail": a separate scheduled workflow first, Grafana Cloud alerting as the better long-term home, alert at `age_hours > 48`, escalate at 7 days). **Corrects an earlier row that blamed the 403 for the staleness.** |
+| **NEW, 19 September: production's schema is frozen pre-ADR-0014, and the first re-crawl would mark all 14 sources fetch_failed without fetching anything** | **OPEN, not fixed, and this is now FIRST in the queue, ahead of both rows below.** Confirmed against production's `information_schema`: `sources.rule_effective_date` and `sources.last_indexed_body` are ABSENT; `documents.rule_effective_date` and `documents.content_tsv` are present. Production is post-Phase-5, pre-ADR-0014. `infra/sql/init.sql` only ever reaches the local compose postgres via `docker-entrypoint-initdb.d` (which runs only on an empty data dir); there is no migration runner and nothing applies it to Neon, so the hosted schema froze at whatever was applied by hand. **The consequence is worse than a failed run.** `_diff_node`'s first statement selects both missing columns, and `touch_last_verified`/`_embed_and_store` both write one, so every success path is dead; but `record_source_failure` touches only original-shape columns and SUCCEEDS. The first run would write `status='fetch_failed'`, bump `consecutive_failures`, and store the `UndefinedColumn` text in `last_error` for **all 14 sources, having fetched nothing** -- a corpus-wide health state that is specifically and confidently wrong. **It also explains the 7 September timestamp**: no re-crawl has ever run against production. That `last_verified_at` was written by an ingest, from a code version predating ADR 0014, since today's `_embed_and_store` would fail on this schema too. Surfaced by `sync_annotations` failing with a raw `UndefinedColumn`; see instrument table entry 33. |
+| ~~NEW, 19 September: the fetcher is blocked at the TLS layer, latent until the secret is set~~ **SEQUENCING RETIRED, the finding stands** | **OPEN, not fixed. The defect is unchanged and still real; the claim that it is the FIRST thing in the way is retired, 19 September, by the schema row above.** Setting `DATABASE_URL` was next on the list and would not have reached a fetch at all: the re-crawl dies on `_diff_node`'s opening SELECT, before the fetcher is ever called, and would have reported the result as fourteen fetch failures -- pointing straight back at this TLS block, which had nothing to do with it. Fix the schema question first; this one is latent behind it, not in front of it.**Original entry follows.** `app/ingest.py::fetch_page` (httpx) returns 403 on all 14 sources including `ice.gov/robots.txt`. Never once reached in CI, because CI has never got past the gate above. Four causes eliminated: not the UA (httpx with no UA still 403s; curl with the project's exact bot UA is served), not the headers (httpx trimmed byte-identical to curl still 403s), not the HTTP version (the installed curl has no HTTP/2 at all, so every 200 was HTTP/1.1, same as httpx), not the client code (stdlib urllib fails identically). What remains is the TLS fingerprint: Python links OpenSSL 3.0.18, the curl that works uses Schannel. **All 14 URLs are explicitly ALLOWED by each host's live robots.txt under the project's real UA and parser, 14 allowed / 0 denied**, so a permitted, honestly-identified, rate-limited crawler is being refused by a bot-detection layer that never reads that permission. **No honest fix exists at the HTTP layer and none was applied**: every remaining lever (`curl_cffi impersonate=`, `tls-client`, a browser UA) works by forging the client's identity, which is outside this project's crawl policy and was refused. **The measurement that must come first has not been taken**: every number here is from Windows/Schannel, a TLS stack that does not exist on Linux, where CI and production run and where curl links the same OpenSSL Python does. See "The 19 September re-crawl" below. |
 | **NEW, 19 September: DHS removed every concrete date from both fixed_admission pages, and added no injunction notice** | **OPEN, reported for decision, deliberately not acted on.** `Sept. 15, 2026` goes 6 to 0 (FAQ) and 4 to 0 (Quick Facts); `Nov. 14, 2030` 1 to 0 on both; `March 18, 2027` 2 to 0 and 1 to 0. Each replaced by "the final rule's effective date". Two passages deleted outright. No injunction language anywhere in either page's raw HTML or its JavaScript-rendered form, verified with a positive control on the same instrument. Causation is not in evidence: the FAQ changed content without moving its own `page_last_updated`, and Quick Facts reports 10 September, four days before the injunction. The source decision is yours and was not made. See "The 19 September re-crawl" below. |
 | ~~NEW, 19 September: `broken_source_count` reports 14 while all 14 sources report ok~~ **WITHDRAWN. Not a bug.** | **This row previously claimed a counting bug. It was wrong and is corrected rather than deleted.** `source_health_state` returns `broken` when `last_success_at` is older than `SOURCE_BROKEN_NO_SUCCESS_DAYS` (7). Every source last succeeded 2026-09-07, twelve days ago, so all 14 are broken **correctly**. `status: "ok"` is the last crawl's outcome and `consecutive_failures: 0` is true because nothing ran to fail; neither field is about staleness and the clause that fired is. **The real finding is the inverse of the one filed: four separate signals (`broken_source_count`, `stale_source_count`, `freshness_state`, `age_hours`) were all correct throughout the outage, served publicly, and consumed by nothing.** That is the argument for option E. Residual, much smaller: the payload names the verdict without naming which clause produced it, so a `reason` field on `BrokenSource` would help the next reader. Not built. |
 | **NEW, 19 September: the sites' own robots.txt permits every URL the WAF refuses** | **Recorded, not actionable on its own, and it stands whatever the Linux measurement returns.** All 14 URLs tested against each host's live `robots.txt` with the project's own `RobotFileParser` and its real UA: **14 allowed, 0 denied.** The single `Disallow: /` on `studyinthestates.dhs.gov` and `ice.gov` belongs to a `User-agent: PetalBot` block, not to `*`. A crawler these sites explicitly permit, identifying honestly with a contact address and honouring an unrequested two-second delay, is refused by a bot-detection layer that never reads that permission. **This is what makes the disguise question a dilemma rather than an obvious no**, and it is also why it still resolves to no: a published robots.txt is permission to crawl, not consent to be deceived about who is crawling. |
@@ -5946,12 +5949,18 @@ page**, one layer up. In both cases the healthy state and the broken state are e
 no amount of looking at the signal distinguishes them. That is the property worth fixing, not the skip
 itself. Options are written up in "Making a skip visible" below; none is built.
 
-### FINDING, HIGH: the fetcher is blocked at the TLS layer, and it bites the moment the secret is set
+### FINDING, HIGH: the fetcher is blocked at the TLS layer (sequencing corrected: this is not the first thing in the way)
 
 Separate from the above, real, measured locally, and **latent rather than active**: it has never run
-in CI because CI has never got that far. It stops being latent the moment `DATABASE_URL` is set, which
-means **it has to be fixed before the secret goes in, not after.** Setting the secret against this
-defect converts fourteen days of silent green into fourteen days of red, or worse, a partial corpus.
+in CI because CI has never got that far.
+
+**Sequencing corrected, 19 September, after this was written.** This section originally said the
+fetcher "has to be fixed before the secret goes in, not after", on the reasoning that setting
+`DATABASE_URL` would convert silent green into red. That is wrong, and the finding below it says why:
+the re-crawl dies on `_diff_node`'s opening SELECT against production's schema, **before the fetcher
+is called at all**. This defect is behind a schema defect, not in front of one, and the run would
+never have got far enough to exhibit it. The finding itself is unchanged and still has to be fixed
+before any live re-crawl fetches anything; it is simply not first.
 
 The project's own fetcher (`app/ingest.py::fetch_page`, httpx) returns **403 Forbidden on all 14
 sources**, including `ice.gov/robots.txt`. 14 of 14 failing identically is a broken client, not
@@ -6004,6 +6013,294 @@ operating system. It is equally possible the block is partly address reputation,
 GitHub Actions or Fly address behaves differently again and there is nothing to fix in the client.
 Measuring from `ubuntu-latest` and from the Fly container costs one throwaway workflow run and settles
 which of these is true. Nothing should be built before that.
+
+### FINDING, HIGH: production's schema is frozen pre-ADR-0014, and the only working part of the re-crawl is its error path
+
+Found on 19 September, after the section above was written, by `app/sync_annotations.py` failing
+against production with `UndefinedColumn` on its first SELECT. Confirmed against production's
+`information_schema`:
+
+| column | in production |
+|---|---|
+| `sources.rule_effective_date` | **absent** |
+| `sources.last_indexed_body` | **absent** |
+| `documents.rule_effective_date` | present |
+| `documents.content_tsv` | present |
+
+Both absent columns are ADR 0014's additions. Both present ones predate it. **Production is
+post-Phase-5, pre-ADR-0014, and no column was dropped**: the code moved and the database did not.
+
+**How a schema drifts with nothing to notice.** `infra/sql/init.sql` is the only SQL file under
+`infra/`, there is no migration runner, and the file reaches a database exactly one way: mounted
+into the local compose postgres at `docker-entrypoint-initdb.d`, which Postgres executes **only when
+the data directory is empty**. Nothing applies it at app startup, in CI, or from the Fly config. So
+every later `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in that file is applied to a developer's
+laptop on first boot and to nowhere else. A hosted database holds whatever was applied by hand at one
+moment. The idempotent `IF NOT EXISTS` form makes the file safe to re-run and creates the impression
+that re-running is happening.
+
+**The consequence, which is the actual finding.** Every success-path statement in the re-crawl
+touches a column that is not there. `_diff_node`'s **first** statement, before any fetch:
+
+    SELECT last_indexed_body, rule_effective_date FROM sources WHERE source_url = %s
+
+`touch_last_verified` and `_embed_and_store` both write `rule_effective_date`. So the unchanged path,
+the meaningful path, and the diff that chooses between them are all dead.
+
+**`record_source_failure` touches only original-shape columns, so it works.** Which means the first
+live run does not crash. `run_refresh`'s per-source `try/except` catches `UndefinedColumn`, routes to
+the failure path, and that path succeeds fourteen times: `status='fetch_failed'`,
+`consecutive_failures` incremented, and the `UndefinedColumn` text written into `last_error`, **for
+all 14 sources, with not one page fetched.** A broken system reporting its brokenness through the one
+mechanism still functioning, in that mechanism's own vocabulary, which is fetching. See instrument
+table entry 33 for the general form.
+
+**It also settles the 7 September question.** There are exactly two writers of
+`sources.last_verified_at`: `_embed_and_store` and `touch_last_verified`. In today's code both
+reference `sources.rule_effective_date`, so neither can run against this schema. **No re-crawl has
+ever run against production.** The 7 September timestamp was written by an ingest, from a code
+version predating ADR 0014. ADR 0014's own text corroborates it, instructing that the backfill "must
+run against production BEFORE the refresh job runs again" -- the language of a job that has not yet
+run there. `touch_last_verified` does write `last_verified_at` exactly as expected; it simply has
+never been in a position to.
+
+**This retires a piece of sequencing that was about to be acted on.** Setting the `DATABASE_URL`
+secret was the next item on the list, and it would have produced exactly the corruption above. Worse,
+the report it produced would have been credible: fourteen fetch failures, on a corpus whose fetcher
+is independently and genuinely blocked at the TLS layer (see the finding above), measured hours
+earlier, affecting the same fourteen sources. **Two real findings, one of them the wrong explanation
+for the other's symptom, pointing at the same fourteen rows.** The TLS block is no longer the first
+thing in the way. It is behind this.
+
+**What is NOT affected, and it matters for the decision.** The guard reads only
+`documents.rule_effective_date` (`app/db.py` selects `d.rule_effective_date`; `sources` supplies
+freshness columns only). That column exists in production and holds `2026-09-15`, which is why the
+temporal annotation demonstrably fires there. **Production's answer correctness has never depended on
+`sources.rule_effective_date`.** By `init.sql`'s own comment that column exists for exactly one
+purpose: to give the stateless differ somewhere to read the annotation without a snapshot file. No
+migration was written and no schema was changed.
+
+**THE OPTION THAT WAS CONSIDERED AND REFUSED, recorded so it is not proposed again.** Make
+`_diff_node` tolerant of the missing columns: catch `UndefinedColumn`, or probe
+`information_schema` first, and degrade to a no-baseline path when they are absent.
+
+It is the cheapest thing on the table by a wide margin. No DDL, no production access, no backfill,
+no snapshots, no coordination with anyone, and the red goes away the same afternoon. **It is the
+option a reasonable person reaches for under deadline**, which is exactly why it is written down
+here rather than left unchosen and available.
+
+It was refused because of what "degrade" means in this specific function. `_diff_node` already has a
+no-baseline branch, and it already refuses to use it in this situation: a NULL `last_indexed_body`
+on a source that already has chunks in `documents` raises loudly, deliberately, because treating it
+as a new source would re-index and re-embed content that has not changed and reset `fetched_at`,
+destroying freshness history `infra/sql/init.sql` marks "not reconstructable after the fact".
+Tolerance would route the schema error into precisely the branch that was built to reject it, and
+the result would not be a visible degradation. It would be fourteen sources re-indexed on a day
+nothing changed, `fetched_at` and `change_count` quietly wrong forever, and a green run.
+
+**The general form: it converts a loud, specific, correct error into a quiet, plausible, wrong
+success.** That is the same shape as instrument entry 33 one layer down, and the same shape as the
+`sources` table being unable to distinguish a failed fetch from an unchanged page. This report has
+now documented that pattern three times in three different components, which is the argument for
+refusing it on sight rather than re-deriving the reasoning each time under time pressure.
+
+### The diff baseline is irreplaceable, and it exists in one gitignored directory on one laptop
+
+`sources.last_indexed_body` means "the body currently indexed". Populating it is mandatory under
+every option above: after the column is added, every row is NULL while `documents` holds chunks,
+which is exactly the state `_diff_node` refuses to proceed on. So the question of where that body can
+come from is not academic, and it has exactly three candidate answers. Two are ruled out, with
+numbers.
+
+**Reconstructing it from `documents` chunks: rejected, measured.** ADR 0014 investigated this and
+recorded the figure: concatenating one real source's stored chunks back into a body gives **12,574
+characters against the original snapshot's 12,321**. The 253-character gap is `chunk_markdown`'s own
+breadcrumb prefix, one inserted line per chunk. `classify_change` is line-based
+(`normalize_for_diff` plus a line-by-line comparison), so every one of those breadcrumbs reads as a
+changed line at every chunk boundary. Undoing the prefix is not available either: it carries the
+parent/heading structure it exists to provide.
+
+**Seeding it from a fresh fetch of the live page: worse than lossy, and this is a finding rather
+than a rejected option.** A fetch returns today's body, not the indexed one, so it does not
+approximate the baseline, it replaces it with a different thing that looks identical in the column.
+Every change that happened between the last ingest and the seeding fetch is silently absorbed into
+the new baseline and can never be detected, because the next diff compares today against today.
+
+**This is not hypothetical here. It would erase a discovery this project has already made.**
+Production was ingested on 7 September. Between then and 19 September, DHS rewrote both
+`fixed_admission` pages, removing every concrete date (`Sept. 15, 2026` 6 to 0 on the FAQ, 4 to 0 on
+Quick Facts; `Nov. 14, 2030` and `March 18, 2027` likewise to 0) and adding no injunction notice.
+That change is the most consequential thing this corpus has seen, it took a live fetch to find, and
+it is what the temporal finding above rests on. Seed `last_indexed_body` from a fetch and the
+baseline becomes the scrubbed text; the next re-crawl reports **`unchanged`**, correctly by its own
+logic and wrongly in every sense that matters, and goes on reporting it forever. The system would
+have no record that the pages ever said anything else.
+
+**So the snapshots are irreplaceable, not merely convenient.** Taken together the two measurements
+establish it: reconstruction is provably lossy in exactly the dimension the differ reads, and
+re-fetching is not a reconstruction of the baseline at all. The 14 files in `data/sources/raw/` are
+the only faithful copy of what is currently indexed.
+
+**The dated risk, stated plainly because it cuts against everything else in this section.** That
+directory is gitignored. It exists on one laptop. **If it is lost before the backfill runs,
+`last_indexed_body` becomes unrecoverable**, and the only remaining paths are a lossy seed or a full
+re-index that resets `fetched_at` and `change_count` -- values `infra/sql/init.sql` marks "not
+reconstructable after the fact". There is no second copy anywhere: not in git, not in production
+(the column does not exist), not in `eval/fixtures/sources/` (four trimmed files).
+
+**The tension is real and should be visible rather than reconstructed later.** Every other finding
+in this section argues for moving slowly: the schema is frozen, the first live re-crawl would
+corrupt fourteen health rows, the fetcher is blocked, the sequencing has already been wrong twice.
+This one argues for moving soon, and it is not in conflict with the others so much as orthogonal to
+them. The backfill does not require the re-crawl to work, the fetcher to be unblocked, or the
+`rule_effective_date` question to be settled. It requires one column, one script, and a directory
+that currently exists. **The window in which this is cheap is open now and closes if that laptop
+does.** Nothing here argues for rushing the parts that are genuinely entangled; it argues for
+recognising that this particular part is not entangled with them.
+
+### The first piece of Option B, landed ahead of the rest, and why that was deliberate
+
+**A future reader finding half of a decision implemented should see that it was on purpose.** Option
+B (delete the `sources.rule_effective_date` dependency rather than add the column to production) is
+approved but mostly not built. One line of it landed early, on 19 September 2026:
+`app/backfill_source_bodies.py`'s UPDATE now writes `last_indexed_body` and nothing else, where it
+used to write `rule_effective_date` as well.
+
+**The reason is sequencing, not tidiness.** The backfill is on the critical path for every option,
+because `last_indexed_body` must be populated under all of them: after the column is added every row
+is NULL while `documents` holds chunks, which is exactly the state `_diff_node` refuses to proceed
+on. But Option B adds ONLY `last_indexed_body` to production and never adds
+`sources.rule_effective_date`. Run the two-column form against that schema and it raises
+`UndefinedColumn` and the entire backfill fails, on the one step everything else waits behind.
+
+The alternatives were costed and are worse. Adding both columns reverts the DDL to Option A and
+leaves a column that step 3 immediately makes vestigial, which is the specific outcome Option B was
+chosen to avoid. Adding both and dropping one later means performing production DDL twice, by hand,
+through the same process that produced the drift this whole section documents.
+
+**What is NOT done, so the half-state is legible.** `app/recrawl.py`'s `touch_last_verified` and
+`reindex_source` still write `sources.rule_effective_date`; `_diff_node` still reads it;
+`app/sync_annotations.py` still writes it. All of that is the rest of Option B and is untouched.
+Nothing has been removed from `infra/sql/init.sql`, and no migration has been written. The backfill
+was pulled forward alone because it is the only piece that blocks the next step.
+
+**Other changes in the same pass**, all to make a hand-run tool behave like one: the synchronous
+conversion (it was async with no concurrency, which made it unrunnable on Windows, where the only
+copy of the snapshots lives), clear errors naming `RAW_SNAPSHOT_DIR` and `DATABASE_URL` with the
+password masked, a bounded `connect_timeout` (11s measured, against roughly 120s unbounded), and
+`register_vector_async` deleted rather than converted since the script touches no vector column.
+
+**Two behaviours that were worse than merely unhelpful, and are the same shape as findings elsewhere
+in this report.** `--dry-run` used to return `sources_rows_still_null_after: 0` unconditionally,
+because nothing had been written. That is a clean bill of health for work not done, which is exactly
+the skipped-cron problem and the failed-versus-unchanged problem in a third place. It now subtracts
+the rows the pass would fill and PREDICTS the post-run number, and it NAMES the leftovers rather than
+counting them, because the count says something is wrong and only the URLs say which sources
+`_diff_node` is about to raise on. Separately, if `RAW_SNAPSHOT_DIR` pointed somewhere with no
+snapshots, the glob returned nothing and the script reported a contented `0 updated` for a run that
+read no files at all; it now exits with an explanation, distinguishing "does not exist" from "exists
+but holds no snapshots".
+
+**A standing verification caveat, recorded here rather than left to be forgotten once a dry run
+passes.** Neither this script nor `app/sync_annotations.py` has ever been executed against a real
+database from this machine; there is no Postgres here. Both were verified against a fake connection
+that records every statement and transaction boundary, which is strong evidence about WHICH
+statements are issued and useless as evidence about how the database responds to them. **Two things
+in particular a fake can agree with and reality can disagree with, and a dry run exercises neither:**
+
+1. `cur.rowcount` on the guarded `UPDATE ... WHERE ... AND last_indexed_body IS NULL`. The
+   concurrent-write branch (rowcount 0, treated as already-populated rather than an error) is
+   reasoned about, not observed.
+2. The commit boundary of `conn.transaction()` on a non-autocommit connection. The per-source
+   durability claim rests on psycopg issuing a real BEGIN/COMMIT around each block.
+
+A `--dry-run` issues no UPDATE and commits nothing, so **passing the dry run leaves both of these
+exactly as unverified as they are now.** Only a real write settles them.
+
+**RESOLVED, 19 September 2026, by the real run. Both are now measured rather than predicted.** Step 2
+completed against production: `sources.last_indexed_body` added, then the backfill run for real,
+**14 of 14 rows written and none left NULL**. That exercises exactly the two things a dry run could
+not.
+
+1. **`cur.rowcount` on the guarded UPDATE: measured, on the success path.** Fourteen UPDATEs each
+   reported `rowcount == 1` against live psycopg, so `updated` counted 14 rather than silently
+   falling through to the concurrent-write branch. The `rowcount == 0` branch itself remains
+   unexercised, because nothing was writing concurrently; that branch is still reasoning, not
+   observation, and it is the smaller of the two claims.
+2. **The `conn.transaction()` commit boundary: measured.** All fourteen per-source blocks committed
+   and persisted, confirmed by a subsequent read finding zero NULL rows. The per-source durability
+   claim is now observed behaviour on a non-autocommit connection.
+
+**A corroboration worth recording, because it confirms the backfill wrote the right bytes and not
+merely some bytes.** ADR 0014's reconstruction argument quotes an original snapshot at 12,321
+characters, which is the STEM OPT page. That source's local snapshot body measures **12,320**, and
+the value production returned after the backfill is **12,320** -- identical to the local file, and
+one character from the ADR's figure, almost certainly a trailing newline counted differently when
+that measurement was taken. The two independent paths agree exactly with each other. (An initial
+concern about a 40,425-character body was a misattribution: 40,425 is `travel-ice-sevp-travel-faq`,
+the largest source in the corpus, and has nothing to do with the figure in ADR 0014.)
+
+### Step 3 built: the schema drift check, and why it does not parse init.sql
+
+`.github/workflows/drift-checks.yml` and `services/orchestrator/app/check_schema.py`, landed
+19 September 2026. It compares production's schema against what `infra/sql/init.sql` declares and
+fails loudly on anything missing. The full reasoning lives in the workflow file's own header rather
+than only here, deliberately: whoever next thinks about parsing `init.sql`, or adds a migration
+runner, or wonders what the check covers, will be reading code.
+
+**The expected schema is not parsed out of `init.sql`. Postgres parses it.** The check applies
+`init.sql` to a throwaway `pgvector/pgvector:pg16` service container and reads that database's
+`information_schema`, so the comparison is between two `information_schema` queries and nothing
+re-implements SQL. The precedent already existed: `.github/workflows/eval.yml` applies the same file
+the same way to its own service container.
+
+The alternative, parsing the file, is the obvious implementation and the fragile one. That file's net
+column set is `CREATE TABLE IF NOT EXISTS`, plus multi-column `ALTER TABLE ... ADD COLUMN IF NOT
+EXISTS` with SQL comments interleaved between the columns, plus a `DROP COLUMN` inside a conditional
+`DO $$` block guarded on whether the legacy columns are present. **A naive parser applying that DROP
+unconditionally still gets `documents` right, but only because those columns are absent from its
+CREATE TABLE anyway: correct by luck, not by design, and the luck is invisible to whoever wrote it.**
+Given thirty-three entries in the instrument table about instruments that were quietly wrong, a
+bespoke SQL parser is not a surface worth adding. Cost when someone adds a column: zero, with nothing
+to remember. It also verifies that `init.sql` is applicable at all, which nothing previously did.
+
+**Strict on missing, report-only on extra, and the asymmetry is principled.** A missing table or
+column is a guaranteed runtime failure with a known severity, and is the case that actually happened.
+An extra one is by construction referenced by no code, so it cannot break anything -- and after
+Option B lands, `sources.rule_effective_date` is exactly that on every developer database created
+before the change. A check that failed on it would be red everywhere for a condition that breaks
+nothing, which is how a check gets muted. One refinement: an extra column that is `NOT NULL` with no
+default IS fatal, because every INSERT not naming it fails. Types are not compared in this version,
+because `text` versus `character varying` across a pinned reference and a hosted target produces
+false positives, and a check that is noisy on its first outing gets ignored rather than fixed.
+
+**A defect found in the check's own output, during its own verification.** The first version derived
+the headline from the missing-object test alone, so a run whose only fault was a fatal extra column
+printed `schema ok` as its first line and then exited 1. A green headline on a red outcome, in the
+check built to catch exactly that shape, caught only because the verification drove a case where the
+two could disagree. The headline is now derived from the same `drift.ok` property that decides the
+exit code, so there is one source of truth for the verdict.
+
+**Two things recorded as decided rather than omitted.**
+
+*The `pull_request` trigger is deferred, not forgotten.* It would catch "you added a column to
+`init.sql` but production does not have it" at the moment of introduction, which is strictly earlier
+and more useful than a daily schedule. It is not taken because it would hand every PR production
+database credentials and would sit red from the moment anyone adds a column until the migration
+happens, making an unrelated PR the place a production migration decision surfaces. Catching this a
+day later is better than that.
+
+*The staleness job is planned and deliberately not built*, though this file is its home and names it.
+Its alert threshold is still open, and it would be RED from the moment it lands (`age_hours` was
+283.9 when it was designed). **Landing one green check is worth more than two where one is red by
+design and therefore ignored from birth** -- the same reasoning that kept option A out of
+`recrawl.yml`.
+
+**Verification, and what is prediction.** Six cases against the real `compare`/`render`, including
+production's actual 19 September drift, a missing table (the `usage_totals` case `app/usage.py`
+documents), a nullable leftover that must stay green, and a fatal `NOT NULL` extra: 6/6 correct. What
+is NOT measured: no run against a real database, and in particular `read_schema`'s single
+`information_schema` SELECT has never been executed. The first CI run is the first evidence for it.
 
 ### FINDING: DHS removed every concrete date from both fixed_admission pages, and added no injunction notice
 

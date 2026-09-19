@@ -1,3 +1,20 @@
+# The source manifest: what to crawl, plus the hand-authored curator annotations that go with it.
+#
+# `url`, `title` and `topic` are crawl configuration. `annotations` is the curator block: values a
+# human asserts, which ingest can never derive from the page. Until September 2026 these lived in
+# the YAML frontmatter of data/sources/raw/*.md, which is GITIGNORED, so the only copies were on one
+# laptop and in production database columns and a fresh clone produced a corpus with no dated chunks
+# at all. They are tracked here now. See docs/adr/0014-stateless-recrawl-diff.md's amendment.
+#
+# This file is AUTHORITATIVE for these values: the daily re-crawl reads them from here and writes
+# them to `sources` and `documents` on every run, so editing a value here and waiting for the next
+# run (or running `python -m app.sync_annotations`) is how a curator change reaches production.
+# Deleting a key writes NULL, which is how an annotation is removed.
+#
+# Known exception, deliberate: eval/fixtures/sources/ keeps its annotations in frontmatter. That
+# corpus is self-contained by design (docs/adr/0004) and is itself tracked, so the problem above
+# does not apply to it. See app/ingest.py::_ingest_from_snapshots.
+
 sources:
   - url: https://www.uscis.gov/working-in-the-united-states/students-and-exchange-visitors/optional-practical-training-opt-for-f-1-students
     title: OPT for F-1 Students
@@ -32,12 +49,36 @@ sources:
   - url: https://studyinthestates.dhs.gov/students/study/traveling-as-an-international-student
     title: Traveling as an International Student (Study in the States)
     topic: travel
+    annotations:
+      # An observation about the fetched artifact rather than a fact about the world. Nothing in
+      # the code reads it; it exists so the next person is not surprised that the manifest URL and
+      # the indexed page disagree about their own title.
+      note: >-
+        The manifest URL redirects to resolved_url; the page has been retitled from "Traveling as
+        an International Student" to "Traveling as an F or M Student".
   - url: https://www.ice.gov/sevis/travel
     title: SEVP Travel FAQ (ICE)
     topic: travel
   - url: https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-procedure-faq
     title: Fixed Time Period of Admission Final Rule FAQ
     topic: fixed_admission
+    annotations:
+      rule_effective_date: 2026-09-15
+      federal_register: https://www.federalregister.gov/d/2026-14439
+      # KNOWN STALE. Moved here VERBATIM so this step is reviewable as a pure move; corrected in a
+      # separate diff (step 6 of the migration plan). Measured against the current snapshot, all
+      # five labels named below are h4, not h3, and the real h3 layer (General, F Students, School
+      # Officials) is not mentioned at all. The note went stale when DHS added a grouping level and
+      # survived the re-fetch that invalidated it, because build_frontmatter preserves unknown keys
+      # verbatim across a body rewrite. See REPORT.md, instrument table entry 32.
+      heading_note: >-
+        This page inverts the usual nesting. Individual FAQ questions are h2 while the group labels
+        that contain them (Transition Period, Understanding the Admit Until Date, Extensions of
+        Stay, Maintaining Status, Departure Period) are h3. Headings are preserved verbatim; a
+        section chunker must not assume h2 outranks h3 on this page.
   - url: https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-procedure-quick
     title: Fixed Time Period of Admission Final Rule Quick Facts
     topic: fixed_admission
+    annotations:
+      rule_effective_date: 2026-09-15
+      federal_register: https://www.federalregister.gov/d/2026-14439
