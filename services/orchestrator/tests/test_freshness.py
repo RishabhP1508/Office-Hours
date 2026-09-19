@@ -743,6 +743,31 @@ def _manifest_urls() -> set[str]:
     return {entry["url"] for entry in manifest["sources"]}
 
 
+def refuse_if_manifest_fully_present(present_urls: set[str], database_url: str) -> None:
+    """The DECISION half of the corpus guard, pure and connection-agnostic: given the set of
+    `source_url`s a database already holds, refuse if it holds every manifest URL.
+
+    Split out from the async wrapper below on 19 September 2026 so a SYNCHRONOUS caller can reuse
+    the identical rule and identical message. `app/backfill_source_bodies.py` was converted from
+    async to sync (it had no concurrency to justify async and was therefore unrunnable on Windows,
+    where the only copy of the snapshots lives), and its tests need this guard against a
+    `psycopg.Connection` rather than an `AsyncConnection`. Splitting the decision out is what keeps
+    ONE copy of the rule and the message; only the two-line query around it differs per connection
+    type. Duplicating the rule instead would give two safety checks that can drift, on the check
+    whose whole job is to stop a test writing to the real corpus.
+    """
+    manifest_urls = _manifest_urls()
+    if manifest_urls and manifest_urls <= present_urls:
+        pytest.fail(
+            f"Refusing to run a DB-writing test against DATABASE_URL={database_url!r}: it already "
+            f"holds a row for every one of the {len(manifest_urls)} URLs in "
+            "data/sources/sources.yaml, which is the signature of the real, fully-ingested corpus. "
+            "This test inserts/deletes rows in `documents`. Point DATABASE_URL at a scratch "
+            "database instead (for example officehours_fixtures or officehours_freshness) and "
+            "re-run."
+        )
+
+
 async def _refuse_if_target_is_the_fully_ingested_real_corpus(
     conn: psycopg.AsyncConnection, database_url: str
 ) -> None:
@@ -773,21 +798,11 @@ async def _refuse_if_target_is_the_fully_ingested_real_corpus(
     # a real deadlock/stale-read hazard, reproduced while writing this guard. rollback() (not
     # commit(): this is a read-only check with nothing to persist) ends the transaction cleanly,
     # leaving `conn` exactly as unencumbered as it was before this guard existed.
-    manifest_urls = _manifest_urls()
     async with conn.cursor() as cur:
         await cur.execute("SELECT DISTINCT source_url FROM documents")
         rows = await cur.fetchall()
     await conn.rollback()
-    present_urls = {row[0] for row in rows}
-    if manifest_urls and manifest_urls <= present_urls:
-        pytest.fail(
-            f"Refusing to run a DB-writing test against DATABASE_URL={database_url!r}: it already "
-            f"holds a row for every one of the {len(manifest_urls)} URLs in "
-            "data/sources/sources.yaml, which is the signature of the real, fully-ingested corpus. "
-            "This test inserts/deletes rows in `documents`. Point DATABASE_URL at a scratch "
-            "database instead (for example officehours_fixtures or officehours_freshness) and "
-            "re-run."
-        )
+    refuse_if_manifest_fully_present({row[0] for row in rows}, database_url)
 
 
 @pytest.fixture

@@ -1,7 +1,13 @@
 """Tests for app/backfill_source_bodies.py -- the one-time backfill that populates
-`sources.last_indexed_body`/`rule_effective_date` for every source ingested before those columns
-existed (docs/adr/0014-stateless-recrawl-diff.md). No langgraph needed: this module imports only
+`sources.last_indexed_body` for every source ingested before that column existed
+(docs/adr/0014-stateless-recrawl-diff.md). No langgraph needed: this module imports only
 app.config/app.ingest and stdlib.
+
+TWO CONNECTIONS, on purpose. The tool is SYNCHRONOUS as it ships, so `sync_conn` (a real
+`psycopg.Connection`) is what it is exercised through. The `conn` fixture stays ASYNC because the
+arrange/assert/cleanup helpers are shared verbatim with test_freshness.py, whose subject
+(app/recrawl.py) is genuinely async. Both fixtures run the same corpus guard, via the one decision
+function they share.
 
 `database_url`/`conn` below are the same fixture SHAPE test_freshness.py defines (including its
 guard against running against the real, fully-ingested corpus), redefined here rather than
@@ -27,6 +33,7 @@ from test_freshness import (
     _delete_test_rows,
     _insert_test_row,
     _refuse_if_target_is_the_fully_ingested_real_corpus,
+    refuse_if_manifest_fully_present,
 )
 
 from app.backfill_source_bodies import backfill_source_bodies
@@ -41,6 +48,11 @@ def database_url() -> str:
 
 @pytest.fixture
 async def conn(database_url):
+    """ASYNC, and only for this file's SCAFFOLDING: `_insert_test_row`/`_delete_test_rows` are
+    shared with test_freshness.py (which tests app/recrawl.py, genuinely async) and reused here
+    unchanged rather than forked -- `_insert_test_row` alone is ~50 lines of SQL including an
+    `embedding`, so a second sync copy would be worse than the problem it solved.
+    """
     connection = await psycopg.AsyncConnection.connect(database_url)
     await register_vector_async(connection)
     try:
@@ -48,6 +60,29 @@ async def conn(database_url):
         yield connection
     finally:
         await connection.close()
+
+
+@pytest.fixture
+def sync_conn(database_url):
+    """SYNCHRONOUS, and this is the one under test. `backfill_source_bodies` is sync as it ships
+    (see its own docstring for why), so it is exercised through a real `psycopg.Connection` rather
+    than through whatever the scaffolding happens to use.
+
+    Guarded by the SAME rule as `conn` above, via the decision function both share, so there is no
+    path into this file that writes to the real corpus without the check. No `register_vector`: the
+    backfill touches no vector column, and the `embedding` the scaffolding writes goes through the
+    async connection.
+    """
+    connection = psycopg.connect(database_url)
+    try:
+        with connection.cursor() as cur:
+            cur.execute("SELECT DISTINCT source_url FROM documents")
+            present = {row[0] for row in cur.fetchall()}
+        connection.rollback()
+        refuse_if_manifest_fully_present(present, database_url)
+        yield connection
+    finally:
+        connection.close()
 
 
 def _write_snapshot(
@@ -71,9 +106,20 @@ def _write_snapshot(
     return path
 
 
-async def test_backfill_populates_null_body_and_annotation_from_local_snapshot(
-    tmp_path, conn, database_url
+async def test_backfill_populates_null_body_and_leaves_rule_effective_date_alone(
+    tmp_path, conn, sync_conn, database_url
 ):
+    """Renamed and re-pointed on 19 September 2026. It was
+    `..._populates_null_body_and_annotation_from_local_snapshot` and asserted that the backfill
+    copied `rule_effective_date` out of the snapshot frontmatter. That write was REMOVED as the
+    first piece of Option B (see the UPDATE's own comment in app/backfill_source_bodies.py), so the
+    old assertion tested behaviour the tool deliberately no longer has.
+
+    The assertion is INVERTED rather than deleted. The snapshot below still carries
+    `rule_effective_date: 2026-09-15`, so the tool is handed the value it used to copy and must be
+    shown to ignore it. Deleting the line would have left nothing watching the removal; this way the
+    test fails if anyone puts the write back.
+    """
     source_url = "https://example.gov/backfill-test-basic"
     body = "# Test Page\n\n## Section\n\nThe extension is 24 months.\n"
     old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -94,7 +140,7 @@ async def test_backfill_populates_null_body_and_annotation_from_local_snapshot(
         await cur.execute("SELECT count(*) FROM sources WHERE last_indexed_body IS NULL")
         (null_count_before,) = await cur.fetchone()
 
-    counts = await backfill_source_bodies(conn, tmp_path)
+    counts = backfill_source_bodies(sync_conn, tmp_path)
 
     assert counts["updated"] == 1
     assert counts["already_populated"] == 0
@@ -108,13 +154,15 @@ async def test_backfill_populates_null_body_and_annotation_from_local_snapshot(
         )
         row = await cur.fetchone()
     assert row["last_indexed_body"] == body
-    assert row["rule_effective_date"] == date(2026, 9, 15)
+    # The snapshot DOES carry rule_effective_date: 2026-09-15. `_insert_test_row` left the column
+    # NULL. The backfill must have left it NULL: it writes last_indexed_body and nothing else.
+    assert row["rule_effective_date"] is None
 
     await _delete_test_rows(conn, source_url)
 
 
 async def test_backfill_is_idempotent_and_never_overwrites_an_already_populated_body(
-    tmp_path, conn, database_url
+    tmp_path, conn, sync_conn, database_url
 ):
     """Safe to re-run: a SECOND call, with the snapshot file now claiming DIFFERENT content, must
     change nothing -- the first call already populated last_indexed_body, and the WHERE
@@ -129,7 +177,7 @@ async def test_backfill_is_idempotent_and_never_overwrites_an_already_populated_
     )
     _write_snapshot(tmp_path, source_url=source_url, body=body)
 
-    first = await backfill_source_bodies(conn, tmp_path)
+    first = backfill_source_bodies(sync_conn, tmp_path)
     assert first["updated"] == 1
 
     # Simulate a stale/different local snapshot file before the second run -- if the guard were
@@ -139,7 +187,7 @@ async def test_backfill_is_idempotent_and_never_overwrites_an_already_populated_
         tmp_path, source_url=source_url, body="# Test Page\n\nSOMETHING ELSE ENTIRELY\n"
     )
 
-    second = await backfill_source_bodies(conn, tmp_path)
+    second = backfill_source_bodies(sync_conn, tmp_path)
     assert second["updated"] == 0
     assert second["already_populated"] == 1
 
@@ -155,7 +203,7 @@ async def test_backfill_is_idempotent_and_never_overwrites_an_already_populated_
     await _delete_test_rows(conn, source_url)
 
 
-async def test_backfill_dry_run_writes_nothing(tmp_path, conn, database_url):
+async def test_backfill_dry_run_writes_nothing(tmp_path, conn, sync_conn, database_url):
     source_url = "https://example.gov/backfill-test-dry-run"
     body = "# Test Page\n\n## Section\n\nThe extension is 24 months.\n"
     old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -165,7 +213,7 @@ async def test_backfill_dry_run_writes_nothing(tmp_path, conn, database_url):
     )
     _write_snapshot(tmp_path, source_url=source_url, body=body)
 
-    counts = await backfill_source_bodies(conn, tmp_path, dry_run=True)
+    counts = backfill_source_bodies(sync_conn, tmp_path, dry_run=True)
     assert counts["updated"] == 1  # reported as "would update"
 
     async with conn.cursor(row_factory=dict_row) as cur:
@@ -178,19 +226,23 @@ async def test_backfill_dry_run_writes_nothing(tmp_path, conn, database_url):
     await _delete_test_rows(conn, source_url)
 
 
-async def test_backfill_flags_a_snapshot_with_no_matching_sources_row(tmp_path, conn, database_url):
+async def test_backfill_flags_a_snapshot_with_no_matching_sources_row(
+    tmp_path, conn, sync_conn, database_url
+):
     """A snapshot on disk for a source_url that was never ingested at all (no `sources` row yet) --
     nothing to backfill, flagged rather than silently skipped or errored.
     """
     source_url = "https://example.gov/backfill-test-orphan-snapshot"
     _write_snapshot(tmp_path, source_url=source_url, body="# Test Page\n\nSome content.\n")
 
-    counts = await backfill_source_bodies(conn, tmp_path)
+    counts = backfill_source_bodies(sync_conn, tmp_path)
 
     assert counts["snapshots_without_a_sources_row"] >= 1
 
 
-async def test_backfill_write_is_durable_across_a_separate_connection(tmp_path, conn, database_url):
+async def test_backfill_write_is_durable_across_a_separate_connection(
+    tmp_path, conn, sync_conn, database_url
+):
     """The write must be COMMITTED, not merely visible to the same session that made it: a bare
     `execute()` with no explicit transaction wrapping opens an ambient transaction that a
     connection close() rolls back rather than commits, which would make the backfill look like it
@@ -208,7 +260,7 @@ async def test_backfill_write_is_durable_across_a_separate_connection(tmp_path, 
     )
     _write_snapshot(tmp_path, source_url=source_url, body=body)
 
-    counts = await backfill_source_bodies(conn, tmp_path)
+    counts = backfill_source_bodies(sync_conn, tmp_path)
     assert counts["updated"] == 1
 
     other_conn = await psycopg.AsyncConnection.connect(database_url)
@@ -228,3 +280,141 @@ async def test_backfill_write_is_durable_across_a_separate_connection(tmp_path, 
         await other_conn.close()
 
     await _delete_test_rows(conn, source_url)
+
+
+# ---------------------------------------------------------------------------------------------
+# NO DATABASE NEEDED below this line. Everything above uses the `conn`/`sync_conn` fixtures and
+# therefore cannot run on Windows (psycopg refuses async mode on the ProactorEventLoop, and there
+# is usually no local Postgres). The statement-level regression below drives the real
+# `backfill_source_bodies` through a fake connection instead, so the one property that most needs
+# watching is checkable on any machine -- see tests/test_sync_annotations.py for the same pattern
+# and for what a fake connection can and cannot establish.
+# ---------------------------------------------------------------------------------------------
+
+# Columns backfill_source_bodies must never write. `rule_effective_date` heads this list because it
+# WAS written until 19 September 2026, when that half of the UPDATE was removed as the first piece
+# of Option B. Its presence here is what proves the removal on every run rather than leaving it as
+# something someone remembers having done.
+_NEVER_WRITTEN = (
+    "rule_effective_date",
+    "fetched_at",
+    "last_verified_at",
+    "last_changed_at",
+    "last_success_at",
+    "change_count",
+    "consecutive_failures",
+    "status",
+    "content",
+    "embedding",
+)
+
+
+class _RecordingCursor:
+    def __init__(self, state, log):
+        self.state, self.log, self.rowcount, self._row, self._rows = state, log, 0, None, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def execute(self, sql, params=None):
+        flat = " ".join(sql.split())
+        self.log.append(flat)
+        if flat.startswith("SELECT last_indexed_body FROM sources"):
+            url = params[0]
+            self._row = (self.state.get(url),) if url in self.state else None
+        elif flat.startswith("SELECT source_url FROM sources WHERE last_indexed_body IS NULL"):
+            self._rows = [(u,) for u, b in sorted(self.state.items()) if b is None]
+        elif flat.startswith("UPDATE sources"):
+            self.state[params[-1]] = params[0]
+            self.rowcount = 1
+        else:
+            raise AssertionError(f"unexpected SQL: {flat}")
+
+    def fetchone(self):
+        return self._row
+
+    def fetchall(self):
+        return self._rows
+
+
+class _RecordingConn:
+    def __init__(self, sources):
+        self.state, self.log = dict(sources), []
+
+    def transaction(self):
+        return _RecordingTxn()
+
+    def cursor(self):
+        return _RecordingCursor(self.state, self.log)
+
+    @property
+    def writes(self):
+        return [s for s in self.log if s.startswith(("UPDATE", "INSERT", "DELETE"))]
+
+
+class _RecordingTxn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+def test_backfill_writes_last_indexed_body_and_never_rule_effective_date(tmp_path):
+    """REGRESSION, no database required. The UPDATE used to write `rule_effective_date` as well;
+    that half was removed so the backfill can run against a schema (Option B's) that will never
+    have the column. The DB-backed test above asserts the same property through a real row, but it
+    cannot run on Windows, so this asserts it at the statement level where anyone can check it.
+    """
+    source_url = "https://example.gov/backfill-statement-level"
+    _write_snapshot(
+        tmp_path, source_url=source_url, body="# Page\n\nBody.\n", rule_effective_date="2026-09-15"
+    )
+    conn = _RecordingConn({source_url: None})
+
+    counts = backfill_source_bodies(conn, tmp_path)
+
+    assert counts["updated"] == 1
+    assert len(conn.writes) == 1
+    statement = conn.writes[0]
+    assert "last_indexed_body = %s" in statement
+    for column in _NEVER_WRITTEN:
+        assert column not in statement, f"{column!r} written by: {statement}"
+
+
+def test_the_never_written_check_would_actually_catch_a_violation():
+    """The control. A forbidden-column assertion pointed at nothing passes forever; this feeds the
+    same predicate the pre-19-September statement and confirms it trips on it.
+    """
+    old_form = (
+        "UPDATE sources SET last_indexed_body = %s, rule_effective_date = %s "
+        "WHERE source_url = %s AND last_indexed_body IS NULL"
+    )
+    assert [c for c in _NEVER_WRITTEN if c in old_form] == ["rule_effective_date"]
+
+    current_form = (
+        "UPDATE sources SET last_indexed_body = %s "
+        "WHERE source_url = %s AND last_indexed_body IS NULL"
+    )
+    assert [c for c in _NEVER_WRITTEN if c in current_form] == []
+
+
+def test_dry_run_predicts_which_sources_stay_unbacked_rather_than_reporting_zero(tmp_path):
+    """`--dry-run` used to return `sources_rows_still_null_after: 0` unconditionally, because
+    nothing had been written: a clean bill of health for work not done. It now subtracts the rows
+    this pass would fill and NAMES what is left.
+    """
+    covered = "https://example.gov/has-a-snapshot"
+    orphan = "https://example.gov/no-snapshot-on-disk"
+    _write_snapshot(tmp_path, source_url=covered, body="# Page\n\nBody.\n")
+    conn = _RecordingConn({covered: None, orphan: None})
+
+    counts = backfill_source_bodies(conn, tmp_path, dry_run=True)
+
+    assert conn.writes == []
+    assert counts["updated"] == 1
+    assert counts["sources_rows_still_null_after"] == 1
+    assert counts["unbacked_source_urls"] == [orphan]
