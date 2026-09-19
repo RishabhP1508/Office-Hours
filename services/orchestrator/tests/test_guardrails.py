@@ -21,7 +21,7 @@ down.
 import json
 import os
 import re
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from psycopg.rows import dict_row
@@ -938,7 +938,29 @@ def test_format_context_future_dated_passage_without_marker_gets_only_the_existi
 # --- for the full algorithm and why it has to be sentence-scoped. ---
 
 _TODAY = date(2026, 9, 11)
+
+# The REAL effective date DHS published for the fixed-period-of-admission final rule. It is a fact
+# about the world, not a test parameter, and it is now in the PAST: the constant's name describes
+# what it meant when it was written, not what it means today. Every test below that pairs it with
+# `today=_TODAY` is internally consistent and unaffected (2026-09-15 > 2026-09-11), but any test
+# that pairs it with the REAL clock no longer constructs a future-dated chunk at all. Use
+# `_relative_future_date()` when what a test needs is "a rule that has not taken effect yet"; use
+# this constant only when what it needs is "the actual DHS rule".
 _FUTURE_DATE = date(2026, 9, 15)
+
+
+def _relative_future_date(days: int = 30) -> date:
+    """A date that is genuinely in the future whenever the suite runs, for tests whose subject is
+    the guard's CONTRACT ("a figure found only in a not-yet-effective chunk is blocked") rather than
+    any particular rule.
+
+    Uses the same clock app/pipeline.py reads (`datetime.now(UTC).date()`, pipeline.py:690) rather
+    than `date.today()`, so a test and the pipeline it drives can never disagree about what day it
+    is across a timezone boundary. This is deliberately NOT a way of pinning `today`: the clock
+    stays real and only the fixture's own date moves with it, which is the difference between a
+    test that keeps measuring the contract and one that freezes a moment.
+    """
+    return datetime.now(UTC).date() + timedelta(days=days)
 
 
 def _departure_period_chunks() -> list[RetrievedChunk]:
@@ -1142,10 +1164,16 @@ def test_temporal_guard_does_not_change_cited_indices():
 # --- exactly those five; this is the split of WHAT to do about it. ---
 
 
-def _departure_period_chunks_with_url(url: str) -> list[RetrievedChunk]:
+def _departure_period_chunks_with_url(
+    url: str, *, rule_effective_date: date = _FUTURE_DATE
+) -> list[RetrievedChunk]:
     """Same shape as `_departure_period_chunks()` above (30 future-only, 60 a current-rule figure)
     but with an overridable, distinctive `source_url` on the future-dated chunk -- lets a BLOCK test
     assert the rendered message names the REAL chunk's URL, not a hardcoded literal.
+
+    `rule_effective_date` defaults to `_FUTURE_DATE` so every existing caller is unchanged. Pass
+    `_relative_future_date()` instead when the test's subject is the guard's contract rather than
+    the actual DHS rule -- see both constants' own comments for which is which.
     """
     return [
         _make_chunk(
@@ -1155,7 +1183,7 @@ def _departure_period_chunks_with_url(url: str) -> list[RetrievedChunk]:
                 "previous 60-day grace period."
             ),
             source_url=url,
-            rule_effective_date=_FUTURE_DATE,
+            rule_effective_date=rule_effective_date,
         ),
         _make_chunk(
             id=2,
@@ -1254,42 +1282,112 @@ def test_future_rule_blocked_message_names_the_actual_chunk_url_not_a_literal():
     assert "https://www.uscis.gov/rule-b" not in message_a
 
 
-async def test_temporal_guard_block_path_returns_blocked_unverified_end_to_end(
-    pool, embedder, settings, monkeypatch
-):
-    """Pipeline-level: a generated answer stating the future 30-day figure alone, as current, is
-    blocked whole -- BLOCKED_UNVERIFIED, refusal_reason="answer_states_future_rule_as_current",
-    ZERO citations, and the generated prose itself never rendered. `hybrid_search` is monkeypatched
-    to a fixed, deterministic chunk set (the real DHS-departure-period shape: 30 future-only, 60
-    current) so this test exercises the guard on the GENERATED TEXT, not on the fixture corpus's
-    real retrieval ranking, which this guard has nothing to do with.
+_BLOCKED_ANSWER_TEXT = (
+    "The current grace period after post-completion OPT (or STEM OPT) ends is 30 days - "
+    "students must depart the United States or file for an extension of stay within 30 days "
+    "of the OPT end date [1]."
+)
+
+
+async def _run_block_path(pool, embedder, settings, monkeypatch, *, rule_effective_date: date):
+    """Drive the whole pipeline over the fixed departure-period chunk pair (30 future-only, 60
+    current), with `rule_effective_date` on the 30-day chunk, and return the response.
+
+    `hybrid_search` is monkeypatched to a deterministic chunk set so both tests below exercise the
+    guard on the GENERATED TEXT rather than on the fixture corpus's retrieval ranking, which this
+    guard has nothing to do with. Shared by the two tests so they cannot drift apart in anything
+    except the one variable that actually distinguishes them: the chunk's effective date.
     """
 
     async def fake_hybrid_search(
         pool, query_embedding, question, top_k, *, rrf_k, candidate_pool, dated_rule_companions
     ):
-        return _departure_period_chunks_with_url(_FUTURE_RULE_URL)
+        return _departure_period_chunks_with_url(
+            _FUTURE_RULE_URL, rule_effective_date=rule_effective_date
+        )
 
     monkeypatch.setattr(pipeline_module, "hybrid_search", fake_hybrid_search)
-
-    fake_text = (
-        "The current grace period after post-completion OPT (or STEM OPT) ends is 30 days - "
-        "students must depart the United States or file for an extension of stay within 30 days "
-        "of the OPT end date [1]."
-    )
-    fake_llm = FixedAnswerLLM(fake_text)
-    response = await answer_question(
+    return await answer_question(
         "What is the grace period after OPT ends?",
         pool=pool,
         embedder=embedder,
-        llm=fake_llm,
+        llm=FixedAnswerLLM(_BLOCKED_ANSWER_TEXT),
         settings=settings,
+    )
+
+
+async def test_temporal_guard_block_path_returns_blocked_unverified_end_to_end(
+    pool, embedder, settings, monkeypatch
+):
+    """Pipeline-level CONTRACT test: a generated answer stating a not-yet-effective rule's figure
+    alone, as current, is blocked whole -- BLOCKED_UNVERIFIED,
+    refusal_reason="answer_states_future_rule_as_current", ZERO citations, and the generated prose
+    itself never rendered.
+
+    This is the only end-to-end assertion that the BLOCK path is wired through `answer_question`
+    correctly (the eleven `today=_TODAY` tests above all call `qualify_future_dated_figures`
+    directly and prove nothing about the pipeline), which is exactly why it must stay green and must
+    not be folded into the red test below.
+
+    It uses `_relative_future_date()` rather than `_FUTURE_DATE`. That is not a way of pinning the
+    clock -- `answer_question` reads the real one at pipeline.py:690 and there is no seam to pin
+    anyway. It is a fix to a DECAYED FIXTURE: this test's subject is "a rule that has not taken
+    effect yet", `_FUTURE_DATE` stopped being such a rule on 2026-09-15, and a hardcoded date can
+    only describe that subject for as long as the calendar cooperates.
+    """
+    response = await _run_block_path(
+        pool, embedder, settings, monkeypatch, rule_effective_date=_relative_future_date()
     )
     assert response.response_type == ResponseType.BLOCKED_UNVERIFIED.value
     assert response.refusal_reason == "answer_states_future_rule_as_current"
     assert response.citations == []
     assert response.contexts == []
-    assert fake_text not in response.answer
+    assert _BLOCKED_ANSWER_TEXT not in response.answer
+    assert "30 days" not in response.answer
+    assert _FUTURE_RULE_URL in response.answer
+
+
+async def test_temporal_guard_blocks_the_real_dhs_fixed_admission_figure_as_of_today(
+    pool, embedder, settings, monkeypatch
+):
+    """THIS TEST IS CURRENTLY RED, ON PURPOSE. IT IS A LIVE FINDING, NOT AN UNMAINTAINED TEST.
+
+    Do not xfail it, do not mark it, do not skip it, do not pin `today`, and do not relax the
+    assertions to match what the system currently returns. Each of those restores a green gate by
+    asserting behaviour the deployed system should not have, and CLAUDE.md's anti-gaming rules
+    forbid the first three by name. It is meant to fail until the system is fixed or the underlying
+    decision is made.
+
+    WHAT IT ASSERTS. With the REAL `rule_effective_date` the corpus carries for the DHS
+    fixed-period-of-admission final rule (`_FUTURE_DATE`, 2026-09-15) and the REAL clock, an answer
+    stating the 30-day departure figure alone, as current, should still be blocked.
+
+    WHY IT FAILS. A federal court enjoined the rule nationwide on 14 September 2026, the day before
+    it would have taken effect: Presidents' Alliance v. DHS, No. 1:26-cv-13799 (D. Mass., Saylor,
+    J.). The rule never came into force and the 60-day departure period remains the law. The guard,
+    however, keys on the calendar and not on whether a rule is actually in effect:
+    `app/guardrails/temporal.py::_figure_sets` gates on `chunk.rule_effective_date > today`, a
+    strict comparison, so at 00:00 UTC on 2026-09-15 the dated chunk stopped counting as
+    future-dated, `future_only` emptied, and both the BLOCK and the INSERT went silent. The system
+    now renders the 30-day figure as current, and `app/guardrails/freshness.py` (which compares the
+    same date with `<=`) appends its own uncited sentence saying the rule "took effect on
+    September 15, 2026". Confirmed live in production on 19 September 2026.
+
+    THE FIX IS NOT IN THIS FILE. The guard needs to stop inferring "in force" from "date has
+    passed", which is a design decision with at least three candidate shapes (remove the two
+    fixed-admission sources, add the court order as a cited source, or add a curator-controlled
+    field that does not depend on a date comparison at all). That decision is open.
+
+    SEE. REPORT.md, "The injunction, and why this is not fixed", and instrument table entry 30.
+    """
+    response = await _run_block_path(
+        pool, embedder, settings, monkeypatch, rule_effective_date=_FUTURE_DATE
+    )
+    assert response.response_type == ResponseType.BLOCKED_UNVERIFIED.value
+    assert response.refusal_reason == "answer_states_future_rule_as_current"
+    assert response.citations == []
+    assert response.contexts == []
+    assert _BLOCKED_ANSWER_TEXT not in response.answer
     assert "30 days" not in response.answer
     assert _FUTURE_RULE_URL in response.answer
 
