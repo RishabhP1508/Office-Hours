@@ -3,8 +3,12 @@
 ## Context
 
 The DHS fixed-period-of-admission rule takes effect 15 September 2026 and changes the F-1
-post-completion departure period from 60 days to 30. ADR 0019 fixed the retrieval half: the passage
-stating the new rule now reaches the generator. This ADR covers what the generator then does with it.
+post-completion departure period from 60 days to 30. **Superseded by the 15 September amendment
+under Decision below: the rule was enjoined on 14 September 2026 and did not take effect. The first
+sentence of this ADR is no longer true, and the self-resolution claim that rests on it is a
+fail-open. Read that amendment before acting on anything here.** ADR 0019 fixed the retrieval
+half: the passage stating the new rule now reaches the generator. This ADR covers what the generator
+then does with it.
 
 Measured over nine generations against three real phrasings, with the correct passage in context:
 every run stated both numbers, and **six of the nine attached the effective date to neither the claim
@@ -134,6 +138,78 @@ is a durable model of how to handle changing rules; the durable version is the "
 subject" matching described under Alternatives, and it was not built because the deadline did not
 allow it and the need expires with the deadline. If a FUTURE dated rule enters this corpus, this code
 becomes live again automatically and should be re-measured then rather than trusted.
+
+**Amended 15 September 2026. The paragraph above is false, and it is the most consequential thing in
+this ADR. A federal court enjoined the rule.** A nationwide preliminary injunction issued 14 September
+2026 in *Presidents' Alliance v. DHS*, No. 1:26-cv-13799 (D. Mass.), Judge F. Dennis Saylor IV. The
+DHS fixed-period-of-admission rule did not take effect on the 15th, the duration of status framework
+remains in place, the 60-day post-completion departure period is still the rule in force, and the
+30-day figure did not become true. The corpus's "F students now have 30 days" did NOT stop being
+false. It is still false, and now the scaffolding built to catch it is gone.
+
+The mechanism does expire exactly as described. What it expires into is not the harmless quiet the
+paragraph above predicts, but a fail-open, and in one place an active assertion of the enjoined rule.
+Three things happen simultaneously at 00:00 UTC on 15 September, all three measured against the real
+chunk text rather than reasoned about, so a future reader does not have to reconstruct them:
+
+1. **The guard goes inert, exactly on the effective date, not the day after.**
+   `_figure_sets` gates on `chunk.rule_effective_date > today`, a STRICT comparison.
+   `2026-09-15 > 2026-09-15` is false, so the dated chunks fall through to the `else` branch, their
+   figures join `current_figures`, `future_only` empties, and BOTH the block and the insertion stop.
+   Run at three dates against the real chunk text and the verbatim sentence measured in 5 of the 10
+   production runs above, the same string that returns `BLOCKED_UNVERIFIED` on the 14th renders
+   byte-for-byte on the 15th:
+
+       today=2026-09-14  future_only={'30': ['2026-09-15']}  blocked=True   insertions=1
+       today=2026-09-15  future_only={}                      blocked=False  insertions=0
+       today=2026-09-16  future_only={}                      blocked=False  insertions=0
+
+2. **The freshness notice does not stop. It inverts.**
+   `app/guardrails/freshness.py` compares the SAME date with `<=`, not `>`, so `in_effect` flips and
+   `freshness_notice_text` renders "took effect on September 15, 2026" in place of "takes effect on".
+   That sentence is generated from the date column and never from the page text, so it carries no
+   citation. The system now asserts, in its own uncited voice, that an enjoined rule is in force.
+   This is worse than the guard merely going quiet, and nothing in this ADR anticipated it: the
+   analysis here was scoped to the guard and never asked what the other two consumers of the same
+   date field would do once it passed.
+
+3. **The prompt annotation flips too, which silences prompt rule 4.**
+   `app/prompts.py::_rule_date_note` moves to "took effect on ... (on or before today)". Prompt
+   rule 4's trigger is anchored on the presence of a "takes effect on" FUTURE-dated passage. After
+   the 15th no passage carries that phrase, so the instruction telling the model to state both rules
+   with both dates no longer applies, and the model reads a past-dated 30-day passage beside an
+   undated 60-day one. The natural inference is that 30 supersedes 60.
+
+Retrieval is unchanged. The `companions` CTE in `app/db.py` matches on EQUAL `rule_effective_date`,
+never on future versus past, so the chunk stating the new figure still reaches the generator exactly
+as it did before. And nothing goes red: all twelve `qualify_future_dated_figures` call sites in the
+test suite pin `today` to a literal, so the suite stays green through the transition. This is
+instrument table entry 30 in REPORT.md.
+
+**The general lesson, which is the durable part of this amendment.** The guard's correctness rested
+on a fact about the world, that a rule would take effect on a known date, and nothing in the system
+could notice when that fact stopped being true. Scaffolding that expires on a date rather than on a
+measured condition assumes the date still means what it meant when the scaffolding was built.
+
+**Not fixed, deliberately, as of 15 September 2026.** The site is not public and has no users, so no
+reader is getting a wrong number from it and the urgency that would justify acting at speed does not
+apply. The two fast options are both worse than waiting: editing `rule_effective_date` to a date DHS
+never published puts a fabricated figure into two pieces of system-authored prose and into the prompt
+the model sees, and curating a citable source for a court order on the night it issued is the kind of
+source selection this project leaves to the curator. A third option, removing both fixed-admission
+sources from `data/sources/sources.yaml` and the corpus, is costed in full in REPORT.md (53 chunks,
+corpus 221 to 168, no test and no golden row depends on them) and is a live candidate, but it also
+drops those pages from the re-crawl manifest and so blinds the refresh to the pages most likely to
+carry DHS's own correction. The decision is to revisit in two or three days, once DHS has likely
+updated the pages and the coverage has settled, and then choose between removal, an injunction source,
+and a curator field that does not depend on a date comparison at all. This is the first thing to
+address before the site goes public, because going public is what turns a dormant defect into a live
+one.
+
+The original paragraph above is kept rather than rewritten, the same way the 12 September amendment
+kept what it corrected. The reasoning was sound given what was known on 12 September, and this ADR is
+more useful as a record of a correct decision overtaken by events than as a tidy document that never
+predicted anything wrong.
 
 **It inserts after the sentence rather than appending at the end.** Appending at the end is what the
 system already does with the freshness notice, and a trailing qualifier is precisely the behaviour
