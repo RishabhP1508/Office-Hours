@@ -33,7 +33,7 @@ from markdownify import markdownify as _markdownify
 from pgvector import Vector
 from pgvector.psycopg import register_vector_async
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, require_contactable_user_agent
 from app.providers.embeddings import get_embedder
 from app.rule_status import validate_rule_status
 
@@ -772,6 +772,12 @@ async def _ingest_from_manifest(
 
     Returns (total_chunks, total_sources).
     """
+    # This is a real network client about to reach a government web server, so the crawl policy
+    # this project argues for (an honestly identified, reachable, rate-limited crawler) has to be
+    # true before the first request, not merely documented -- see REPORT.md instrument entry 39
+    # and app/config.py::require_contactable_user_agent's own docstring.
+    require_contactable_user_agent(settings.USER_AGENT)
+
     manifest = read_manifest(Path(settings.SOURCES_MANIFEST_PATH))
     existing_index = load_existing_snapshot_index(raw_dir)
 

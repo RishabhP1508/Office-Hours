@@ -7,12 +7,30 @@ configured twice (see ARCHITECTURE.md, "The corpus and the query always use the 
 model").
 """
 
+import re
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# THE one literal. Referenced by Settings.USER_AGENT's default and by the blank-means-default
+# validator below, so neither is a second definition of it. See instrument entry 39.
+DEFAULT_USER_AGENT = (
+    "OfficeHoursBot/0.1 (+https://github.com/RishabhP1508/Office-Hours; "
+    "contact: patel.rishabh@northeastern.edu)"
+)
 
 
 class Settings(BaseSettings):
+    # NO env_ignore_empty here, deliberately. It was added on 19 September 2026 so
+    # docker-compose.yml could pass "${USER_AGENT:-}" through without an empty string beating
+    # USER_AGENT's own default, and it was removed the same day: it is a CLASS-wide setting, so
+    # it silently made an explicitly-blanked env var fall back to the hardcoded default for all
+    # 21 fields here that have a non-empty one. Two of those matter. A blanked SESSION_HASH_SALT
+    # would have restored the dev salt this repository publishes, and a blanked ALLOWED_ORIGINS
+    # would have restored http://localhost:3000 and broken CORS in a way that presents as a
+    # network fault. A global fail-open introduced while fixing a fail-open. The narrow fix is
+    # the USER_AGENT field validator below. See REPORT.md instrument entry 40.
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # Database
@@ -207,7 +225,32 @@ class Settings(BaseSettings):
 
     # Ingestion / crawling
     CRAWL_DELAY_SECONDS: float = 2.0
-    USER_AGENT: str = "OfficeHoursBot/0.1 (+https://github.com/office-hours)"
+
+    # This is the ONE definition. REPORT.md instrument entry 39: three other literals used to
+    # exist (.env.example, the gitignored .env, docker-compose.yml's own placeholder default) and
+    # every one of them described the crawl policy without enforcing it, because none of them is
+    # what Fly's `[env]` block or a fresh clone actually sends -- this field is. A value that is
+    # documented in several places and defaulted in one is not configured, it is described; only
+    # the default reaching this field is load-bearing, so it has to be complete here, in the one
+    # place a human is least likely to think of as "the docs", rather than in a file a human reads.
+    # docker-compose.yml and .env.example now both defer to this default instead of restating it.
+    USER_AGENT: str = DEFAULT_USER_AGENT
+
+    @field_validator("USER_AGENT", mode="before")
+    @classmethod
+    def _blank_user_agent_means_the_default(cls, value):
+        """A blank USER_AGENT falls back to DEFAULT_USER_AGENT instead of crawling as "".
+
+        Scoped to THIS ONE FIELD on purpose. docker-compose.yml passes "${USER_AGENT:-}", which is
+        an empty string when nothing overrides it, and an empty UA would fail
+        require_contactable_user_agent at the crawl entry point rather than quietly sending the
+        right thing. The class-wide `env_ignore_empty` that would also solve this was tried and
+        reverted, because it changes the same behaviour for every other field too, including
+        SESSION_HASH_SALT and ALLOWED_ORIGINS. See the model_config comment above.
+        """
+        if isinstance(value, str) and not value.strip():
+            return DEFAULT_USER_AGENT
+        return value
 
     # Filesystem
     SOURCES_MANIFEST_PATH: str = "/app/data/sources/sources.yaml"
@@ -419,3 +462,57 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+# Kept beside USER_AGENT (above) rather than in app/ingest.py or app/recrawl.py: one definition
+# and its own constraint belong in one place, which is the lesson of REPORT.md instrument entry
+# 39 -- the default drifted from four documents that all described it correctly and none of which
+# enforced it. An email-shaped token: a run of non-space, non-"@" characters, "@", then a domain
+# with at least one dot and a final label of 2+ letters.
+_EMAIL_SHAPED_TOKEN = re.compile(r"[^\s@]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
+
+# RFC 2606 reserves example.com/.org/.net for documentation, so an address there is unreachable by
+# definition, however email-shaped it looks.
+_RESERVED_CONTACT_DOMAINS = frozenset({"example.com", "example.org", "example.net"})
+
+# The exact value production was sending on 19 September 2026 (REPORT.md instrument entry 39,
+# confirmed on the Fly machine itself by a probe that printed the UA it was about to send). Kept
+# as a named module constant, not just typed into a test, specifically so require_contactable_
+# user_agent has at least one known-bad input drawn from a real incident to reject: a predicate
+# whose test corpus contains zero instances of the thing it exists to catch cannot demonstrate
+# that it would have caught the real one (see MEMORY.md, "confirm the check could have failed").
+MEASURED_PRODUCTION_USER_AGENT_2026_09_19 = "OfficeHoursBot/0.1 (+https://github.com/office-hours)"
+
+
+def require_contactable_user_agent(user_agent: str) -> None:
+    """Raise ValueError unless `user_agent` carries a reachable human contact.
+
+    This checks a PROPERTY -- a human is reachable from this string -- rather than a FORMAT.
+    Deliberately it does NOT require the literal substring "contact:", which would lock one
+    phrasing in place while still passing something like "contact: none". It also deliberately
+    does NOT accept a bare URL as sufficient: a URL is exactly what production's USER_AGENT
+    carried on 19 September 2026 (see MEASURED_PRODUCTION_USER_AGENT_2026_09_19 above), and
+    "github.com/office-hours" does not resolve to this project's repository at all. Checking
+    that a URL resolves would mean a network call on the crawl-startup path, which is a new
+    failure mode this project does not want; an email address is structurally checkable offline,
+    and it is what federal site operators expect a crawler to carry.
+
+    Raises ValueError naming the offending user agent and what is missing.
+    """
+    if "set-a-real-contact-here" in user_agent:
+        raise ValueError(
+            f"USER_AGENT {user_agent!r} still carries the placeholder "
+            "'set-a-real-contact-here' instead of a real contact address."
+        )
+    match = _EMAIL_SHAPED_TOKEN.search(user_agent)
+    if match is None:
+        raise ValueError(
+            f"USER_AGENT {user_agent!r} carries no contact: expected an email-shaped token "
+            "(something@somewhere.tld) somewhere in the string."
+        )
+    domain = match.group(0).rsplit("@", 1)[1].lower()
+    if domain in _RESERVED_CONTACT_DOMAINS:
+        raise ValueError(
+            f"USER_AGENT {user_agent!r} carries a contact at {domain!r}, an RFC 2606 "
+            "documentation-only domain reserved to be unreachable."
+        )

@@ -52,7 +52,13 @@ services:
       OTEL_SERVICE_NAME: "office-hours-orchestrator"
       INGEST_MODE: "${INGEST_MODE:-fetch}"
       CRAWL_DELAY_SECONDS: "${CRAWL_DELAY_SECONDS:-2.0}"
-      USER_AGENT: "${USER_AGENT:-OfficeHoursBot/0.1 (+https://github.com/office-hours; contact: set-a-real-contact-here)}"
+      # No placeholder string here anymore (app/config.py::Settings.USER_AGENT is the one
+      # definition now -- see its own comment and REPORT.md instrument entry 39). ${USER_AGENT:-}
+      # passes an override through when the shell/`.env` sets USER_AGENT, and otherwise resolves
+      # to an empty string -- which Settings' own env_ignore_empty=True treats as "not set" and
+      # falls through to Settings.USER_AGENT's own complete default, rather than this file
+      # substituting a second, competing definition.
+      USER_AGENT: "${USER_AGENT:-}"
       JUDGE_PROVIDER: "${JUDGE_PROVIDER:-nvidia}"
       JUDGE_BASE_URL: "${JUDGE_BASE_URL:-https://integrate.api.nvidia.com/v1}"
       JUDGE_API_KEY: "${JUDGE_API_KEY}"
