@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -62,10 +63,18 @@ from app.providers.embeddings import OllamaEmbedder, StubEmbedder
 from app.providers.llm import LLM, StubLLM
 from app.recrawl import (
     GoldenImpact,
+    RefreshDeps,
     RefreshReport,
     SourceResult,
+    _chunk_node,
+    _diff_node,
+    _embed_node,
+    _fetch_node,
     _initial_state,
+    _record_failure_node,
+    _reindex_node,
     _short_source_label,
+    _verify_only_node,
     classify_change,
     golden_impact_for_source,
     load_golden_source_urls,
@@ -1181,7 +1190,6 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
         heading="Other Heading",
     )
 
-    embedder = StubEmbedder(dim=768)
     new_now = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
     new_page_last_updated = date(2026, 9, 1)
     new_rule_effective_date = date(2026, 9, 15)
@@ -1195,10 +1203,13 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
             "text": new_body,
         }
     ]
+    # reindex_source no longer embeds -- it takes precomputed vectors (see its own docstring,
+    # updated Sept 2026 so the caller can compute them before ever acquiring `conn`).
+    vectors = await StubEmbedder(dim=768).embed([c["text"] for c in chunks])
 
     count = await reindex_source(
         conn,
-        embedder,
+        vectors,
         source_url=source_url,
         resolved_url=None,
         page_last_updated=new_page_last_updated,
@@ -1273,21 +1284,38 @@ class _RaisingEmbedder:
         raise RuntimeError("simulated embedder failure")
 
 
-async def test_reindex_source_embedder_failure_leaves_existing_chunks_intact(conn):
-    """DoD 1(a), BEHAVIORAL: a reindex_source call whose embedder raises must never leave a source
-    half-migrated -- the pre-existing chunks must survive, unchanged, by id. This asserts the
-    OBSERVABLE outcome (a fresh read from the database, not a claim about how the implementation
-    gets there), so it stays true even if a future refactor changes exactly where inside
-    `_embed_and_store` the embedder is called relative to the transaction.
+class _NeverCalledConnFactory:
+    """A conn_factory that fails loudly if it is ever invoked -- used below to prove a raising
+    embedder stops `_reindex_node` BEFORE any connection is acquired at all, rather than merely
+    hoping nothing was written by one that was.
+    """
 
-    LIMITATION, stated plainly rather than glossed over: `_embed_and_store` calls
-    `embedder.embed(texts)` BEFORE `async with conn.transaction():` opens, so this specific failure
-    never reaches the DELETE at all -- it is a fine regression test for "an embedder error must
-    never corrupt a source," but it does NOT exercise a real ROLLBACK, and would pass unchanged even
-    if the DELETE/INSERT were not transactional at all. The next test (
-    `test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_and_sources_upsert`) is
-    the one that actually proves the transaction rolls back: it fails INSIDE the transaction, after
-    the DELETE has already executed.
+    def __call__(self):
+        raise AssertionError(
+            "conn_factory must not be called when the embedder raises -- vectors are computed "
+            "before a connection is ever acquired (see app/recrawl.py::_reindex_node)"
+        )
+
+
+async def test_reindex_node_embedder_failure_never_acquires_a_connection_and_leaves_chunks_intact(
+    conn,
+):
+    """DoD 1(a), BEHAVIORAL, MOVED September 2026 (the embed/connection-ordering fix -- see
+    app/recrawl.py's module docstring): `reindex_source` no longer takes an embedder or computes
+    any embedding at all (see its own docstring) -- it now takes precomputed `vectors`, computed by
+    the caller BEFORE `conn` is ever acquired. So an embedder failure can no longer happen inside
+    `reindex_source`; it happens one level up, inside `_reindex_node`, before `deps.conn_factory()`
+    is ever called. This test moved with it, and got STRONGER in the move: it no longer only shows
+    pre-existing chunks survive (trivially true once a connection is never opened at all) -- it
+    shows the connection factory itself is NEVER invoked, via `_NeverCalledConnFactory`, which
+    raises if it is. A regression that went back to opening the connection before embedding would
+    fail this test loudly, not merely by comparing timestamps.
+
+    This is the SAME source-level safety property
+    `test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_and_sources_upsert` below
+    proves for a write-time failure (the transaction rolling back after the DELETE already ran);
+    together the two cover both failure points on the meaningful-change path: before any connection
+    exists (here), and inside the transaction once one does (the next test).
     """
     source_url = "https://example.gov/freshness-test-reindex-embedder-failure"
     old_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -1310,19 +1338,29 @@ async def test_reindex_source_embedder_failure_leaves_existing_chunks_intact(con
             "text": "New Heading\n\nSome new content.",
         }
     ]
+    state = {
+        "source_url": source_url,
+        "resolved_url": None,
+        "page_last_updated": None,
+        "rule_effective_date": None,
+        "rule_status": None,
+        "rule_status_source": None,
+        "body": "New Heading\n\nSome new content.",
+        "chunks": chunks,
+        "verdict": {"status": "meaningful", "reason": "content_lines_changed"},
+        "node_trail": ["fetch", "diff", "chunk", "embed"],
+    }
+    deps = RefreshDeps(
+        fetcher=None,
+        conn_factory=_NeverCalledConnFactory(),
+        embedder=_RaisingEmbedder(),
+        raw_dir=Path("."),
+        backoff_seconds=0,
+        dry_run=False,
+    )
 
     with pytest.raises(RuntimeError, match="simulated embedder failure"):
-        await reindex_source(
-            conn,
-            _RaisingEmbedder(),
-            source_url=source_url,
-            resolved_url=None,
-            page_last_updated=None,
-            rule_effective_date=None,
-            body="New Heading\n\nSome new content.",
-            chunks=chunks,
-            now=datetime(2026, 9, 5, 12, 0, tzinfo=UTC),
-        )
+        await _reindex_node(deps, state)
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
@@ -1346,7 +1384,8 @@ class _WrongDimensionEmbedder:
     only THEN fails, when Postgres rejects the mismatched vector on INSERT
     (`psycopg.errors.DataException`, verified directly against a live pgvector column: "expected
     768 dimensions, not 3"). This is what makes the test below a real proof of ROLLBACK, unlike
-    `test_reindex_source_embedder_failure_leaves_existing_chunks_intact` above.
+    `test_reindex_node_embedder_failure_never_acquires_a_connection_and_leaves_chunks_intact` above
+    (that failure never gets a connection at all).
     """
 
     async def embed(self, texts):
@@ -1400,11 +1439,14 @@ async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_a
             "text": "New Heading\n\nSome new content.",
         }
     ]
+    # reindex_source takes precomputed vectors now, not an embedder -- compute the (deliberately
+    # wrong-dimension) vectors the same way _reindex_node would, before calling it.
+    vectors = await _WrongDimensionEmbedder().embed([c["text"] for c in chunks])
 
     with pytest.raises(psycopg.errors.DataException, match="768 dimensions"):
         await reindex_source(
             conn,
-            _WrongDimensionEmbedder(),
+            vectors,
             source_url=source_url,
             resolved_url=None,
             page_last_updated=date(2026, 9, 1),
@@ -1478,9 +1520,10 @@ async def test_embed_and_store_first_index_writes_last_indexed_body_and_the_docu
         }
     ]
 
+    vectors = await StubEmbedder(dim=768).embed([c["text"] for c in chunks])
     await _embed_and_store(
         conn,
-        StubEmbedder(dim=768),
+        vectors,
         source_url=source_url,
         resolved_url=None,
         page_last_updated=date(2026, 1, 1),
@@ -1531,10 +1574,17 @@ class _AsyncFakeCursor:
     """Records every statement issued through it. `rowcount` mimics psycopg closely enough for
     touch_last_verified's `return cur.rowcount`: it is set by the most recent UPDATE/INSERT this
     fake modeled, exactly the way a real cursor's rowcount reflects the most recent execute.
+
+    `executemany_calls` records each `executemany()` call separately from `log`, as
+    `(flattened_sql, params_list)` -- added for FIX 2 (app/ingest.py::_embed_and_store's chunk
+    write is one `executemany()` now, not one `execute()` per chunk) so a test can tell the two
+    shapes apart: N `execute()` calls show up as N entries in `log` and nothing in
+    `executemany_calls`; one `executemany()` call shows up as one entry in each.
     """
 
-    def __init__(self, log: list[str]):
+    def __init__(self, log: list[str], executemany_calls: list[tuple[str, list]]):
         self.log = log
+        self.executemany_calls = executemany_calls
         self.rowcount = 0
 
     async def __aenter__(self):
@@ -1553,6 +1603,17 @@ class _AsyncFakeCursor:
         elif flat.startswith("DELETE FROM documents"):
             self.rowcount = 0
 
+    async def executemany(self, sql, params_seq):
+        # Deliberately NOT appended to `self.log` too: `log` stays exclusively "one entry per
+        # execute() call" so a test can tell "N execute() calls" apart from "one executemany()
+        # call" by checking `log`'s length against `executemany_calls`'s length -- appending to
+        # both would make an N-row executemany() indistinguishable from N execute() calls by count.
+        flat = " ".join(sql.split())
+        params_list = list(params_seq)
+        self.executemany_calls.append((flat, params_list))
+        if flat.startswith("INSERT INTO documents"):
+            self.rowcount = len(params_list)
+
 
 class _AsyncFakeTxn:
     async def __aenter__(self):
@@ -1565,17 +1626,18 @@ class _AsyncFakeTxn:
 class _AsyncFakeConn:
     """The minimal async surface `touch_last_verified`/`_embed_and_store` actually call:
     `conn.transaction()` and `conn.cursor()`, both used as async context managers, plus
-    `cur.execute()`. Nothing here executes real SQL or talks to a socket.
+    `cur.execute()`/`cur.executemany()`. Nothing here executes real SQL or talks to a socket.
     """
 
     def __init__(self):
         self.log: list[str] = []
+        self.executemany_calls: list[tuple[str, list]] = []
 
     def transaction(self):
         return _AsyncFakeTxn()
 
     def cursor(self):
-        return _AsyncFakeCursor(self.log)
+        return _AsyncFakeCursor(self.log, self.executemany_calls)
 
     @property
     def statements_touching_sources(self) -> list[str]:
@@ -1665,9 +1727,10 @@ async def test_embed_and_store_never_writes_rule_effective_date_to_sources():
         }
     ]
 
+    vectors = await StubEmbedder(dim=768).embed([c["text"] for c in chunks])
     await _embed_and_store(
         conn,
-        StubEmbedder(dim=768),
+        vectors,
         source_url="https://example.gov/fake-conn-embed-and-store",
         resolved_url=None,
         page_last_updated=date(2026, 1, 1),
@@ -1681,10 +1744,13 @@ async def test_embed_and_store_never_writes_rule_effective_date_to_sources():
     violations = _statements_writing_sources_rule_effective_date(conn.log)
     assert not violations, f"sources statement carries it: {violations}"
 
-    # documents still receives the annotation, per chunk -- unaffected by this fix.
-    documents_writes = [s for s in conn.log if s.startswith("INSERT INTO documents")]
-    assert len(documents_writes) == 1
-    assert "rule_effective_date" in documents_writes[0]
+    # documents still receives the annotation, per chunk -- unaffected by this fix. The chunk
+    # write is now one executemany() call (FIX 2, see conn.executemany_calls's own docstring), not
+    # an execute() call, so it is checked there rather than in conn.log.
+    assert len(conn.executemany_calls) == 1
+    documents_sql, _ = conn.executemany_calls[0]
+    assert documents_sql.startswith("INSERT INTO documents")
+    assert "rule_effective_date" in documents_sql
 
 
 def test_embed_and_store_sources_check_would_actually_catch_a_violation():
@@ -1712,6 +1778,355 @@ def test_embed_and_store_sources_check_would_actually_catch_a_violation():
         "ON CONFLICT (source_url) DO UPDATE SET last_indexed_body = EXCLUDED.last_indexed_body"
     )
     assert _statements_writing_sources_rule_effective_date([current_statement]) == []
+
+
+async def test_embed_and_store_writes_chunks_in_one_executemany_not_n_executes():
+    """FIX 2 regression, no database required: `_embed_and_store` used to issue one
+    `INSERT INTO documents` execute() call per chunk -- N round trips to a remote database, held
+    open for the whole loop. It now issues exactly ONE `cur.executemany()` call carrying every
+    chunk's parameters (see the comment beside that call in app/ingest.py for why executemany()
+    over copy()). Uses 3 chunks, not 1 like the neighboring rule_effective_date regression tests
+    above, specifically so a regression back to the old shape would show up as 3 log entries here,
+    not 1 -- see the control right below for proof this test can actually tell the two apart.
+    """
+    conn = _AsyncFakeConn()
+    chunks = [
+        {
+            "heading": f"Section {i}",
+            "level": 2,
+            "parent": None,
+            "breadcrumb": f"Page > Section {i}",
+            "text": f"Page > Section {i}\n\nContent {i}.",
+        }
+        for i in range(3)
+    ]
+    vectors = await StubEmbedder(dim=768).embed([c["text"] for c in chunks])
+
+    await _embed_and_store(
+        conn,
+        vectors,
+        source_url="https://example.gov/fake-conn-executemany",
+        resolved_url=None,
+        page_last_updated=date(2026, 1, 1),
+        body="# Page\n\n## Section 0\n\nContent 0.\n",
+        chunks=chunks,
+    )
+
+    assert len(conn.executemany_calls) == 1, (
+        f"expected exactly one executemany() call for the chunk write, got: "
+        f"{conn.executemany_calls}"
+    )
+    sql, params_list = conn.executemany_calls[0]
+    assert "INSERT INTO documents" in sql
+    assert len(params_list) == 3, "expected one parameter row per chunk, not fewer or more"
+    assert len(params_list[0]) == 9, "expected the same 9-column row shape as before this fix"
+
+    # No per-chunk execute() call should remain for the documents insert -- only the DELETE and
+    # the sources upsert are still plain execute() calls.
+    documents_execute_calls = [s for s in conn.log if s.startswith("INSERT INTO documents")]
+    assert documents_execute_calls == [], (
+        "found a per-chunk 'INSERT INTO documents' execute() call -- the chunk write must go "
+        f"through executemany() instead: {documents_execute_calls}"
+    )
+
+
+async def test_embed_and_store_executemany_check_would_actually_catch_the_old_n_execute_shape():
+    """The control for the FIX 2 regression test above (see "confirm the check could have failed"):
+    replays the OLD shape by hand -- one execute() per chunk, nothing routed through
+    executemany() -- against the exact same fake, and confirms the regression test's own
+    assertions (one executemany() call; zero per-chunk execute() calls) would have failed against
+    it: 3 execute() calls land in `log`, not `executemany_calls`, and `executemany_calls` stays
+    empty.
+    """
+    conn = _AsyncFakeConn()
+    async with conn.cursor() as cur:
+        for i in range(3):
+            await cur.execute(
+                "INSERT INTO documents (content, source_url) VALUES (%s, %s)",
+                (f"content {i}", "https://example.gov/old-shape"),
+            )
+
+    documents_execute_calls = [s for s in conn.log if s.startswith("INSERT INTO documents")]
+    assert (
+        len(documents_execute_calls) == 3
+    ), "control setup should reproduce the old N-execute shape"
+    assert conn.executemany_calls == [], "control setup should not use executemany() at all"
+
+
+# =================================================================================================
+# CONNECTION-ORDERING INVARIANT (September 2026 fix): a source's chunks must be fully embedded
+# BEFORE `_reindex_node` acquires a database connection, never after -- see app/recrawl.py's module
+# docstring for the measured 104.77s embed and the Neon idle-connection failure this fixes. No
+# database and no langgraph needed: `_reindex_node` and the other graph nodes are plain async
+# functions (nothing above `build_refresh_graph` in app/recrawl.py imports langgraph), callable
+# directly against fakes.
+# =================================================================================================
+
+
+class _OrderTrackingConnFactory:
+    """A fake conn_factory that records whether a connection is currently "open", so a paired fake
+    embedder can assert none is open yet when it is called. Yields a plain `_AsyncFakeConn` (no
+    real DB, no real socket) -- reusing the same fake the statement-shape tests above use means the
+    real `reindex_source`/`_embed_and_store` code path runs completely unmodified against it.
+    """
+
+    def __init__(self):
+        self.open_count = 0
+        self.is_open = False
+
+    def __call__(self):
+        return self._ctx()
+
+    @asynccontextmanager
+    async def _ctx(self):
+        self.open_count += 1
+        self.is_open = True
+        try:
+            yield _AsyncFakeConn()
+        finally:
+            self.is_open = False
+
+
+class _ConnMustBeClosedEmbedder:
+    """Raises the instant it is called while `conn_factory.is_open` is True. This is what makes the
+    ordering test below encode the invariant DIRECTLY -- a fake that fails the moment the bad order
+    happens -- rather than indirectly, by comparing timestamps after the fact, which can only ever
+    show correlation. Delegates to a real StubEmbedder otherwise, so a passing call still exercises
+    a normal chunks/vectors pairing downstream.
+    """
+
+    def __init__(self, conn_factory: _OrderTrackingConnFactory, dim: int = 768):
+        self._conn_factory = conn_factory
+        self._stub = StubEmbedder(dim=dim)
+        self.called = False
+
+    async def embed(self, texts):
+        if self._conn_factory.is_open:
+            raise AssertionError(
+                "embedder called while a connection was already open -- vectors must be computed "
+                "BEFORE a connection is acquired (see app/recrawl.py::_reindex_node)"
+            )
+        self.called = True
+        return await self._stub.embed(texts)
+
+
+def _minimal_reindex_state(*, source_url: str, chunks: list[dict], body: str) -> dict:
+    """The minimal RefreshState `_reindex_node` actually reads -- built by hand rather than through
+    a real graph invocation (which would need langgraph) or `_initial_state` (which seeds a FRESH
+    run, not a mid-graph one). RefreshState is a TypedDict, i.e. a plain dict at runtime, so no
+    langgraph import is needed to construct or pass one.
+    """
+    return {
+        "source_url": source_url,
+        "resolved_url": None,
+        "page_last_updated": None,
+        "rule_effective_date": None,
+        "rule_status": None,
+        "rule_status_source": None,
+        "body": body,
+        "chunks": chunks,
+        "verdict": {"status": "meaningful", "reason": "content_lines_changed"},
+        "node_trail": ["fetch", "diff", "chunk", "embed"],
+    }
+
+
+async def test_reindex_node_embeds_before_acquiring_the_connection():
+    """THE FIX ITSELF: `_reindex_node` must compute vectors BEFORE calling `deps.conn_factory()`.
+    `_ConnMustBeClosedEmbedder` raises the instant it is called while a connection is open, so a
+    regression back to "open the connection, then embed" fails this test loudly rather than by
+    comparing timestamps.
+    """
+    conn_factory = _OrderTrackingConnFactory()
+    embedder = _ConnMustBeClosedEmbedder(conn_factory)
+    chunks = [{"heading": "H", "level": 2, "parent": None, "breadcrumb": "H", "text": "H\n\nBody."}]
+    state = _minimal_reindex_state(
+        source_url="https://example.gov/order-test", chunks=chunks, body="H\n\nBody."
+    )
+    deps = RefreshDeps(
+        fetcher=None,
+        conn_factory=conn_factory,
+        embedder=embedder,
+        raw_dir=Path("."),
+        backoff_seconds=0,
+        dry_run=False,
+    )
+
+    result = await _reindex_node(deps, state)
+
+    assert embedder.called, "the fake embedder was never called at all -- this test proves nothing"
+    assert conn_factory.open_count == 1
+    assert result["chunks_indexed"] == 1
+
+
+async def test_reindex_node_ordering_assertion_actually_catches_the_bad_order():
+    """CONTROL for the test above: a check that never sees the bad order cannot prove it catches
+    one (see "confirm the check could have failed"). Reproduces the PRE-FIX order by hand -- acquire
+    the connection, THEN embed -- against the exact same fakes, and confirms
+    `_ConnMustBeClosedEmbedder` trips.
+    """
+    conn_factory = _OrderTrackingConnFactory()
+    embedder = _ConnMustBeClosedEmbedder(conn_factory)
+
+    with pytest.raises(AssertionError, match="already open"):
+        async with conn_factory() as _fake_conn:
+            del _fake_conn
+            await embedder.embed(["some text"])
+
+
+# =================================================================================================
+# THE CHECKPOINT TRAP: RefreshState is checkpointed to sqlite by LangGraph (45 chunks x 768 floats
+# is roughly 276KB per source), so a vector must never appear in ANY node's returned state-update
+# dict. Checked broadly -- the whole dict, recursively, not by looking for one specific key name --
+# and against every node in the graph, not just the ones that happen to see `chunks` today.
+# =================================================================================================
+
+
+def _assert_no_vector_like_payload(update: dict, node_name: str) -> None:
+    """Recursively scans every key and value in `update` (a node's returned state-update dict) for
+    anything that could be an embedding: a key whose name contains "vector" or "embed"
+    (case-insensitive), or a value that is itself a list/tuple of 8+ numbers (real vectors here are
+    768-dimensional; 8 is a deliberately low floor so even a much smaller accidental vector would
+    still be caught). Written over the WHOLE dict, recursively, rather than checking for one key
+    name -- LangGraph checkpoints whatever this dict merges into RefreshState, so any route a vector
+    could enter it is the same failure.
+    """
+
+    def _walk(value, path: list) -> None:
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                assert not re.search(
+                    r"vector|embed", str(key), re.IGNORECASE
+                ), f"{node_name}: key {path + [key]} looks like it carries an embedding: {key!r}"
+                _walk(inner, path + [key])
+        elif isinstance(value, (list, tuple)):
+            if len(value) >= 8 and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
+            ):
+                raise AssertionError(
+                    f"{node_name}: value at {path} is a {len(value)}-element numeric list -- "
+                    "this looks like an embedding vector, which must never enter RefreshState "
+                    "(LangGraph checkpoints it to disk)"
+                )
+            for i, item in enumerate(value):
+                _walk(item, path + [i])
+
+    _walk(update, [])
+
+
+class _SelectOnlyFakeCursor:
+    """The minimal SELECT surface `_load_diff_baseline` needs: two execute()/fetchone() pairs
+    inside one cursor context. Drives `_diff_node` down its "genuinely new source" branch (no
+    baseline body, no existing chunks) with zero setup, so it runs with no real database at all.
+    """
+
+    def __init__(self):
+        self._calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, sql, params=None):
+        self._calls += 1
+
+    async def fetchone(self):
+        # First SELECT (sources.last_indexed_body): None -- no prior row. Second SELECT (whether
+        # `documents` already holds chunks): (False,) -- it does not either.
+        return None if self._calls == 1 else (False,)
+
+
+class _SelectOnlyFakeConn:
+    def cursor(self, **kwargs):
+        del kwargs
+        return _SelectOnlyFakeCursor()
+
+
+@asynccontextmanager
+async def _select_only_conn_ctx():
+    yield _SelectOnlyFakeConn()
+
+
+async def _fake_fetcher_for_checkpoint_trap(entry: dict) -> FetchedPage:
+    del entry
+    return FetchedPage(
+        resolved_url=None, title="T", page_last_updated=None, body_markdown="H\n\nBody."
+    )
+
+
+async def test_no_graph_node_ever_returns_a_vector_in_its_state_update():
+    """THE CHECKPOINT TRAP, guarded directly rather than merely documented: none of the seven graph
+    nodes may return an embedding inside its state-update dict. Checked against every one of them,
+    not just `_reindex_node` -- `_embed_node` staying a pure pass-through is exactly the guarantee
+    this asserts, in addition to describing it in its own docstring.
+
+    `dry_run=True` drives six of the seven with no real database at all (`_diff_node` still reads,
+    dry-run or not, hence `_select_only_conn_ctx`). `_reindex_node` runs a SECOND time below with
+    `dry_run=False` and a real (fake) embedder, because the dry-run branch never computes a vector
+    at all and would make this check vacuous for the one node where a vector is actually produced.
+    """
+    chunks = [{"heading": "H", "level": 2, "parent": None, "breadcrumb": "H", "text": "H\n\nBody."}]
+    state = _initial_state(
+        {"url": "https://example.gov/checkpoint-trap", "topic": "freshness_test"},
+        run_id="checkpoint-trap-run",
+        max_attempts=3,
+    )
+    state.update(
+        {
+            "body": "H\n\nBody.",
+            "chunks": chunks,
+            "verdict": {"status": "meaningful", "reason": "content_lines_changed"},
+            "node_trail": ["fetch", "diff", "chunk", "embed"],
+        }
+    )
+    dry_run_deps = RefreshDeps(
+        fetcher=_fake_fetcher_for_checkpoint_trap,
+        conn_factory=_select_only_conn_ctx,
+        embedder=StubEmbedder(dim=768),
+        raw_dir=Path("."),
+        backoff_seconds=0,
+        dry_run=True,
+    )
+
+    fetch_update = await _fetch_node(dry_run_deps, state)
+    _assert_no_vector_like_payload(fetch_update, "_fetch_node")
+
+    diff_update = await _diff_node(dry_run_deps, state)
+    _assert_no_vector_like_payload(diff_update, "_diff_node")
+
+    chunk_update = await _chunk_node(dry_run_deps, state)
+    _assert_no_vector_like_payload(chunk_update, "_chunk_node")
+
+    embed_update = await _embed_node(dry_run_deps, state)
+    assert embed_update == {
+        "node_trail": [*state["node_trail"], "embed"]
+    }, "_embed_node must stay a pure pass-through -- see its own docstring"
+    _assert_no_vector_like_payload(embed_update, "_embed_node")
+
+    reindex_dry_update = await _reindex_node(dry_run_deps, state)
+    _assert_no_vector_like_payload(reindex_dry_update, "_reindex_node(dry_run)")
+
+    verify_only_update = await _verify_only_node(dry_run_deps, state)
+    _assert_no_vector_like_payload(verify_only_update, "_verify_only_node")
+
+    record_failure_update = await _record_failure_node(dry_run_deps, state)
+    _assert_no_vector_like_payload(record_failure_update, "_record_failure_node")
+
+    # The one case that actually matters: _reindex_node with dry_run=False, where a real 768-float
+    # vector is genuinely computed. Reuses the same ordering fakes as the invariant test above, so
+    # this also re-confirms the connection is opened after the embed, never before.
+    conn_factory = _OrderTrackingConnFactory()
+    real_deps = RefreshDeps(
+        fetcher=None,
+        conn_factory=conn_factory,
+        embedder=_ConnMustBeClosedEmbedder(conn_factory),
+        raw_dir=Path("."),
+        backoff_seconds=0,
+        dry_run=False,
+    )
+    reindex_real_update = await _reindex_node(real_deps, state)
+    _assert_no_vector_like_payload(reindex_real_update, "_reindex_node(real)")
 
 
 async def test_no_foreign_key_touching_documents_is_on_delete_cascade(conn):
