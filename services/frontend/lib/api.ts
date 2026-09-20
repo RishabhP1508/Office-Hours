@@ -33,10 +33,34 @@ export interface FreshnessSource {
   rule_effective_date: string | null;
 }
 
+// app/schemas.py::FreshnessNotice. `in_effect` was REMOVED 2026-09-19 (see that class's own
+// docstring, and docs/adr/0023-curator-rule-status.md): it collapsed `enjoined`, `scheduled`, and
+// `not_in_force` into the identical `False`, which is exactly what let this component render
+// "takes effect on September 15, 2026" for a rule a court had enjoined five days earlier. Every
+// consumer now reads `rule_status` directly (see lib/freshness.ts) -- there is no boolean force
+// bit anywhere in this type any more.
 export interface FreshnessNotice {
   source_url: string;
-  rule_effective_date: string;
-  in_effect: boolean;
+  // Optional, not `| null`, because build_freshness only ever OMITS this key for a chunk with
+  // neither annotation, and a source that reaches this type always carries a `rule_effective_date`
+  // and/or a `rule_status` -- see that field's own note below. `null` is a real, if rare
+  // (legacy/unsynced row), value app/schemas.py::FreshnessNotice.rule_effective_date can carry.
+  rule_effective_date: string | null;
+  // Kept as `string`, not a literal union, the same forward-compatibility reason `ResponseType`
+  // above is: a `rule_status` value this frontend does not recognize yet (a fifth vocabulary
+  // value app/rule_status.py adds later) must fall back to safe, non-committal prose, never crash
+  // and never guess a force verdict -- see lib/freshness.ts's UNKNOWN_STATUS branch, which is the
+  // fallback this type's forward-compatibility exists to route into.
+  rule_status: string;
+  // The citable URL a curator gave for `enjoined`/`not_in_force` (app/rule_status.py::
+  // validate_rule_status requires it for those two); `null` for `in_force`/`scheduled`, where the
+  // source page itself is the citation.
+  rule_status_source: string | null;
+  // Whether `rule_status_source` actually documents the STATUS (a court's order) or merely the
+  // rule the status is ABOUT (e.g. the Federal Register notice for the rule itself); `null` when
+  // `rule_status_source` itself is `null`, or for a legacy/unsynced row written before this column
+  // existed. See lib/freshness.ts for how this branches the enjoined/not_in_force wording.
+  rule_status_source_evidences_status: boolean | null;
   reason: "top_ranked" | "cited" | "retrieved";
 }
 

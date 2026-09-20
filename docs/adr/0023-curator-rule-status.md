@@ -208,3 +208,17 @@ Rejected as out of scope and over-engineered for a corpus of 14 sources with, to
 rule ever contested: building and maintaining a feed of court dockets is a materially larger system
 than the four-value field it would replace, for a problem this project's curator can solve by
 reading the news and editing one line of YAML.
+
+## Update, 2026-09-19: `in_effect` removed
+
+`app/schemas.py::FreshnessNotice.in_effect` and `services/frontend/lib/api.ts`'s matching field are
+both gone. That boolean was originally kept "for compatibility" so the frontend would not need
+this ADR's four-value vocabulary at all, but a boolean cannot carry the vocabulary's own
+distinction any better on the frontend than it could have on the backend: `is_in_force` reads
+`enjoined`, `scheduled`, and `not_in_force` as the identical `False`, and the frontend, reading
+only that one bit, rendered "A rule affecting this answer takes effect on September 15, 2026" for
+a rule a federal court had enjoined five days earlier. The compatibility field did not avoid this
+ADR's defect; it re-imported it onto a second surface. `services/frontend/lib/freshness.ts` now
+reads `rule_status` directly, one branch per value, with the same four-state vocabulary this ADR
+defines and the same "unrecognized value renders safely, never as a force claim" discipline
+`app/rule_status.py::is_in_force` was built to enforce on the backend.

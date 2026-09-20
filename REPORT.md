@@ -57,6 +57,8 @@ Thirty-four times in this build, an instrument was the thing worth writing down 
 | 32 | The FAQ snapshot's `heading_note`, as the record of why that page's chunking is unusual | **A note whose entire job is to describe a structure has outlived the structure it describes, silently, because the mechanism preserving it was working exactly as designed.** The note says the page's group labels "(Transition Period, Understanding the Admit Until Date, Extensions of Stay, Maintaining Status, Departure Period) are h3". Measured against the file it sits in: all five are **h4**, and the real h3 layer (`General`, `F Students`, `School Officials`) is not mentioned at all. DHS evidently added a grouping level at some point; the note was written before that and has been wrong ever since. **The mechanism is the part worth keeping.** `build_frontmatter` preserves every non-base frontmatter key verbatim across a body rewrite, which is correct and is the behaviour ARCHITECTURE.md demands so curator annotations are never lost. The consequence is that an annotation which DESCRIBES the body is carried unchanged across exactly the event that invalidates it: the 5 September re-fetch rewrote the body and copied the note forward untouched. A preservation guarantee and a staleness guarantee are the same guarantee when the thing preserved is a description of the thing replaced. Nothing in the repo compares a `heading_note` to the headings, and no test could have gone red. | Not by any check, and not by anything looking for it. It surfaced only because the annotation was being MOVED to a tracked file, and the move was verified by reading the file it describes rather than by copying the string. A byte-identical round-trip check, which is what a careful migration would normally run and which this one did run, passes on a false value: it proves the move was faithful, which is a different claim from the value being true. **The general form, and it is the one to carry: curator annotations divide into facts about the world and observations about the artifact.** `rule_effective_date` and `federal_register` are facts; they survive any re-fetch unchanged because they never described the page in the first place. `heading_note` and the redirect `note` are observations; a re-fetch is precisely what can falsify them. Storing both classes in the same place, beside the body, gives the second class a guarantee of silent rot, and the fix is not better discipline about updating notes but recognising that the two classes have opposite relationships to the same event. |
 | 33 | The re-crawl's own failure reporting, as the account of why a run against production failed | **The error path is the only part of `app/recrawl.py` that still works against production's schema, so a total failure of the success path would have rendered as a specific, plausible, entirely wrong diagnosis.** Production's Postgres is frozen post-Phase-5, pre-ADR-0014: `documents.rule_effective_date` and `documents.content_tsv` exist, `sources.rule_effective_date` and `sources.last_indexed_body` do not (confirmed against `information_schema`: false, false, true, true). `infra/sql/init.sql` reaches a database only through the local compose mount at `docker-entrypoint-initdb.d`, which runs only on an empty data directory; nothing applies it to a hosted database, so Neon holds whatever was applied by hand at one moment and nothing since. Every success-path statement touches a column that is not there. `_diff_node`'s FIRST statement, before any fetch, is `SELECT last_indexed_body, rule_effective_date FROM sources`. `touch_last_verified` and `_embed_and_store` both write `rule_effective_date`. **`record_source_failure` touches only original-shape columns, so it succeeds.** The first run would therefore catch `UndefinedColumn` per source, route to the failure path, and write `status='fetch_failed'`, an incremented `consecutive_failures`, and the `UndefinedColumn` text into `last_error`, for **all 14 sources, without fetching a single page**. Not a crash. A corpus-wide health state that is confidently, specifically wrong. | **Not by running it, and it could not have been.** It surfaced sideways: `app/sync_annotations.py`, a new tool written against the same table, failed with a raw `UndefinedColumn` on its first SELECT, because it is small enough to have no failure handler standing between the database and the person reading the output. The re-crawl has one, and that handler would have converted the same error into a domain verdict. **The generalisable form, and it is the sharpest in this table: when the failure handler depends on LESS of the system than the success path does, it outlives the success path, and a total failure renders as a confident specific diagnosis in the failure handler's own vocabulary.** The vocabulary here is fetching, so a schema problem would have reported as fourteen fetch failures. That reading was available, adjacent, and already half-believed: the httpx TLS block (entry 31) is real, affects all 14 sources, and had nothing whatever to do with this. Two independent findings pointing at the same 14 rows, one of them the wrong explanation for the other's symptom. The defensive form: a failure handler that requires less than the thing it reports on is not a safety net, it is an unreliable narrator with better uptime than the narrator it replaced. |
 | 34 | A local run of `tests/test_backfill_source_bodies.py`, as evidence that those tests are correct | **Those tests already fail on this machine for a known, accepted, unrelated reason, so when the synchronous conversion broke them they went on failing and nothing changed.** The conversion (19 September) made `app/backfill_source_bodies.py` sync and left its five tests on the async `conn` fixture, calling `await backfill_source_bodies(...)` on a function that no longer returns an awaitable. Five real breakages, in the tests for the tool that had just written to production. A local run could not report it: on Windows those tests fail before reaching any assertion, because psycopg refuses to run in async mode on the ProactorEventLoop (and with no local Postgres they would fail anyway on connection). **The verdict before the breakage and the verdict after it were the same word.** The severity is not that the tests fail locally, which was known and accepted; it is that a known-failing check has no remaining capacity to report anything new. | CI, on Linux, where the accepted local reason does not apply, so the real defect produced a DIFFERENT and specific error (`TypeError: '_AsyncGeneratorContextManager' object does not support the context manager protocol`) instead of being absorbed into an existing one. **The generalisable form: an accepted failure is an ABSORBING STATE for new failures.** Once a check is known-broken for a reason everyone has agreed to look past, it can take on unlimited further breakage at no visible cost, and the agreement to look past it is what disables it. That is the same family as entry 33 (a failure handler outliving the success path it reports on), the scheduled job reporting green while skipping, and the backfill's own `--dry-run` reporting `0 still NULL` for a run that wrote nothing: in every case a signal that should separate two states cannot. **The honest note on the fix: it does not make these tests runnable here.** The scaffolding fixture stays async on purpose, because it shares ~50 lines of insert/delete SQL with `test_freshness.py`, whose subject genuinely is async. So the absorbing state persists on Windows and CI remains the only place these tests can speak. Knowing that is the mitigation; pretending the conversion fixed it would be a second instance of the same error. |
+| 35 | `FreshnessNotice.in_effect`, a boolean retained FOR COMPATIBILITY so the frontend would not break | **The field kept to avoid breaking a consumer carried the exact defect the change was removing, into the only place a user reads.** The `rule_status` change existed because one bit cannot express four states: `in_force`, `scheduled`, `enjoined`, `not_in_force`. Every backend consumer was rekeyed onto the status. `in_effect` was kept anyway, on my instruction, as a compatibility field, and redefined as `is_in_force(rule_status)`. `services/frontend/components/Freshness.tsx` read that one bit and branched two ways on it, so `enjoined` produced `false` and `false` printed "takes effect". **The fix did not fail to reach the frontend. It flipped the falsehood from past tense to future tense**: before the change an enjoined past-dated rule rendered "took effect", after it rendered "takes effect", and both are false. The page then contradicted itself, because the corrected prose sentence rendered one paragraph above the uncorrected structured block. | **Not by any check.** By the user reading the deployed site. Every backend test passed, including six that pin `in_effect` and are still correct; a green assertion on a field whose only consumer misreads it establishes nothing about what the consumer prints. `tsc`, `next lint` and `next build` all pass on the defective code, because it was correctly-typed, lint-clean code rendering wrong copy. **The general form: a compatibility shim is a live consumer of the old model, not a neutral placeholder. Keeping one while migrating everything else off it guarantees exactly one code path still speaks the old vocabulary, and the surface that keeps the shim is the surface that keeps the bug.** The remedy was to delete the field, which forces every consumer to read the status. |
+| 36 | The green CI check, as evidence that a frontend change is sound | **CI has never, in this project's history, run a single frontend test.** Verified by grep across all four workflows that existed before 19 September 2026 (`drift-checks.yml`, `eval.yml`, `fetch-probe.yml`, `recrawl.yml`): not one references node, npm, vitest or jest. There were two frontend test files, `lib/prose.test.ts` and `lib/sources.test.ts`, neither covering a component, and nothing ever executed them. So every green run on every pull request touching the frontend was green about Python only, and read as green about the change. **Recorded separately from entry 35 because it is the reason nothing caught that one**, and it would equally have failed to catch any other frontend defect shipped in this project's life. | **Only by going looking, after entry 35 had already shipped a false claim to production.** The user's standing account is that every frontend change this project shipped went in on their own reading of a Playwright run and nothing else, which is accurate and was not written down anywhere until now. **The narrow form worth keeping: `.github/workflows/` had four files and a reader could reasonably assume breadth from their number.** Nobody had asked which LANGUAGES they covered. The remedy is `frontend.yml`, and its own header records the part that matters: `tsc`, `lint` and `build` would all still have passed on the defective code, so the workflow's contribution is narrow, it is what makes one wording test run. |
 
 
 **A second layer on entry 18, found 12 September.** Entry 18 ends by naming the remedy: read the
@@ -6852,6 +6854,97 @@ them to `sources` and `documents` on every run". Only `documents` is true now. T
 as part of this work, so it was corrected as part of it, with a clause recording that the `sources`
 mirror was removed under Option B. No `url`, `title`, `topic` or annotation value was touched, and the
 manifest still parses to 14 sources with the same three annotation blocks.
+
+## The frontend was still saying "takes effect" about an enjoined rule, and CI could not have known
+
+Found by the user on the deployed site, after the `rule_status` change shipped and after the guard
+was confirmed working. The answer correctly stated the 60-day rule as current and the 30-day rule as
+blocked by a court order, and then, one paragraph below, the freshness block rendered:
+
+    A rule affecting this answer takes effect on September 15, 2026. [the first source], [the second source]
+
+The page contradicted itself. Five days after a court enjoined the rule, the site asserted in its own
+voice that the rule takes effect.
+
+**The cause is not that the frontend was missed.** `services/frontend/components/Freshness.tsx`
+branched two ways on `in_effect`, the boolean kept FOR COMPATIBILITY when everything else was rekeyed
+onto `rule_status`. That bit is `is_in_force(rule_status)`, which for `enjoined` is `false`, and
+`false` in a two-way branch means "takes effect". **The change flipped the falsehood from past tense
+to future tense rather than removing it**: before, the same rule rendered "took effect"; after,
+"takes effect". Instrument table entry 35 has the general form. The frontend's own
+`FreshnessNotice` type never declared `rule_status` at all, so the status was on the wire and
+unreadable by the component that needed it.
+
+**Nothing could have caught it, and the reason is bigger than one component.** No workflow in this
+repository has ever run a frontend test. The four that existed reference no node, npm, vitest or
+jest. The two frontend test files cover library functions, not components. Six backend assertions
+pin `in_effect` and all six pass, correctly; a green assertion on a field whose only consumer
+misreads it says nothing about what that consumer prints. Entry 36.
+
+### What shipped
+
+`in_effect` is DELETED rather than retained. Retention was my instruction and it was wrong for the
+reason the ADR already gave. The six backend assertions were inverted onto `rule_status` rather than
+removed, because the claim still has a subject.
+
+The copy mapping moved out of the component into `services/frontend/lib/freshness.ts`, a pure
+function, with `components/Freshness.tsx` reduced to a renderer holding no wording decision. That was
+forced by a real constraint and is better anyway: the test runner is `node --test lib/*.test.ts`,
+which strips TypeScript types but does not compile JSX, so a component cannot be unit tested without
+new dependencies, and none were added. `lib/sources.ts` and `lib/prose.ts` already establish the
+pattern.
+
+All seven renderings, measured against the shipped code:
+
+    enjoined ev=false   A rule affecting this answer was scheduled to take effect on September 15,
+                        2026. It has since been blocked by a court order and is not in force. That
+                        is recorded by this site's maintainer; the page above does not say it.
+                        [the rule as published]
+    enjoined ev=true    ... A court has blocked it and it is not in force. [the court's order]
+    enjoined, no date   A rule affecting this answer has been blocked by a court order and is not
+                        in force. ... [the rule as published]
+    not_in_force        A rule affecting this answer is not in force. ... [the rule as published]
+    scheduled           A rule affecting this answer takes effect on September 15, 2026, ...
+    in_force            A rule affecting this answer took effect on September 15, 2026, ...
+    UNKNOWN status      This page does not know the status of a rule affecting this answer.
+
+The unknown-status fallback is the part that matters for the next state somebody adds. It never says
+"took effect" or "takes effect", so a status this frontend has not been taught cannot repeat this
+defect; it degrades to naming its own ignorance.
+
+**The regression test was mutation-checked, not trusted.** Neutralising the `enjoined` branch so it
+falls through to the took/takes-effect wording, which is precisely the live defect:
+
+    baseline   tests 53   pass 53   fail 0
+    mutant     tests 53   pass 47   fail 6
+
+Six tests die, including the one named for this defect, which asserts an `enjoined` notice's text
+contains neither "takes effect" nor "took effect". Written as an absence check over both phrases
+rather than the one observed, and shipped with a control feeding it the real pre-fix string.
+
+`.github/workflows/frontend.yml` runs `npm ci`, `tsc --noEmit`, `next lint`, `npm test`, `next
+build`. **Its header records the part that is easy to get wrong**: none of tsc, lint or build would
+have caught this. All three pass on the defective code, because it was correct TypeScript rendering
+wrong copy. The workflow's contribution is narrow and specific, it is what makes one wording test
+run.
+
+### Recorded, deliberately not fixed: the rule is final, and the system cannot say so
+
+The generated answer called the enjoined rule "a proposed rule". It is a final rule that a court
+blocked. The prompt annotation never uses the word "proposed", but it never says "final" either, and
+the only thing it tells the model about the rule's standing is a future-tense event that did not
+happen:
+
+    This passage describes a rule that was scheduled to take effect on September 15, 2026 but is
+    blocked by a court order and is not in force today, September 19, 2026. Do not state its
+    figures as current.
+
+So `enjoined` on a final rule and `enjoined` on a proposed one render identically today, and nothing
+in the annotation pulls the model away from "proposed". **A finality axis is a second vocabulary
+decision and is deliberately not riding along with this fix.** It is recorded here so the next person
+finds it as a known gap rather than as a model quirk.
+
+---
 
 ---
 

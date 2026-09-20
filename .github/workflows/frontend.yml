@@ -1,0 +1,57 @@
+name: Frontend checks
+
+# WHY THIS FILE EXISTS. Before 19 September 2026 NO workflow in this repository ran any frontend
+# check at all -- verified by grep: none of the four workflows that existed before this one
+# (drift-checks.yml, eval.yml, fetch-probe.yml, recrawl.yml) reference node, npm, vitest, or jest
+# anywhere. That is why an enjoined rule rendered as "A rule affecting this answer takes effect on
+# September 15, 2026" on the live site with every check green: nothing in CI ever ran the frontend
+# at all, so nothing could have caught it there, green or red.
+#
+# CRUCIALLY, adding this workflow is not the same claim as "this would have caught that bug".
+# `tsc --noEmit`, `next lint`, and `next build` all still pass, unmodified, on the code that
+# rendered the wrong sentence: `notice.in_effect` was a real, correctly-typed `boolean`, read by
+# well-typed, lint-clean code, and it built without error. The defect was CORRECT TypeScript
+# rendering WRONG COPY -- a boolean that collapsed `enjoined`, `scheduled`, and `not_in_force` into
+# the identical `false`, so the type system, the linter, and the bundler had nothing to flag. Only
+# `lib/freshness.test.ts` -- specifically its regression test asserting an `enjoined` notice's text
+# never contains "takes effect" or "took effect" -- exercises the actual wording and would have
+# failed on the pre-fix code. This workflow's real contribution is narrow and specific: it is what
+# makes `npm test` (and therefore that one test) run on every pull request and push, not a general
+# guarantee that type-checking or linting would have caught this class of bug. They would not have.
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  frontend:
+    name: tsc, lint, test, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/frontend
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: services/frontend/package-lock.json
+
+      - name: Install dependencies (npm ci, from the committed lockfile)
+        run: npm ci
+
+      - name: Type check (tsc --noEmit)
+        run: npx tsc --noEmit
+
+      - name: Lint (next lint)
+        run: npm run lint
+
+      - name: Unit tests (node --test lib/*.test.ts)
+        run: npm test
+
+      - name: Build (next build)
+        run: npm run build

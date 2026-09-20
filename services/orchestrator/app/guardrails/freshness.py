@@ -254,9 +254,6 @@ def build_freshness(
                 rule_status=chunk.rule_status,
                 rule_status_source=chunk.rule_status_source,
                 rule_status_source_evidences_status=chunk.rule_status_source_evidences_status,
-                # Curator-stated (app/rule_status.py::is_in_force), never a date comparison -- see
-                # this module's docstring, "CURATOR-STATED FORCE".
-                in_effect=is_in_force(chunk.rule_status),
                 reason=reason,
             )
         )
@@ -418,9 +415,12 @@ def freshness_notice_text(notices: list[FreshnessNotice], *, today: date) -> str
         elif rule_effective_date is not None:
             # `in_force` or `scheduled` (or a legacy/unsynced row with rule_status None but a date
             # -- see app/schemas.py::FreshnessNotice's own docstring on why that combination can
-            # transiently exist), both wordings UNCHANGED from before this fix.
-            in_effect = is_in_force(rule_status)
-            verb_phrase = "took effect on" if in_effect else "takes effect on"
+            # transiently exist), both wordings UNCHANGED from before this fix. Named
+            # `rule_in_force`, not `in_effect` -- `FreshnessNotice.in_effect` was removed 2026-09-19
+            # (see that class's own docstring); this local is unrelated to that removed field, it
+            # only picks the verb tense below, so it must never read as though it were that field.
+            rule_in_force = is_in_force(rule_status)
+            verb_phrase = "took effect on" if rule_in_force else "takes effect on"
             sentences.append(
                 f"{subject} a rule that {verb_phrase} {_format_date(rule_effective_date)}, so the "
                 f"answer differs before and after that date. See {_join_source_links(source_urls)}."
