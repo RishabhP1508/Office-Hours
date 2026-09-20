@@ -26,6 +26,20 @@ class RetrievedChunk:
     heading_level: int
     page_last_updated: date | None
     rule_effective_date: date | None
+    # Curator-stated force (docs/adr/0023-curator-rule-status.md): rule_status is the input every
+    # consumer uses to decide "is this rule in force" (app/rule_status.py::is_in_force); the
+    # companions CTE below still keys on rule_effective_date alone, unchanged, and is untouched by
+    # this pair. rule_status_source is the URL a notice built from an enjoined/not_in_force chunk
+    # must link, so the system never asserts a court order or a withdrawal in its own uncited voice.
+    rule_status: str | None
+    rule_status_source: str | None
+    # Whether rule_status_source actually documents the STATUS (a court's order) or merely the rule
+    # the status is ABOUT (e.g. the Federal Register notice for the rule itself) -- see
+    # app/rule_status.py::validate_rule_status and docs/adr/0023-curator-rule-status.md. Curator-
+    # stated, never inferred from the URL; `None` only when rule_status_source itself is `None`
+    # (validate_rule_status requires this field whenever rule_status_source is set) or for a
+    # legacy/unsynced row written before this column existed.
+    rule_status_source_evidences_status: bool | None
     fetched_at: datetime
     last_verified_at: datetime
     distance: float
@@ -189,12 +203,14 @@ companions AS (
 -- precisely because the FK makes "no matching sources row" a schema violation, not a real case this
 -- query needs to tolerate.
 SELECT id, content, source_url, resolved_url, section_heading, heading_level, page_last_updated,
-       rule_effective_date, fetched_at, last_verified_at, distance, rrf_score, semantic_rank,
-       keyword_rank, retrieved_by
+       rule_effective_date, rule_status, rule_status_source, rule_status_source_evidences_status,
+       fetched_at, last_verified_at, distance, rrf_score, semantic_rank, keyword_rank, retrieved_by
 FROM (
     SELECT
         d.id, d.content, d.source_url, s.resolved_url, d.section_heading, d.heading_level,
-        s.page_last_updated, d.rule_effective_date, s.fetched_at, s.last_verified_at,
+        s.page_last_updated, d.rule_effective_date, d.rule_status, d.rule_status_source,
+        d.rule_status_source_evidences_status,
+        s.fetched_at, s.last_verified_at,
         d.embedding <=> %(embedding)s AS distance,
         t.rrf_score, t.semantic_rank, t.keyword_rank,
         'fusion' AS retrieved_by,
@@ -207,7 +223,9 @@ FROM (
 
     SELECT
         d.id, d.content, d.source_url, s.resolved_url, d.section_heading, d.heading_level,
-        s.page_last_updated, d.rule_effective_date, s.fetched_at, s.last_verified_at,
+        s.page_last_updated, d.rule_effective_date, d.rule_status, d.rule_status_source,
+        d.rule_status_source_evidences_status,
+        s.fetched_at, s.last_verified_at,
         d.embedding <=> %(embedding)s AS distance,
         COALESCE(f.rrf_score, 0) AS rrf_score, f.semantic_rank, f.keyword_rank,
         'dated_companion' AS retrieved_by,

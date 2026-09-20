@@ -114,16 +114,45 @@ class FreshnessSource(BaseModel):
 
 
 class FreshnessNotice(BaseModel):
-    """A distinct retrieved source states a dated rule -- for example the DHS fixed-period-of-
-    admission final rule, effective 2026-09-15. Red-team fix (2026-09-07): every distinct retrieved
-    source carrying a `rule_effective_date` gets a notice now, regardless of rank or citation (see
+    """A distinct retrieved source states a dated, contested, or no-longer-in-force rule -- for
+    example the DHS fixed-period-of-admission final rule, enjoined 2026-09-14 (docs/adr/0023-
+    curator-rule-status.md). Red-team fix (2026-09-07): every distinct retrieved source carrying a
+    `rule_status` OR a `rule_effective_date` gets a notice now, regardless of rank or citation (see
     app/guardrails/freshness.py::build_freshness's module docstring, "WHY THAT GATE WAS
     OVERRIDDEN") -- `reason` is no longer a qualifying condition, only a descriptive fact about how
     this source related to this particular retrieval and generation.
 
-    `in_effect` is `rule_effective_date <= as_of`, computed once in build_freshness so every
-    consumer (the API response, the appended answer text) agrees on the same verdict. `reason` is
-    exactly one of:
+    `rule_effective_date` is now OPTIONAL: `enjoined` and `not_in_force` may carry none at all (see
+    app/rule_status.py's own vocabulary table), and a notice must still fire for one of those with
+    no date (see build_freshness's own docstring). `rule_status` is the curator-stated value
+    (`app/rule_status.py::RuleStatus`) this notice is actually reporting on; it is `None` only for a
+    row stored before this column existed and not yet re-synced (see the migration note in
+    infra/sql/init.sql) -- a genuinely unannotated, ordinary source never reaches this class at all
+    (build_freshness skips it). `rule_status_source` is the citable URL a curator gave for
+    `enjoined`/`not_in_force` (required for those two by app/rule_status.py::validate_rule_status),
+    so the rendered sentence can link the court order or withdrawal notice instead of asserting it
+    in this system's own uncited voice; `None` for `in_force`/`scheduled`, where nothing needs
+    citing beyond the source itself.
+
+    `rule_status_source_evidences_status` (2026-09-19, docs/adr/0023-curator-rule-status.md) is
+    curator-stated, never inferred from the URL: whether `rule_status_source` actually documents the
+    STATUS (a court's order) or merely the rule the status is ABOUT (e.g. the Federal Register
+    notice for the rule itself). Required whenever `rule_status_source` is set
+    (app/rule_status.py::validate_rule_status); `None` when `rule_status_source` itself is `None`,
+    or for a legacy/unsynced row written before this column existed.
+    app/guardrails/freshness.py::freshness_notice_text branches the enjoined/not_in_force wording on
+    this field so a link is never captioned as evidence of a status the linked page does not
+    actually state.
+
+    `in_effect` is RETAINED FOR COMPATIBILITY (services/frontend/components/Freshness.tsx and
+    lib/api.ts both read it) and is now DERIVED FROM `rule_status` via
+    `app/rule_status.py::is_in_force`, never from a date comparison -- see that function's own
+    docstring for why `None`/`in_force` both read True. Before 2026-09-19 this field WAS the force
+    decision (`rule_effective_date <= as_of`); it is now a projection of `rule_status`, kept so
+    nothing reading only this one bit breaks, computed by the same predicate every other consumer
+    uses so it cannot itself drift into a second, independent force decision.
+
+    `reason` is exactly one of:
       `"top_ranked"` -- this source's chunk was the single highest-ranked retrieved chunk.
       `"cited"` -- the generated answer's bracket citations referenced a chunk from this source
           (and it was not top-ranked).
@@ -137,7 +166,10 @@ class FreshnessNotice(BaseModel):
     """
 
     source_url: str
-    rule_effective_date: date
+    rule_effective_date: date | None
+    rule_status: str | None = None
+    rule_status_source: str | None = None
+    rule_status_source_evidences_status: bool | None = None
     in_effect: bool
     reason: Literal["top_ranked", "cited", "retrieved"]
 

@@ -45,18 +45,24 @@ THE BLAST RADIUS, stated exhaustively because this is the first tool outside app
 app/recrawl.py to write `documents` at all:
 
     WRITES, and nothing else:
-        documents.rule_effective_date   (N rows per annotated source, one per chunk)
+        documents.rule_effective_date               (N rows per annotated source, one per chunk)
+        documents.rule_status                       (same N rows, same one UPDATE -- see below)
+        documents.rule_status_source                (same N rows, same one UPDATE -- see below)
+        documents.rule_status_source_evidences_status (same N rows, same one UPDATE -- see below)
 
     READS ONLY:
-        documents.rule_effective_date   (to compute the before/after diff, and to tell a source
+        documents.rule_effective_date, documents.rule_status, documents.rule_status_source,
+        documents.rule_status_source_evidences_status
+                                         (to compute the before/after diff, and to tell a source
                                          that is absent from the corpus from one that is present)
 
     TOUCHES THE `sources` TABLE NOT AT ALL. It used to write `sources.rule_effective_date` and
     read the before-value from there. Both were removed on 19 September 2026 under Option B: that
     column is never being added to production, so every statement against it raised
-    UndefinedColumn and the tool could not run. `documents.rule_effective_date` is the one
-    retrieval actually reads (app/db.py selects `d.rule_effective_date`), and was always the
-    load-bearing copy.
+    UndefinedColumn and the tool could not run. None of the other three has ever had a `sources`
+    mirror at all. `documents` is the one table retrieval actually reads (app/db.py selects
+    `d.rule_effective_date`, `d.rule_status`, `d.rule_status_source`,
+    `d.rule_status_source_evidences_status`), and was always the load-bearing copy.
 
     NEVER TOUCHED, by construction -- these columns appear in no UPDATE in this file:
         every column of `sources` without exception, plus documents.content,
@@ -66,12 +72,18 @@ No row is ever INSERTed and no row is ever DELETEd. A manifest entry whose `sour
 `sources` row is reported and skipped, never created: this tool syncs annotations onto an existing
 corpus and is not an ingest.
 
-ONLY `rule_effective_date` IS SYNCED, because it is the only annotation with a database column.
-`federal_register`, `heading_note` and `note` are human-facing and live in the manifest only;
-nothing in services/ or eval/ reads them. When a new annotation gains a column (the injunction
-status field is the expected next one), it has to be added to the two UPDATE statements below AND
-to the blast-radius list above, which stops being true the moment a column is written that it does
-not name.
+ALL FOUR ANNOTATIONS WITH A DATABASE COLUMN ARE SYNCED TOGETHER, in one UPDATE per source
+(2026-09-19, docs/adr/0023-curator-rule-status.md -- this docstring used to say a fourth annotation
+gaining a column would need this treatment; `rule_status_source_evidences_status` is that fourth
+one, added the same day `rule_status_source` itself gained the requirement that it never travel
+without one). `federal_register`, `heading_note` and `note` remain human-facing and live in the
+manifest only; nothing in services/ or eval/ reads them. Each is also VALIDATED here, at sync time,
+the same way app/ingest.py and app/recrawl.py validate at load time (`app/rule_status.py::
+validate_rule_status`) -- a curator's manifest edit that would be a hard error at the next ingest
+is refused here too, immediately, rather than accepted and left for the next full re-ingest to
+discover. When a FIFTH annotation gains a column, it has to be added to the one UPDATE/SELECT pair
+below AND to the blast-radius list above, which stops being true the moment a column is written
+that it does not name.
 
 Runnable as:
 
@@ -97,41 +109,107 @@ from pathlib import Path
 import psycopg
 
 from app.config import Settings, get_settings
-from app.ingest import manifest_annotation, read_manifest
+from app.ingest import (
+    manifest_annotation,
+    manifest_annotation_bool,
+    manifest_annotation_str,
+    read_manifest,
+)
+from app.rule_status import validate_rule_status
 
 # `manifest_annotation` is re-exported from here (rather than only importable from app.ingest)
 # because it is public API of this module today -- tests/test_sync_annotations.py, and any other
 # caller written before 19 September 2026, imports it as `from app.sync_annotations import
 # manifest_annotation`. The single definition now lives in app/ingest.py (see that function's own
 # docstring for why it moved); this import keeps the old spelling working without a second copy of
-# the logic.
+# the logic. `manifest_annotation_str` (`rule_status`/`rule_status_source`, plain strings, no date
+# parsing) is the same shape of import, added 19 September 2026 alongside the second and third
+# synced annotation. `manifest_annotation_bool` (`rule_status_source_evidences_status`, an
+# uncoerced value so a non-boolean curator mistake still raises) is the same shape again, added
+# alongside the fourth.
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("sync_annotations")
 
 # Deliberately NOT a list of synced annotation names here. There was one, and it was decorative:
-# nothing read it, while the real list lived in the two UPDATE statements below, so a reader could
-# have added a name to it and believed something would happen. `rule_effective_date` is the only
-# annotation with a database column, it is named explicitly at each site that uses it, and the
-# module docstring says what to do when a second one arrives.
+# nothing read it, while the real list lived in the SELECT/UPDATE statements below, so a reader
+# could have added a name to it and believed something would happen. `rule_effective_date`,
+# `rule_status`, `rule_status_source`, and `rule_status_source_evidences_status` are the four
+# annotations with a database column, each is named explicitly at each site that uses it, and the
+# module docstring says what to do when a fifth arrives.
+
+
+#: `(rule_effective_date, rule_status, rule_status_source,
+#: rule_status_source_evidences_status)`, in the fixed column order every SELECT and UPDATE in this
+#: module uses -- one small tuple rather than four parallel scalar fields on `SourceDiff`, so a
+#: before/after pair can be compared, logged, and passed to `set(...)` (the mixed-chunk check below)
+#: as a single unit, the same way the four columns move as a unit in the one UPDATE that actually
+#: writes them.
+Annotations = tuple[date | None, str | None, str | None, bool | None]
+
+_NULL_ANNOTATIONS: Annotations = (None, None, None, None)
+
+
+def _render_annotations(values: Annotations) -> str:
+    """Log-friendly rendering of an `Annotations` tuple: `NULL` when all four are unset (the
+    common case for 12 of 14 sources), otherwise `date|status|status_source|evidences` with each
+    empty slot shown as `-` so a partial annotation (a status with no date, or vice versa) is never
+    mistaken for a fully-NULL one at a glance. `rule_status_source_evidences_status` renders as the
+    literal string `"True"`/`"False"` (via `str()`), never as `-`, unless it is actually `None` --
+    `-` must mean "unset", not "False", or a curator reading this log could not tell the two apart.
+    """
+    rule_effective_date, rule_status, rule_status_source, rule_status_source_evidences_status = (
+        values
+    )
+    if values == _NULL_ANNOTATIONS:
+        return "NULL"
+    return "|".join(
+        part if part is not None else "-"
+        for part in (
+            rule_effective_date.isoformat() if rule_effective_date else None,
+            rule_status,
+            rule_status_source,
+            (
+                None
+                if rule_status_source_evidences_status is None
+                else str(rule_status_source_evidences_status)
+            ),
+        )
+    )
+
+
+def _annotations_to_dict(values: Annotations) -> dict:
+    rule_effective_date, rule_status, rule_status_source, rule_status_source_evidences_status = (
+        values
+    )
+    return {
+        "rule_effective_date": rule_effective_date.isoformat() if rule_effective_date else None,
+        "rule_status": rule_status,
+        "rule_status_source": rule_status_source,
+        "rule_status_source_evidences_status": rule_status_source_evidences_status,
+    }
 
 
 @dataclass
 class SourceDiff:
-    """What this tool would do, or did, to one manifest entry."""
+    """What this tool would do, or did, to one manifest entry. `before`/`after` each carry all
+    four synced annotations together (`Annotations`), since 2026-09-19 -- see that type's own
+    comment for why a single tuple, not four parallel fields.
+    """
 
     source_url: str
-    before: date | None = None
-    after: date | None = None
+    before: Annotations = _NULL_ANNOTATIONS
+    after: Annotations = _NULL_ANNOTATIONS
     changed: bool = False
     documents_rows: int = 0
     # No chunks in `documents` for this source_url: it is in the manifest but not in the corpus.
     # Renamed from `missing_sources_row` on 19 September 2026, when the read moved off `sources`
     # onto `documents` -- the old name described a `sources` row this tool no longer looks at.
     not_in_corpus: bool = False
-    # True when this source's chunks do NOT all carry the same rule_effective_date. Impossible to
-    # observe while the value was read from `sources` (one row, one value), and worth surfacing
-    # rather than silently flattening: it means a previous partial write left the source split.
+    # True when this source's chunks do NOT all carry the same (rule_effective_date, rule_status,
+    # rule_status_source, rule_status_source_evidences_status) tuple. Impossible to observe while
+    # the value was read from `sources` (one row, one value), and worth surfacing rather than
+    # silently flattening: it means a previous partial write left the source split.
     before_is_mixed: bool = False
 
 
@@ -157,8 +235,8 @@ class SyncReport:
             "details": [
                 {
                     "source_url": d.source_url,
-                    "before": d.before.isoformat() if d.before else None,
-                    "after": d.after.isoformat() if d.after else None,
+                    "before": _annotations_to_dict(d.before),
+                    "after": _annotations_to_dict(d.after),
                     "changed": d.changed,
                     "documents_rows": d.documents_rows,
                     "not_in_corpus": d.not_in_corpus,
@@ -175,7 +253,17 @@ def sync_annotations(
     *,
     dry_run: bool = False,
 ) -> SyncReport:
-    """Sync `rule_effective_date` from `manifest` onto the matching `documents` rows.
+    """Sync `rule_effective_date`, `rule_status`, `rule_status_source`, and
+    `rule_status_source_evidences_status` from `manifest` onto the matching `documents` rows -- all
+    four together, in one UPDATE per source, since they are one curator annotation, not four
+    independent ones (2026-09-19, docs/adr/0023-curator-rule-status.md).
+
+    Each entry's desired values are VALIDATED (`app/rule_status.py::validate_rule_status`) before
+    anything is read or written for it -- a manifest mistake (a date with no status, an unknown
+    status, a state/date mismatch, a missing `rule_status_source` for `enjoined`/`not_in_force`, or
+    a `rule_status_source` with no or non-boolean `rule_status_source_evidences_status`) is refused
+    here exactly as loudly as it would be at the next full ingest, rather than pushed to production
+    and left for that later run to catch.
 
     One transaction per source, wrapping the read and the write, so each source is durable the
     moment the loop moves on rather than riding an ambient transaction that some later unrelated
@@ -187,22 +275,43 @@ def sync_annotations(
 
     for entry in manifest:
         source_url = entry["url"]
-        desired = manifest_annotation(entry, "rule_effective_date")
+        desired_date = manifest_annotation(entry, "rule_effective_date")
+        desired_status = manifest_annotation_str(entry, "rule_status")
+        desired_status_source = manifest_annotation_str(entry, "rule_status_source")
+        desired_status_source_evidences_status = manifest_annotation_bool(
+            entry, "rule_status_source_evidences_status"
+        )
+        validate_rule_status(
+            source_url=source_url,
+            rule_status=desired_status,
+            rule_effective_date=desired_date,
+            rule_status_source=desired_status_source,
+            rule_status_source_evidences_status=desired_status_source_evidences_status,
+            today=date.today(),
+        )
+        desired: Annotations = (
+            desired_date,
+            desired_status,
+            desired_status_source,
+            desired_status_source_evidences_status,
+        )
         diff = SourceDiff(source_url=source_url, after=desired)
 
         with conn.transaction():
             with conn.cursor() as cur:
                 # Reads `documents`, not `sources`. That is not a stylistic choice: under Option B
-                # `sources.rule_effective_date` is never added to production, so a SELECT against
-                # it raises UndefinedColumn and this tool could not run at all. `documents` is also
-                # the correct place to read from on the merits -- it is what retrieval actually
-                # uses (app/db.py selects `d.rule_effective_date`), so it is the value whose
-                # before-and-after a curator cares about.
+                # none of these four columns is ever added to production `sources`, so a SELECT
+                # against it raises UndefinedColumn and this tool could not run at all. `documents`
+                # is also the correct place to read from on the merits -- it is what retrieval
+                # actually uses (app/db.py selects `d.rule_effective_date`, `d.rule_status`,
+                # `d.rule_status_source`, `d.rule_status_source_evidences_status`), so it is the
+                # value whose before-and-after a curator cares about.
                 cur.execute(
-                    "SELECT DISTINCT rule_effective_date FROM documents WHERE source_url = %s",
+                    "SELECT DISTINCT rule_effective_date, rule_status, rule_status_source, "
+                    "rule_status_source_evidences_status FROM documents WHERE source_url = %s",
                     (source_url,),
                 )
-                existing = [row[0] for row in cur.fetchall()]
+                existing = [tuple(row) for row in cur.fetchall()]
 
                 if not existing:
                     diff.not_in_corpus = True
@@ -214,20 +323,18 @@ def sync_annotations(
                     )
                     continue
 
-                # Normally every chunk of a source carries the same date, so `existing` holds one
-                # value. More than one means a previous write reached only part of the source; the
-                # tool treats that as needing a sync (the set is not {desired}) and says so, rather
-                # than picking one of them to call "before".
+                # Normally every chunk of a source carries the same tuple, so `existing` holds
+                # one value. More than one means a previous write reached only part of the source;
+                # the tool treats that as needing a sync (the set is not {desired}) and says so,
+                # rather than picking one of them to call "before".
                 diff.before_is_mixed = len(existing) > 1
-                diff.before = existing[0] if len(existing) == 1 else None
+                diff.before = existing[0] if len(existing) == 1 else _NULL_ANNOTATIONS
                 current = diff.before
 
                 if set(existing) == {desired}:
                     report.diffs.append(diff)
                     logger.info(
-                        "%s: already %s -- no write",
-                        source_url,
-                        desired.isoformat() if desired else "NULL",
+                        "%s: already %s -- no write", source_url, _render_annotations(desired)
                     )
                     continue
 
@@ -242,27 +349,30 @@ def sync_annotations(
                     logger.info(
                         "[dry-run] %s: %s -> %s (%d documents rows)",
                         source_url,
-                        current.isoformat() if current else "NULL",
-                        desired.isoformat() if desired else "NULL",
+                        _render_annotations(current),
+                        _render_annotations(desired),
                         diff.documents_rows,
                     )
                     continue
 
-                # ONE table. The `UPDATE sources SET rule_effective_date` that used to run here
+                # ONE table, ONE UPDATE, all four columns together -- see the module docstring's
+                # BLAST RADIUS. The `UPDATE sources SET rule_effective_date` that used to run here
                 # was removed on 19 September 2026: under Option B that column never arrives in
                 # production, and `documents` is the one retrieval reads. Same removal, and the
                 # same reason, as app/backfill_source_bodies.py's.
                 cur.execute(
-                    "UPDATE documents SET rule_effective_date = %s WHERE source_url = %s",
-                    (desired, source_url),
+                    "UPDATE documents SET rule_effective_date = %s, rule_status = %s, "
+                    "rule_status_source = %s, rule_status_source_evidences_status = %s "
+                    "WHERE source_url = %s",
+                    (*desired, source_url),
                 )
                 diff.documents_rows = cur.rowcount
                 report.diffs.append(diff)
                 logger.info(
                     "%s: %s -> %s (%d documents rows)",
                     source_url,
-                    current.isoformat() if current else "NULL",
-                    desired.isoformat() if desired else "NULL",
+                    _render_annotations(current),
+                    _render_annotations(desired),
                     diff.documents_rows,
                 )
 

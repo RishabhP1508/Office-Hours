@@ -80,11 +80,35 @@ the same discipline app/guardrails/freshness.py::build_freshness already follows
 fix, byte-for-byte. Rules 4/1 were sharpened to bind explicitly to this note rather than to the
 vaguer "current rule and a dated replacement" language alone, so the instruction and the thing it
 is instructing about now use the same vocabulary.
+
+**THE PROMPT RULE 4 TRAP (2026-09-19, docs/adr/0023-curator-rule-status.md).** `_rule_date_note`
+used to be a two-branch function of `rule_effective_date` and `today` alone: past-or-today rendered
+"took effect on", future rendered "takes effect on". Rule 4 (SYSTEM_PROMPT) / rule 1
+(REFUSAL_SYSTEM_PROMPT) are anchored on the LITERAL PHRASES "took effect on" and "takes effect on"
+-- that is how the model is told which passage is the dated one at all. Curator-stated force
+(`app/rule_status.py::RuleStatus`) adds two states neither phrase can honestly describe: an
+`enjoined` rule may never take effect, or may take effect on a date other than the one DHS
+published, so "takes effect on <date>" would be a plain false statement about it; a `not_in_force`
+rule is not "taking effect" on any date at all. Adding those states to `_rule_date_note` WITHOUT
+adding their phrasing to rule 4/rule 1's own anchor text would have reintroduced exactly the defect
+this file's own instrument table already recorded once: a rule referencing a passage annotation the
+model is never told how to read is unanswerable, not disobeyed. Both prompts were extended (new
+sentences, existing sentences and their anchor phrases left untouched -- see
+app/guardrails/prompt_leak.py's `RULE_SPANS`, which pins several of those exact sentences as
+leak-detection markers) to name the two new note phrases ("blocked by a court order", "is not in
+force") the same way they already name "took effect on"/"takes effect on". The four note templates
+below (`_NOTE_IN_FORCE_TEMPLATE` etc.) are named module-level constants specifically so
+`tests/test_guardrails.py`'s parametrized test over all four `RuleStatus` values can assert, for
+each one, that the phrase its rendered note actually contains is also literally present in the
+prompt that is supposed to explain it -- so a fifth status added to `_rule_date_note` without
+teaching rule 4/rule 1 about it fails that test rather than shipping silently unreadable.
 """
 
 import hashlib
 import re
 from datetime import UTC, date, datetime
+
+from app.rule_status import RuleStatus
 
 SYSTEM_PROMPT = """You are Office Hours, an assistant that answers factual questions about F-1, \
 OPT, STEM OPT, and H-1B immigration rules for international students and workers.
@@ -108,7 +132,10 @@ state the current rule together with the date it applies until, and the replacem
 with the date it takes effect, using each passage's own dates. Never state a single fact as though \
 only one rule applied at all times when the passages mark a dated replacement for it. If every \
 passage on the topic shares the same effective-date status, or none of them carry the note at all, \
-state the rule that is actually there.
+state the rule that is actually there. Some passages instead carry a note that a rule "is blocked \
+by a court order" or "is not in force" today: treat that passage's figures as NOT the rule in \
+force, no matter what date the passage names, state the rule that IS in force instead, and if you \
+mention the blocked or not-in-force rule at all, say plainly that it is not in force.
 5. Never give advice. Do not tell the reader what they personally should do, whether a filing \
 will be approved, or which status or path is best for them. State what the rule says and where it \
 is written, and stop there.
@@ -138,8 +165,12 @@ note that the rule they describe "took effect on <date>" (on or before today) or
 on" future-dated passage with a passage on the same topic that carries no such note, or a "took \
 effect on" note, state both the current rule (with the date it applies until) and the replacement \
 rule (with the date it takes effect) -- never state a single fact as though only one rule applied \
-at all times when the passages mark a dated replacement for it. Use a plain ASCII bracket like \
-[2] -- never a full-width bracket citation like 【1†source】, and never any other citation format. \
+at all times when the passages mark a dated replacement for it. Some passages instead carry a note \
+that a rule "is blocked by a court order" or "is not in force" today: treat that passage's figures \
+as NOT the rule in force, no matter what date the passage names, state the rule that IS in force \
+instead, and if you mention the blocked or not-in-force rule at all, say plainly that it is not in \
+force. Use a plain ASCII bracket like [2] -- never a full-width bracket citation like \
+【1†source】, and never any other citation format. \
 Cite only a number that appears in the context, and never invent one. Never paste a URL into your \
 answer text, and never add a "Source URLs:" list, a "Sources:" section, or any similar trailing \
 list -- the interface renders citations separately from your answer text.
@@ -224,23 +255,88 @@ def _format_date(value: date) -> str:
     return f"{value:%B} {value.day}, {value.year}"
 
 
-def _rule_date_note(rule_effective_date: date, today: date) -> str:
+# The note templates `_rule_date_note` below chooses among, one per `app/rule_status.py::
+# RuleStatus` value (plus a with-date/no-date pair for `enjoined`/`not_in_force`, since neither
+# state requires a `rule_effective_date` -- see that module's own vocabulary table). Named
+# module-level constants, not inline literals in `_rule_date_note`'s branches, per this module's own
+# docstring, "THE PROMPT RULE 4 TRAP": these are exactly what
+# tests/test_guardrails.py's parametrized `format_context` test checks against SYSTEM_PROMPT's own
+# text, for every status this module is taught about.
+#
+# `enjoined`/`not_in_force` never say "takes effect on" or "took effect on": both phrases assert
+# the rule has (or will have) legal effect on a specific date, which is false for a rule a court has
+# blocked (it may never take effect, or take effect on a different date than DHS published) and for
+# one that has been vacated or withdrawn (it is not "taking effect" on any date at all).
+_NOTE_IN_FORCE_TEMPLATE = (
+    "This passage describes a rule that took effect on {date} (on or before today, {today})."
+)
+_NOTE_IN_FORCE_NO_DATE_TEMPLATE = "This passage describes a rule that is in force today, {today}."
+_NOTE_SCHEDULED_TEMPLATE = (
+    "This passage describes a rule that takes effect on {date} (after today, {today})."
+)
+_NOTE_ENJOINED_WITH_DATE_TEMPLATE = (
+    "This passage describes a rule that was scheduled to take effect on {date} but is blocked by "
+    "a court order and is not in force today, {today}. Do not state its figures as current."
+)
+_NOTE_ENJOINED_NO_DATE_TEMPLATE = (
+    "This passage describes a rule that is blocked by a court order and is not in force today, "
+    "{today}. Do not state its figures as current."
+)
+_NOTE_NOT_IN_FORCE_WITH_DATE_TEMPLATE = (
+    "This passage describes a rule dated {date} that is not in force today, {today}. Do not state "
+    "its figures as current."
+)
+_NOTE_NOT_IN_FORCE_NO_DATE_TEMPLATE = (
+    "This passage describes a rule that is not in force today, {today}. Do not state its figures "
+    "as current."
+)
+
+
+def _rule_date_note(
+    rule_status: str | None, rule_effective_date: date | None, *, today: date
+) -> str:
     """The mechanically-generated note `format_context` appends to a passage whose chunk carries a
-    `rule_effective_date` (red-team fix, see this module's docstring). Wording is derived only from
-    the date and whether it has passed relative to `today` -- never a hardcoded description of what
-    the rule changed -- so this stays correct for any future dated rule the corpus picks up, the
-    same discipline app/guardrails/freshness.py::freshness_notice_text already follows.
+    `rule_status` or a `rule_effective_date` (red-team fix, see this module's docstring). Wording is
+    chosen from `rule_status` (2026-09-19: previously from `rule_effective_date` compared against
+    `today` alone -- see this module's docstring, "THE PROMPT RULE 4 TRAP") -- never a hardcoded
+    description of what the rule changed -- so this stays correct for any future dated or contested
+    rule the corpus picks up, the same discipline app/guardrails/freshness.py::freshness_notice_text
+    already follows.
+
+    `rule_status=None` (no annotation on this exact field, but `format_context`'s caller already
+    established that at least one of the two is set) is treated as `in_force`, the same
+    None-means-in-force reading `app/rule_status.py::is_in_force` gives every other consumer -- this
+    is the "explicit in_force" and "legacy/unsynced row carrying a date but not yet re-synced onto
+    `rule_status`" cases folding into the one wording that is accurate for both.
     """
-    date_str = _format_date(rule_effective_date)
+    date_str = _format_date(rule_effective_date) if rule_effective_date is not None else None
     today_str = _format_date(today)
-    if rule_effective_date <= today:
-        return (
-            f"This passage describes a rule that took effect on {date_str} "
-            f"(on or before today, {today_str})."
-        )
-    return (
-        f"This passage describes a rule that takes effect on {date_str} "
-        f"(after today, {today_str})."
+    status = rule_status or RuleStatus.IN_FORCE.value
+
+    if status == RuleStatus.IN_FORCE.value:
+        if date_str is None:
+            return _NOTE_IN_FORCE_NO_DATE_TEMPLATE.format(today=today_str)
+        return _NOTE_IN_FORCE_TEMPLATE.format(date=date_str, today=today_str)
+    if status == RuleStatus.SCHEDULED.value:
+        if date_str is None:
+            # Contract violation defensively handled: app/rule_status.py::validate_rule_status
+            # requires a date for 'scheduled' at load time, so this should never happen. Degrade to
+            # an accurate, undated "not in force" statement instead of crashing a live request or
+            # fabricating a date scheduled never had.
+            return _NOTE_NOT_IN_FORCE_NO_DATE_TEMPLATE.format(today=today_str)
+        return _NOTE_SCHEDULED_TEMPLATE.format(date=date_str, today=today_str)
+    if status == RuleStatus.ENJOINED.value:
+        if date_str is None:
+            return _NOTE_ENJOINED_NO_DATE_TEMPLATE.format(today=today_str)
+        return _NOTE_ENJOINED_WITH_DATE_TEMPLATE.format(date=date_str, today=today_str)
+    if status == RuleStatus.NOT_IN_FORCE.value:
+        if date_str is None:
+            return _NOTE_NOT_IN_FORCE_NO_DATE_TEMPLATE.format(today=today_str)
+        return _NOTE_NOT_IN_FORCE_WITH_DATE_TEMPLATE.format(date=date_str, today=today_str)
+    raise ValueError(
+        f"app/prompts.py::_rule_date_note has no wording for rule_status={rule_status!r} -- add "
+        "one (and teach rule 4/rule 1 about it -- see this module's docstring, \"THE PROMPT RULE 4 "
+        'TRAP") before this status can reach the model.'
     )
 
 
@@ -250,19 +346,24 @@ def format_context(chunks: list[dict], *, today: date) -> str:
     Each chunk is rendered with its 1-based bracket number and the URL it came from, so the model
     can cite the number (rule 2) while still seeing the real provenance of each passage.
 
-    Red-team fix: a chunk dict carrying a non-None `rule_effective_date` gets a second line, the
-    mechanically-generated note from `_rule_date_note` above, computed from the `today` the caller
-    passed in -- this function never reads the clock itself, matching how
-    app/guardrails/freshness.py::build_freshness already takes `today` as a parameter. A chunk dict
-    with no `rule_effective_date` key, or one whose value is None, renders exactly as it did before
-    this fix: byte-for-byte the same `[N] Source: <url>\\n<content>` block.
+    Red-team fix: a chunk dict carrying a non-None `rule_effective_date` OR a non-None `rule_status`
+    gets a second line, the mechanically-generated note from `_rule_date_note` above, computed from
+    the `today` the caller passed in -- this function never reads the clock itself, matching how
+    app/guardrails/freshness.py::build_freshness already takes `today` as a parameter. 2026-09-19:
+    the gate used to be "rule_effective_date is not None" alone; it is now "either field is set",
+    because `enjoined`/`not_in_force` may carry a status with no date at all (see
+    app/rule_status.py's own vocabulary table) and such a passage must still be annotated for the
+    model. A chunk dict with NEITHER key, or both None, renders exactly as it did before this fix:
+    byte-for-byte the same `[N] Source: <url>\\n<content>` block.
     """
     blocks = []
     for i, chunk in enumerate(chunks, start=1):
         header = f"[{i}] Source: {chunk['citation_url']}"
+        rule_status = chunk.get("rule_status")
         rule_effective_date = chunk.get("rule_effective_date")
-        if rule_effective_date is not None:
-            header = f"{header}\n{_rule_date_note(rule_effective_date, today)}"
+        if rule_status is not None or rule_effective_date is not None:
+            note = _rule_date_note(rule_status, rule_effective_date, today=today)
+            header = f"{header}\n{note}"
         blocks.append(f"{header}\n{chunk['content']}")
     return "\n\n".join(blocks)
 

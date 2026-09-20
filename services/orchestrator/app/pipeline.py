@@ -88,7 +88,7 @@ Concretely, in order:
    whether the date appears anywhere in the rendered answer. 2026-09-12: a firing sentence with no
    accompanying CURRENT-rule figure anywhere in it (see that module's docstring, "BLOCK VS INSERT")
    asserts the future rule alone, as current, rather than merely misplacing the date; this returns
-   BLOCKED_UNVERIFIED with refusal_reason="answer_states_future_rule_as_current" instead of
+   BLOCKED_UNVERIFIED with refusal_reason="answer_states_not_in_force_rule_as_current" instead of
    inserting a correction, the same early-return shape step 7's own BLOCKED_UNVERIFIED returns use.
 
 Phase 6 addition: an optional, keyword-only `on_event` callback (app/main.py's POST /query/stream
@@ -373,8 +373,9 @@ def _blocked_message_for_reason(
     which check happened to run last, so this stays correct even if step 7's checks are ever
     reordered. "answer_claims_official_authority" (app/guardrails/authority.py) gets the honest
     authority message; "answer_reproduces_system_prompt" (app/guardrails/prompt_leak.py) gets the
-    honest prompt-leak message; "answer_states_future_rule_as_current" (app/guardrails/temporal.py's
-    BLOCK signal) gets a message built from `future_rule_source_urls` -- the only one of the four
+    honest prompt-leak message; "answer_states_not_in_force_rule_as_current"
+    (app/guardrails/temporal.py's BLOCK signal) gets a message built from
+    `future_rule_source_urls` -- the only one of the four
     reasons whose message is not a fixed constant, since it has to name the real retrieved source
     rather than only ask the reader to rephrase (see _future_rule_blocked_message's own docstring).
     Every other reason (both of verify_citations's own reasons, and anything else that might reuse
@@ -386,7 +387,7 @@ def _blocked_message_for_reason(
     the same reasoning applies here -- an answer withheld for reproducing the prompt has nothing
     wrong with its citations.
     """
-    if reason == "answer_states_future_rule_as_current":
+    if reason == "answer_states_not_in_force_rule_as_current":
         return _future_rule_blocked_message(future_rule_source_urls)
     if reason == "answer_claims_official_authority":
         return _AUTHORITY_BLOCKED_MESSAGE
@@ -696,6 +697,10 @@ async def answer_question(
             # Red-team fix: carried through so app/prompts.py::format_context can annotate any
             # passage whose chunk carries one -- see this module's docstring, step 5.
             "rule_effective_date": chunk.rule_effective_date,
+            # Curator-stated force (docs/adr/0023-curator-rule-status.md): format_context's note
+            # is now chosen from this, never from rule_effective_date alone -- see that module's
+            # docstring, "THE PROMPT RULE 4 TRAP".
+            "rule_status": chunk.rule_status,
         }
         for chunk in chunks
     ]
@@ -940,17 +945,17 @@ async def answer_question(
         )
         return _empty_response(
             answer=_blocked_message_for_reason(
-                "answer_states_future_rule_as_current",
+                "answer_states_not_in_force_rule_as_current",
                 future_rule_source_urls=qualification.blocked_source_urls,
             ),
             response_type=ResponseType.BLOCKED_UNVERIFIED,
-            refusal_reason="answer_states_future_rule_as_current",
+            refusal_reason="answer_states_not_in_force_rule_as_current",
             question_non_latin_script=question_non_latin_script,
         )
 
     answer_text = qualification.text
 
-    notice_text = freshness_notice_text(freshness.notices)
+    notice_text = freshness_notice_text(freshness.notices, today=today)
     if notice_text:
         answer_text = f"{answer_text}\n\n{notice_text}"
 

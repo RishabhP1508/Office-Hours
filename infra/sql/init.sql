@@ -195,6 +195,42 @@ CREATE INDEX IF NOT EXISTS documents_embedding_hnsw ON documents USING hnsw (emb
 -- read, unaffected by that removal.
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS rule_effective_date DATE;
 
+-- 19 September 2026, docs/adr/0023-curator-rule-status.md: the injunction against the DHS
+-- fixed-period-of-admission rule showed that a date alone cannot answer "is this rule in force" --
+-- a court can block a rule without moving the date DHS published, and three consumers each
+-- inferred force from a date comparison and each got it wrong the moment the court order and the
+-- effective date disagreed. `rule_status` is the curator's STATED answer (app/rule_status.py::
+-- RuleStatus: in_force, scheduled, enjoined, not_in_force), read by every consumer through
+-- app/rule_status.py::is_in_force, which is `status == 'in_force'` and NEVER a date comparison.
+-- `rule_effective_date` keeps its original, narrower meaning -- the date the agency published --
+-- and stops being an input to any force decision.
+--
+-- THIS IS THE FIRST CHANGE IN THIS FILE THAT GENUINELY ADDS A COLUMN PRODUCTION DOES NOT ALREADY
+-- HAVE, rather than removing one (`sources.rule_effective_date`, above) or backfilling one already
+-- shipped (`sources.last_indexed_body`). It needs a REAL migration against Neon, run BEFORE the
+-- application code that reads these columns is deployed -- see the phase report for the exact
+-- order (schema migration, then `python -m app.sync_annotations` to backfill the two fixed_admission
+-- rows while the OLD code is still serving traffic and ignores both columns entirely, then deploy
+-- the new code). Nullable with no default, so this ALTER is instant and blocks nothing: every
+-- existing row reads NULL for both columns until sync_annotations (or a re-ingest) writes them.
+--
+-- Deliberately on `documents`, not `sources`: `rule_status` is exactly as per-chunk as
+-- `rule_effective_date` is (see that column's own comment above for why it was kept off the Phase 7
+-- `sources` normalization), and the two travel together -- a chunk's force and its date are one
+-- curator annotation, not two.
+-- `rule_status_source_evidences_status` (same day, same migration -- this ADD COLUMN has not been
+-- applied to production yet, so it adds no new migration step): whether `rule_status_source`
+-- actually documents the STATUS (a court's order) or merely the rule the status is ABOUT (e.g. the
+-- Federal Register notice for the rule itself). Curator-stated, required by
+-- app/rule_status.py::validate_rule_status whenever `rule_status_source` is set, never inferred
+-- from the URL -- inferring it would be the same guess this whole migration exists to stop making,
+-- moved rather than removed. Nullable with no default, same reasoning as `rule_status` above: every
+-- existing row reads NULL until sync_annotations (or a re-ingest) writes it.
+ALTER TABLE documents
+    ADD COLUMN IF NOT EXISTS rule_status TEXT,
+    ADD COLUMN IF NOT EXISTS rule_status_source TEXT,
+    ADD COLUMN IF NOT EXISTS rule_status_source_evidences_status BOOLEAN;
+
 -- Phase 7 migration: on a fresh database, `documents` above is already created in its final shape
 -- (source_url REFERENCES sources, no legacy columns), so this block is a no-op there -- it only
 -- runs against a database still carrying the pre-Phase-7 shape (resolved_url, page_last_updated,

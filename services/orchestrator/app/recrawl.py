@@ -62,11 +62,14 @@ from app.ingest import (
     load_existing_snapshot_index,
     load_snapshot,
     manifest_annotation,
+    manifest_annotation_bool,
+    manifest_annotation_str,
     mint_snapshot_filename,
     read_manifest,
     render_snapshot,
 )
 from app.providers.embeddings import Embedder, get_embedder
+from app.rule_status import validate_rule_status
 
 # ---------------------------------------------------------------------------------------------
 # normalize_for_diff: line-based normalization that strips boilerplate before anything is compared
@@ -400,22 +403,29 @@ async def touch_last_verified(
     *,
     now: datetime,
     rule_effective_date: date | None,
+    rule_status: str | None = None,
+    rule_status_source: str | None = None,
+    rule_status_source_evidences_status: bool | None = None,
 ) -> int:
     """Bookkeeping only: moves `sources.last_verified_at` (and `last_success_at`, and clears any
     prior failure bookkeeping -- a source that was previously failing but is now reachable again
     and unchanged is exactly as healthy as one that never failed) and syncs
-    `documents.rule_effective_date`. Never touches `sources.fetched_at`/`page_last_updated`/
+    `documents.rule_effective_date`/`rule_status`/`rule_status_source`/
+    `rule_status_source_evidences_status`. Never touches `sources.fetched_at`/`page_last_updated`/
     `last_indexed_body`, or `documents.content`/`embedding` -- see the WHY THE SPLIT comment above,
     and infra/sql/init.sql's comment on `last_indexed_body`: an unchanged/cosmetic verdict means
     nothing is being re-indexed, so the body app/recrawl.py::_diff_node will next compare against
     must stay exactly what it already was.
 
-    Does NOT sync `sources.rule_effective_date` -- that column does not exist in production and is
-    never being added there (Option B; see docs/adr/0022-manifest-authoritative-annotations.md).
-    `data/sources/sources.yaml` is now the authoritative copy of the annotation; `documents` is the
-    one retrieval and the guards actually read (app/db.py selects `d.rule_effective_date`), so it
-    stays the only table this function writes the annotation onto. All writes happen in one
-    transaction. Returns the number of `documents` rows whose `rule_effective_date` was synced.
+    Does NOT sync anything onto `sources` -- none of these four annotations has ever existed as a
+    `sources` column (Option B; see docs/adr/0022-manifest-authoritative-annotations.md and
+    docs/adr/0023-curator-rule-status.md). `data/sources/sources.yaml` is now the authoritative copy
+    of all four annotations; `documents` is the one table retrieval and the guards actually read
+    (app/db.py selects `d.rule_effective_date`, `d.rule_status`, `d.rule_status_source`,
+    `d.rule_status_source_evidences_status`), so it stays the only table this function writes any of
+    them onto. All writes happen in one transaction. Returns the number of `documents` rows synced
+    (the four columns move together, one UPDATE, so this is a single count for all four, not four
+    separate ones).
     """
     async with conn.transaction():
         async with conn.cursor() as cur:
@@ -433,8 +443,16 @@ async def touch_last_verified(
                 (now, now, source_url),
             )
             await cur.execute(
-                "UPDATE documents SET rule_effective_date = %s WHERE source_url = %s",
-                (rule_effective_date, source_url),
+                "UPDATE documents SET rule_effective_date = %s, rule_status = %s, "
+                "rule_status_source = %s, rule_status_source_evidences_status = %s "
+                "WHERE source_url = %s",
+                (
+                    rule_effective_date,
+                    rule_status,
+                    rule_status_source,
+                    rule_status_source_evidences_status,
+                    source_url,
+                ),
             )
             return cur.rowcount
 
@@ -505,13 +523,17 @@ async def reindex_source(
     body: str,
     chunks: list[dict],
     now: datetime,
+    rule_status: str | None = None,
+    rule_status_source: str | None = None,
+    rule_status_source_evidences_status: bool | None = None,
 ) -> int:
     """A meaningful change: delete this source's old rows and insert freshly embedded chunks, all
     in one transaction, setting `fetched_at = last_verified_at = now` (this source was both
     re-fetched and re-checked right now) plus the new `page_last_updated`/`last_indexed_body` on
-    `sources`, and the new `rule_effective_date` on every one of this source's `documents` rows.
-    `rule_effective_date` is NOT written onto `sources` -- that column does not exist in production
-    (Option B; see docs/adr/0022-manifest-authoritative-annotations.md).
+    `sources`, and the new `rule_effective_date`/`rule_status`/`rule_status_source`/
+    `rule_status_source_evidences_status` on every one of this source's `documents` rows. None of
+    the four is written onto `sources` -- none of these columns exists in production (Option B; see
+    docs/adr/0022-manifest-authoritative-annotations.md and docs/adr/0023-curator-rule-status.md).
 
     `body` is the freshly fetched raw markdown this call is indexing -- the SAME text
     `_chunk_node` just wrote to the snapshot file and chunked (`state["body"]`, never
@@ -534,6 +556,9 @@ async def reindex_source(
         page_last_updated=page_last_updated,
         body=body,
         rule_effective_date=rule_effective_date,
+        rule_status=rule_status,
+        rule_status_source=rule_status_source,
+        rule_status_source_evidences_status=rule_status_source_evidences_status,
         chunks=chunks,
         now=now,
         mark_changed=True,
@@ -585,6 +610,9 @@ class RefreshState(TypedDict):
     resolved_url: str | None
     page_last_updated: str | None  # ISO date string, or None
     rule_effective_date: str | None  # ISO date string, or None
+    rule_status: str | None  # plain string (app/rule_status.py::RuleStatus value), or None
+    rule_status_source: str | None  # plain string (a URL), or None
+    rule_status_source_evidences_status: bool | None  # plain bool, JSON/msgpack-safe as-is, or None
     body: str | None
     verdict: dict | None  # a serialized ChangeVerdict (dataclasses.asdict)
     chunks: list[dict]  # chunk_markdown's output; internal plumbing between chunk -> embed/reindex
@@ -610,16 +638,38 @@ class RefreshDeps:
 
 
 def _initial_state(entry: dict, run_id: str, max_attempts: int) -> RefreshState:
-    # `rule_effective_date` now comes from the manifest entry itself (Option B; see
-    # docs/adr/0022-manifest-authoritative-annotations.md), not from a `sources` column that is
-    # being removed from production. `manifest_annotation` returns a `date | None` -- YAML parses
+    # `rule_effective_date`/`rule_status`/`rule_status_source`/
+    # `rule_status_source_evidences_status` all come from the manifest entry itself (Option B; see
+    # docs/adr/0022-manifest-authoritative-annotations.md), never from a `sources` column -- none of
+    # the four has ever existed there. `manifest_annotation` returns a `date | None` -- YAML parses
     # `2026-09-15` into a real `datetime.date`, and `_parse_iso_date` returns a `date` unchanged --
-    # so `.isoformat()` is REQUIRED here: every value in this TypedDict has to survive a round trip
-    # through LangGraph's checkpointer, which persists state with ormsgpack, and the module
-    # docstring's own rule is no `datetime`/`date` objects in state. Skipping this call would work
-    # today (nothing serializes state in these tests) and fail the first time a real checkpointer
-    # tried to persist a source carrying this annotation.
+    # so `.isoformat()` is REQUIRED for that one: every value in this TypedDict has to survive a
+    # round trip through LangGraph's checkpointer, which persists state with ormsgpack, and the
+    # module docstring's own rule is no `datetime`/`date` objects in state. Skipping that call would
+    # work today (nothing serializes state in these tests) and fail the first time a real
+    # checkpointer tried to persist a source carrying this annotation. `rule_status`/
+    # `rule_status_source` (`manifest_annotation_str`) are already plain strings -- YAML never
+    # parses either into anything but a `str` -- and `rule_status_source_evidences_status`
+    # (`manifest_annotation_bool`) is already a plain `bool` (or `None`) -- msgpack-safe as-is -- so
+    # none of the three needs a conversion here.
     manifest_rule_effective_date = manifest_annotation(entry, "rule_effective_date")
+    manifest_rule_status = manifest_annotation_str(entry, "rule_status")
+    manifest_rule_status_source = manifest_annotation_str(entry, "rule_status_source")
+    manifest_rule_status_source_evidences_status = manifest_annotation_bool(
+        entry, "rule_status_source_evidences_status"
+    )
+    # Load-time validation (docs/adr/0023-curator-rule-status.md): the scheduled refresh job hits
+    # this the same way a hand-run ingest does -- a manifest mistake fails this source loudly
+    # (isolated by run_refresh's own per-source try/except, see that function's docstring) rather
+    # than silently defaulting a force decision from a date.
+    validate_rule_status(
+        source_url=entry["url"],
+        rule_status=manifest_rule_status,
+        rule_effective_date=manifest_rule_effective_date,
+        rule_status_source=manifest_rule_status_source,
+        rule_status_source_evidences_status=manifest_rule_status_source_evidences_status,
+        today=datetime.now(UTC).date(),
+    )
     return {
         "source_url": entry["url"],
         "topic": entry["topic"],
@@ -636,6 +686,9 @@ def _initial_state(entry: dict, run_id: str, max_attempts: int) -> RefreshState:
         "rule_effective_date": (
             manifest_rule_effective_date.isoformat() if manifest_rule_effective_date else None
         ),
+        "rule_status": manifest_rule_status,
+        "rule_status_source": manifest_rule_status_source,
+        "rule_status_source_evidences_status": manifest_rule_status_source_evidences_status,
         "body": None,
         "verdict": None,
         "chunks": [],
@@ -887,6 +940,8 @@ async def _reindex_node(deps: RefreshDeps, state: RefreshState) -> dict:
             resolved_url=state.get("resolved_url"),
             page_last_updated=page_last_updated,
             rule_effective_date=rule_effective_date,
+            rule_status=state.get("rule_status"),
+            rule_status_source=state.get("rule_status_source"),
             body=state["body"],
             chunks=chunks,
             now=now,
@@ -916,6 +971,8 @@ async def _verify_only_node(deps: RefreshDeps, state: RefreshState) -> dict:
                 state["source_url"],
                 now=now,
                 rule_effective_date=rule_effective_date,
+                rule_status=state.get("rule_status"),
+                rule_status_source=state.get("rule_status_source"),
             )
 
     return {

@@ -211,6 +211,32 @@ kept what it corrected. The reasoning was sound given what was known on 12 Septe
 more useful as a record of a correct decision overtaken by events than as a tidy document that never
 predicted anything wrong.
 
+**Amended 19 September 2026 -- fixed. See docs/adr/0023-curator-rule-status.md.** The paragraph
+above ("This scaffolding has a 72-hour shelf life and self-resolves") is the root cause, stated
+plainly, of everything the 15 September amendment records: "self-resolves on the effective date"
+is only true if the effective date is also the day the rule actually took effect, and this ADR's
+own algorithm had no way to notice when that stopped being the case. `app/guardrails/temporal.py`
+no longer compares any date to `today` to decide whether a chunk's rule counts as current. It asks
+`app/rule_status.py::is_in_force(chunk.rule_status)` -- `status == "in_force"`, a fact a curator
+states in `data/sources/sources.yaml`, never arithmetic on a date. The internal concept this
+module's docstring called FUTURE-ONLY is renamed NOT-IN-FORCE-ONLY throughout, built from that
+predicate instead: `in_force` and unannotated chunks count as current (never fire); `scheduled`
+fires with unchanged wording ("takes effect on <date>"); `enjoined` and `not_in_force` are two
+states the pre-fix code had no way to express at all, each with its own wording that never says
+"takes effect on" (see `app/rule_status.py` for why that phrase would be a false statement about
+either). The refusal reason this ADR's own BLOCK signal returns is renamed
+`answer_states_not_in_force_rule_as_current` (from `answer_states_future_rule_as_current`), since
+"future" stopped being an accurate description of the thing being blocked the moment `enjoined`
+became reachable. The BLOCK-vs-INSERT axis itself (module docstring, "BLOCK VS INSERT") is
+UNCHANGED: it is still "does the firing sentence also name an in-force figure", the same test
+regardless of which not-in-force status triggered it, so `enjoined` is not made "always block"
+merely for being the status behind the live incident.
+
+The general lesson recorded two paragraphs above this one -- "scaffolding that expires on a date
+rather than on a measured condition assumes the date still means what it meant when the scaffolding
+was built" -- is exactly what motivated the fix: force is now a condition a curator measures and
+states, never a date this code assumes still means what it meant when the code was written.
+
 **It inserts after the sentence rather than appending at the end.** Appending at the end is what the
 system already does with the freshness notice, and a trailing qualifier is precisely the behaviour
 measured as insufficient.

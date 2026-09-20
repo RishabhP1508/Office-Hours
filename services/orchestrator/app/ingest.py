@@ -35,6 +35,7 @@ from pgvector.psycopg import register_vector_async
 
 from app.config import Settings, get_settings
 from app.providers.embeddings import get_embedder
+from app.rule_status import validate_rule_status
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("ingest")
@@ -386,6 +387,33 @@ def manifest_annotation(entry: dict, key: str) -> date | None:
     return _parse_iso_date((entry.get("annotations") or {}).get(key))
 
 
+def manifest_annotation_str(entry: dict, key: str) -> str | None:
+    """Like `manifest_annotation` above but for a plain-string curator annotation (`rule_status`,
+    `rule_status_source`) rather than a date -- YAML parses these as ordinary strings already, so
+    there is no `_parse_iso_date`-style conversion to make. Same None-versus-absent contract: an
+    absent key and an explicit `null` both mean "no value", which is how a curator removes an
+    annotation (see `manifest_annotation`'s own docstring) -- not just for `rule_effective_date`,
+    but for `rule_status`/`rule_status_source` too, now that all three travel together
+    (app/rule_status.py, docs/adr/0023-curator-rule-status.md).
+    """
+    value = (entry.get("annotations") or {}).get(key)
+    return str(value) if value is not None else None
+
+
+def manifest_annotation_bool(entry: dict, key: str):
+    """Like `manifest_annotation_str` above but for a boolean curator annotation
+    (`rule_status_source_evidences_status`) -- returns the value UNCOERCED, whatever type YAML
+    parsed it as (a real `bool` for a well-formed `true`/`false` entry, but possibly a `str`, an
+    `int`, or anything else for a curator mistake), so app/rule_status.py::validate_rule_status can
+    raise on a non-boolean value instead of this function silently coercing a mistake into
+    `bool(value)` -- which would make every non-empty string, including the string `"false"`, read
+    as truthy, defeating the entire point of requiring this field explicitly (docs/adr/0023-
+    curator-rule-status.md). Same None-versus-absent contract as manifest_annotation/
+    manifest_annotation_str: an absent key and an explicit `null` both mean "not set".
+    """
+    return (entry.get("annotations") or {}).get(key)
+
+
 class RobotsCache:
     """Fetches and caches one robots.txt per host."""
 
@@ -603,20 +631,35 @@ async def _embed_and_store(
     body: str,
     chunks: list[dict],
     rule_effective_date: date | None = None,
+    rule_status: str | None = None,
+    rule_status_source: str | None = None,
+    rule_status_source_evidences_status: bool | None = None,
     now: datetime | None = None,
     mark_changed: bool = False,
 ) -> None:
-    """`rule_effective_date` is the curator annotation -- read out of the manifest entry's
-    `annotations` block by the caller (`_ingest_from_manifest` via `manifest_annotation`, or
-    app/recrawl.py::_initial_state before `reindex_source` ever runs), never computed here. It is
-    written ONLY onto `documents`, one row per chunk -- see infra/sql/init.sql's comment on
-    `documents.rule_effective_date`. It is NOT written onto `sources`: that column existed for a
-    while (docs/adr/0014-stateless-recrawl-diff.md) but was removed under Option B (see
-    docs/adr/0022-manifest-authoritative-annotations.md) because it is never being added to
-    production and `data/sources/sources.yaml` is authoritative for the value now. `now` defaults to
-    the real current time; it is an explicit parameter so app/recrawl.py::reindex_source (Phase 5)
-    can pass one `now` value for both `fetched_at` and `last_verified_at`, deterministically,
-    instead of two separate calls to datetime.now(UTC) that could disagree by a few microseconds.
+    """`rule_effective_date`/`rule_status`/`rule_status_source`/
+    `rule_status_source_evidences_status` are the curator annotations -- read out of the manifest
+    entry's `annotations` block by the caller (`_ingest_from_manifest` via
+    `manifest_annotation`/`manifest_annotation_str`/`manifest_annotation_bool`, or
+    app/recrawl.py::_initial_state before `reindex_source` ever runs), never computed here. All four
+    are written ONLY onto `documents`, one row per chunk -- see infra/sql/init.sql's comments on
+    those columns. None of the four is written onto `sources`: `rule_effective_date` had a `sources`
+    mirror for a while (docs/adr/0014-stateless-recrawl-diff.md) that was removed under Option B
+    (see docs/adr/0022-manifest-authoritative-annotations.md), and the other three never had one --
+    `data/sources/sources.yaml` is authoritative for all four now, and the newer columns are
+    exactly as per-chunk as the one they travel alongside (see infra/sql/init.sql's own comment on
+    why). `now` defaults to the real current time; it is an explicit parameter so
+    app/recrawl.py::reindex_source (Phase 5) can pass one `now` value for both `fetched_at` and
+    `last_verified_at`, deterministically, instead of two separate calls to datetime.now(UTC) that
+    could disagree by a few microseconds.
+
+    NONE OF THE FOUR IS VALIDATED HERE. Validation (`app/rule_status.py::validate_rule_status`) runs
+    once, at LOAD TIME, in every caller that reads these values off a manifest entry
+    (`_ingest_from_manifest`, `_ingest_from_snapshots` below, and app/recrawl.py::_initial_state) --
+    this function only ever receives values a caller has already validated, and re-validating a
+    value on every one of N chunks it is about to be written onto would be the same check, repeated
+    for no benefit, at the one place in the codebase least convenient to report a curator's mistake
+    from.
 
     `body` is the raw markdown this source was just indexed from -- the same text a snapshot file
     holds, BEFORE chunking (never a chunk's own `text`, which chunk_markdown prefixes with a
@@ -695,8 +738,9 @@ async def _embed_and_store(
                     """
                     INSERT INTO documents
                         (content, source_url, section_heading, heading_level,
-                         rule_effective_date, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                         rule_effective_date, rule_status, rule_status_source,
+                         rule_status_source_evidences_status, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         chunk["text"],
@@ -704,6 +748,9 @@ async def _embed_and_store(
                         chunk["heading"],
                         chunk["level"],
                         rule_effective_date,
+                        rule_status,
+                        rule_status_source,
+                        rule_status_source_evidences_status,
                         Vector(vector),
                     ),
                 )
@@ -714,11 +761,14 @@ async def _ingest_from_manifest(
 ) -> tuple[int, int]:
     """Phase 0's path: fetch every URL in SOURCES_MANIFEST_PATH, snapshot, chunk, embed, store.
 
-    `rule_effective_date` is read from the manifest entry's own `annotations` block
-    (`manifest_annotation`), not from the snapshot's frontmatter -- the manifest is authoritative
-    for curator annotations under Option B (docs/adr/0022-manifest-authoritative-annotations.md),
-    so a stale or hand-edited frontmatter value on disk can never disagree with what actually gets
-    written to the database.
+    `rule_effective_date`/`rule_status`/`rule_status_source`/
+    `rule_status_source_evidences_status` are read from the manifest entry's own `annotations` block
+    (`manifest_annotation`/`manifest_annotation_str`/`manifest_annotation_bool`), not from the
+    snapshot's frontmatter -- the manifest is authoritative for curator annotations under Option B
+    (docs/adr/0022-manifest-authoritative-annotations.md), so a stale or hand-edited frontmatter
+    value on disk can never disagree with what actually gets written to the database. All four are
+    validated together (`app/rule_status.py::validate_rule_status`, docs/adr/0023-curator-rule-
+    status.md) before anything is fetched-and-stored for this entry.
 
     Returns (total_chunks, total_sources).
     """
@@ -745,6 +795,26 @@ async def _ingest_from_manifest(
             frontmatter, body = load_snapshot(snapshot_path)
             chunks = chunk_markdown(body)
 
+            rule_effective_date = manifest_annotation(entry, "rule_effective_date")
+            rule_status = manifest_annotation_str(entry, "rule_status")
+            rule_status_source = manifest_annotation_str(entry, "rule_status_source")
+            rule_status_source_evidences_status = manifest_annotation_bool(
+                entry, "rule_status_source_evidences_status"
+            )
+            # Load-time validation (docs/adr/0023-curator-rule-status.md): a manifest entry with a
+            # `rule_effective_date` and no `rule_status`, an unknown status, a state/date mismatch,
+            # or a `rule_status_source` with no (or non-boolean)
+            # `rule_status_source_evidences_status` is a HARD ERROR here, before anything is
+            # written -- never defaulted or silently ingested.
+            validate_rule_status(
+                source_url=url,
+                rule_status=rule_status,
+                rule_effective_date=rule_effective_date,
+                rule_status_source=rule_status_source,
+                rule_status_source_evidences_status=rule_status_source_evidences_status,
+                today=date.today(),
+            )
+
             await _embed_and_store(
                 conn,
                 embedder,
@@ -752,7 +822,10 @@ async def _ingest_from_manifest(
                 resolved_url=frontmatter.get("resolved_url"),
                 page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
                 body=body,
-                rule_effective_date=manifest_annotation(entry, "rule_effective_date"),
+                rule_effective_date=rule_effective_date,
+                rule_status=rule_status,
+                rule_status_source=rule_status_source,
+                rule_status_source_evidences_status=rule_status_source_evidences_status,
                 chunks=chunks,
             )
 
@@ -774,8 +847,9 @@ async def _ingest_from_snapshots(
     _embed_and_store unchanged -- only how a snapshot is obtained differs from
     _ingest_from_manifest, never the chunking or storage logic itself.
 
-    DELIBERATE, DOCUMENTED EXCEPTION: this path reads `rule_effective_date` out of the snapshot's
-    own YAML frontmatter below, NOT from a manifest entry's `annotations` block the way
+    DELIBERATE, DOCUMENTED EXCEPTION: this path reads `rule_effective_date`/`rule_status`/
+    `rule_status_source`/`rule_status_source_evidences_status` out of the snapshot's own YAML
+    frontmatter below, NOT from a manifest entry's `annotations` block the way
     `_ingest_from_manifest` does. `eval/fixtures/sources/` has no manifest entry at all -- it is a
     self-contained, four-file CI fixture corpus tracked directly in git
     (docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md), so the problem Option B exists to
@@ -795,6 +869,22 @@ async def _ingest_from_snapshots(
             raise RuntimeError(f"{path}: snapshot has no source_url in its frontmatter")
         chunks = chunk_markdown(body)
 
+        rule_effective_date = _parse_iso_date(frontmatter.get("rule_effective_date"))
+        rule_status = frontmatter.get("rule_status")
+        rule_status_source = frontmatter.get("rule_status_source")
+        rule_status_source_evidences_status = frontmatter.get("rule_status_source_evidences_status")
+        # Same load-time validation as the manifest path above (docs/adr/0023-curator-rule-
+        # status.md) -- the CI fixture corpus is a self-contained, checked-in exception to WHERE
+        # the annotations live (frontmatter, not a manifest), never to whether they are validated.
+        validate_rule_status(
+            source_url=source_url,
+            rule_status=rule_status,
+            rule_effective_date=rule_effective_date,
+            rule_status_source=rule_status_source,
+            rule_status_source_evidences_status=rule_status_source_evidences_status,
+            today=date.today(),
+        )
+
         await _embed_and_store(
             conn,
             embedder,
@@ -802,7 +892,10 @@ async def _ingest_from_snapshots(
             resolved_url=frontmatter.get("resolved_url"),
             page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
             body=body,
-            rule_effective_date=_parse_iso_date(frontmatter.get("rule_effective_date")),
+            rule_effective_date=rule_effective_date,
+            rule_status=rule_status,
+            rule_status_source=rule_status_source,
+            rule_status_source_evidences_status=rule_status_source_evidences_status,
             chunks=chunks,
         )
 

@@ -68,6 +68,32 @@ sources:
     annotations:
       rule_effective_date: 2026-09-15
       federal_register: https://www.federalregister.gov/d/2026-14439
+      # CURATOR-STATED FORCE (docs/adr/0023-curator-rule-status.md). A nationwide preliminary
+      # injunction issued 14 September 2026 in Presidents' Alliance v. DHS, No. 1:26-cv-13799
+      # (D. Mass., Saylor, J.), blocking this rule the day before its published effective date. The
+      # rule did not take effect on 15 September and the duration-of-status framework remains the
+      # law; rule_effective_date above is left exactly as DHS published it (the date the agency
+      # published, not a fact about whether the rule is in force) and is no longer read as an input
+      # to that decision anywhere in this codebase -- see app/rule_status.py.
+      rule_status: enjoined
+      # CURATOR DECISION, FLAGGED HONESTLY: this points at the Federal Register document for the
+      # rule itself, not at the court's order, because no citable URL for the order was in this
+      # repository and inventing a PACER/CourtListener link was out of scope for this change. The
+      # notice this produces therefore links the rule DHS published rather than the order that
+      # blocked it -- accurate about WHERE the rule came from, silent on WHERE the injunction can be
+      # read. Replace with a direct citation to the order (or a court-reporting summary of it) when
+      # one is curated.
+      rule_status_source: https://www.federalregister.gov/d/2026-14439
+      # This URL documents the RULE (the Federal Register notice), not the STATUS (the court's
+      # order) -- see the decision above. false, never inferred from the URL (docs/adr/0023-
+      # curator-rule-status.md's "Why rule_status_source is required for enjoined/not_in_force").
+      # Update to true only once rule_status_source itself is replaced with a direct citation to
+      # the order.
+      rule_status_source_evidences_status: false
+      rule_status_note: >-
+        Enjoined nationwide, 14 September 2026, Presidents' Alliance v. DHS, No. 1:26-cv-13799
+        (D. Mass., Saylor, J.), one day before its published effective date. Not vacated: the rule
+        could still take effect later if the injunction is lifted or narrowed on appeal.
       # KNOWN STALE. Moved here VERBATIM so this step is reviewable as a pure move; corrected in a
       # separate diff (step 6 of the migration plan). Measured against the current snapshot, all
       # five labels named below are h4, not h3, and the real h3 layer (General, F Students, School
@@ -85,3 +111,13 @@ sources:
     annotations:
       rule_effective_date: 2026-09-15
       federal_register: https://www.federalregister.gov/d/2026-14439
+      # See the FAQ entry above for the full account; both fixed_admission pages state the same
+      # rule and share the same status.
+      rule_status: enjoined
+      rule_status_source: https://www.federalregister.gov/d/2026-14439
+      # Same URL, same reasoning as the FAQ entry above: it documents the rule, not the status.
+      rule_status_source_evidences_status: false
+      rule_status_note: >-
+        Enjoined nationwide, 14 September 2026, Presidents' Alliance v. DHS, No. 1:26-cv-13799
+        (D. Mass., Saylor, J.), one day before its published effective date. Not vacated: the rule
+        could still take effect later if the injunction is lifted or narrowed on appeal.

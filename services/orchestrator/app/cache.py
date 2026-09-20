@@ -35,13 +35,19 @@ WHY A DATE IS PART OF THIS (root-caused, not merely patched): a `corpus_version`
 `last_changed_at`/`count(documents)` has no way to notice that a DAY has passed with the corpus
 itself unchanged, and this cache has no TTL either. Some of the answer text this module caches is
 DATE-DERIVED, not corpus-derived: app/guardrails/freshness.py::freshness_notice_text's own
-"takes effect on <date>"/"took effect on <date>" wording, and app/guardrails/temporal.py::
-qualify_future_dated_figures's inserted qualifying sentence, both switch wording based on whether
-`today` is on or after a `rule_effective_date` -- and neither `sources.last_changed_at` nor
+"takes effect on <date>"/"took effect on <date>"/"is not in force today, <date>" wording, and
+app/guardrails/temporal.py::qualify_future_dated_figures's inserted qualifying sentence, both
+render "today" literally into the answer text -- and neither `sources.last_changed_at` nor
 `count(documents)` moves when only the CALENDAR moves. Without today's date in the version string,
-a response cached on September 11 stating "takes effect on September 15, 2026" would still be
-served, verbatim, on September 16 -- after the rule everyone can see has already come into force --
-because nothing about the corpus itself changed, only which side of that date "today" now falls on.
+a response cached on September 11 stating "It is not the rule in force today, September 11, 2026"
+would still be served, verbatim, on September 16, because nothing about the corpus itself changed,
+only the calendar date that sentence names. (2026-09-19, docs/adr/0023-curator-rule-status.md:
+before this fix the risk was specifically the wording FLIPPING from "takes effect on" to "took
+effect on" as a date rolled past -- the exact defect that motivated writing this section. That
+flip can no longer happen on its own; `rule_status` is curator-stated, not date-derived. The
+staleness risk this section guards against is broader than that one flip and remains: every note
+this module can cache still spells out "today" as a literal date, in every status's wording, and
+that date goes stale the moment the calendar turns over regardless of what triggered the wording.)
 Concretely: `version("2026-09-11")` != `version("2026-09-16")` even with `last_changed_at`/
 `count(documents)` held fixed, so `lookup()` (which only ever matches the CURRENT version) can never
 return that stale row again once the day turns over, and `store()`'s own delete-superseded-versions

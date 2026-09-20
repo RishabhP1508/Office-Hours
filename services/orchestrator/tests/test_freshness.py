@@ -276,7 +276,7 @@ def test_initial_state_puts_the_manifest_rule_effective_date_in_state_as_a_strin
     serializable value in state), not a roundabout way of re-deriving it from an equality failure.
     """
     entry = _manifest_entry_for_initial_state(
-        annotations={"rule_effective_date": date(2026, 9, 15)}
+        annotations={"rule_effective_date": date(2026, 9, 15), "rule_status": "in_force"}
     )
 
     state = _initial_state(entry, run_id="test-run", max_attempts=3)
@@ -293,13 +293,55 @@ def test_initial_state_puts_the_manifest_rule_effective_date_in_state_as_a_strin
 def test_initial_state_rule_effective_date_is_none_without_a_manifest_annotation(annotations):
     """Both "the manifest entry has no `annotations` key" and "it has one but it is empty/omits
     this key" must give None -- the same None-versus-absent contract `manifest_annotation` itself
-    documents, now exercised through `_initial_state`.
+    documents, now exercised through `_initial_state`. `rule_status`/`rule_status_source`
+    (`manifest_annotation_str`) get the identical contract -- see the test right below this one for
+    the case where `rule_status` alone is absent but a date is not.
     """
     entry = _manifest_entry_for_initial_state(annotations=annotations)
 
     state = _initial_state(entry, run_id="test-run", max_attempts=3)
 
     assert state["rule_effective_date"] is None
+    assert state["rule_status"] is None
+    assert state["rule_status_source"] is None
+    assert state["rule_status_source_evidences_status"] is None
+
+
+def test_initial_state_puts_rule_status_and_its_source_in_state_as_plain_strings():
+    """`rule_status`/`rule_status_source` need no `.isoformat()`-style conversion -- YAML parses
+    both into plain strings already -- but they still have to reach `RefreshState` at all, seeded
+    from the manifest entry the same way `rule_effective_date` is (docs/adr/0023-curator-rule-
+    status.md). `rule_status_source_evidences_status` is a plain `bool`, seeded the same way and
+    required alongside `rule_status_source` (`app/rule_status.py::validate_rule_status`).
+    """
+    entry = _manifest_entry_for_initial_state(
+        annotations={
+            "rule_effective_date": date(2026, 9, 15),
+            "rule_status": "enjoined",
+            "rule_status_source": "https://www.federalregister.gov/d/2026-14439",
+            "rule_status_source_evidences_status": False,
+        }
+    )
+
+    state = _initial_state(entry, run_id="test-run", max_attempts=3)
+
+    assert state["rule_status"] == "enjoined"
+    assert isinstance(state["rule_status"], str)
+    assert state["rule_status_source"] == "https://www.federalregister.gov/d/2026-14439"
+    assert state["rule_status_source_evidences_status"] is False
+
+
+def test_initial_state_raises_on_a_date_with_no_status():
+    """Load-time validation (`app/rule_status.py::validate_rule_status`) runs inside
+    `_initial_state` itself -- the scheduled refresh job must refuse a manifest mistake exactly as
+    loudly as a hand-run ingest does, not silently default a force decision from the date.
+    """
+    entry = _manifest_entry_for_initial_state(
+        annotations={"rule_effective_date": date(2026, 9, 15)}
+    )
+
+    with pytest.raises(ValueError, match="rule_effective_date is set"):
+        _initial_state(entry, run_id="test-run", max_attempts=3)
 
 
 def test_initial_state_is_json_serializable():
@@ -312,7 +354,7 @@ def test_initial_state_is_json_serializable():
     at all, rather than a check that would pass on any dict handed to it.
     """
     entry = _manifest_entry_for_initial_state(
-        annotations={"rule_effective_date": date(2026, 9, 15)}
+        annotations={"rule_effective_date": date(2026, 9, 15), "rule_status": "in_force"}
     )
 
     state = _initial_state(entry, run_id="test-run", max_attempts=3)
@@ -1912,6 +1954,9 @@ def _make_chunk(**overrides) -> RetrievedChunk:
         heading_level=2,
         page_last_updated=None,
         rule_effective_date=None,
+        rule_status=None,
+        rule_status_source=None,
+        rule_status_source_evidences_status=None,
         fetched_at=datetime(2026, 8, 1, tzinfo=UTC),
         last_verified_at=datetime(2026, 8, 1, tzinfo=UTC),
         distance=0.1,
@@ -1931,6 +1976,7 @@ def test_build_freshness_top_ranked_uncited_dated_source_produces_a_notice_with_
     chunk = _make_chunk(
         source_url="https://studyinthestates.dhs.gov/quick-facts",
         rule_effective_date=date(2026, 9, 15),
+        rule_status="scheduled",
     )
 
     freshness = build_freshness([chunk], today=date(2026, 9, 5), cited_indices=set())
@@ -1942,7 +1988,7 @@ def test_build_freshness_top_ranked_uncited_dated_source_produces_a_notice_with_
     assert notice.in_effect is False
     assert notice.reason == "top_ranked"
 
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
     assert text is not None
     assert "September 15, 2026" in text
     assert "https://studyinthestates.dhs.gov/quick-facts" in text
@@ -1959,6 +2005,7 @@ def test_build_freshness_cited_but_not_top_ranked_dated_source_produces_a_notice
         _make_chunk(
             source_url="https://studyinthestates.dhs.gov/quick-facts",
             rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
         ),
     ]
 
@@ -1969,7 +2016,7 @@ def test_build_freshness_cited_but_not_top_ranked_dated_source_produces_a_notice
     assert notice.source_url == "https://studyinthestates.dhs.gov/quick-facts"
     assert notice.reason == "cited"
 
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
     assert text is not None
     assert "September 15, 2026" in text
 
@@ -1987,7 +2034,12 @@ def test_build_freshness_dated_source_at_rank_five_uncited_still_produces_a_noti
         _make_chunk(id=2, source_url="https://example.gov/unrelated-2", rule_effective_date=None),
         _make_chunk(id=3, source_url="https://example.gov/unrelated-3", rule_effective_date=None),
         _make_chunk(id=4, source_url="https://example.gov/unrelated-4", rule_effective_date=None),
-        _make_chunk(id=5, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            id=5,
+            source_url=dated_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices=set())
@@ -2002,7 +2054,7 @@ def test_build_freshness_dated_source_at_rank_five_uncited_still_produces_a_noti
     # case this replaces.
     assert notice.reason == "retrieved"
 
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
     assert text is not None
     assert "September 15, 2026" in text
     assert dated_url in text
@@ -2023,7 +2075,12 @@ def test_build_freshness_reason_is_not_falsely_cited_when_other_chunks_are_cited
         _make_chunk(id=2, source_url="https://example.gov/unrelated-2", rule_effective_date=None),
         _make_chunk(id=3, source_url="https://example.gov/unrelated-3", rule_effective_date=None),
         _make_chunk(id=4, source_url="https://example.gov/unrelated-4", rule_effective_date=None),
-        _make_chunk(id=5, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            id=5,
+            source_url=dated_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={1, 2})
@@ -2042,10 +2099,25 @@ def test_build_freshness_reason_covers_all_three_values_for_the_three_retrieval_
     cited_url = "https://example.gov/cited-dated"
     retrieved_only_url = "https://example.gov/retrieved-only-dated"
     chunks = [
-        _make_chunk(id=1, source_url=top_ranked_url, rule_effective_date=date(2026, 9, 15)),
-        _make_chunk(id=2, source_url=cited_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            id=1,
+            source_url=top_ranked_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
+        _make_chunk(
+            id=2,
+            source_url=cited_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
         _make_chunk(id=3, source_url="https://example.gov/unrelated", rule_effective_date=None),
-        _make_chunk(id=4, source_url=retrieved_only_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            id=4,
+            source_url=retrieved_only_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
     ]
 
     # cited_indices={2}: position 2 (cited_url) is cited; position 1 (top_ranked_url) is not cited
@@ -2074,30 +2146,45 @@ def test_build_freshness_without_any_dated_source_produces_no_notice():
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices=set())
 
     assert freshness.notices == []
-    assert freshness_notice_text(freshness.notices) is None
+    assert freshness_notice_text(freshness.notices, today=date(2026, 9, 5)) is None
 
 
-def test_build_freshness_date_rollover_flips_in_effect_and_wording_to_took_effect():
-    """With `today` frozen to a date after the rule's effective date, `in_effect` must flip to
-    True and `freshness_notice_text`'s wording must switch from "takes effect on" (future) to
-    "took effect on" (already in effect) -- the real DHS fixed-admission rule is eight days away
-    from this rollover as of this fix, so it ships whether or not this is tested.
+def test_build_freshness_status_change_flips_in_effect_and_wording_not_the_calendar():
+    """RENAMED and REDESIGNED 2026-09-19 (docs/adr/0023-curator-rule-status.md): this used to be
+    `..._date_rollover_flips_in_effect_and_wording_to_took_effect`, proving that advancing `today`
+    past the rule's own date flipped `in_effect` and the rendered wording. That mechanism is
+    EXACTLY the bug REPORT.md's "The injunction, and why this is not fixed" records: the real DHS
+    rule's date passed on 2026-09-15 and a federal court had enjoined it the day before, so the old
+    version of this test enshrined the very defect the fix closes. `in_effect` and the wording now
+    flip on a CURATOR STATUS change, `today` held fixed throughout -- proving the replacement
+    mechanism does what the old one used to, without the calendar as an input.
     """
-    chunk = _make_chunk(
+    scheduled_chunk = _make_chunk(
         source_url="https://studyinthestates.dhs.gov/quick-facts",
         rule_effective_date=date(2026, 9, 15),
+        rule_status="scheduled",
     )
+    in_force_chunk = _make_chunk(
+        source_url="https://studyinthestates.dhs.gov/quick-facts",
+        rule_effective_date=date(2026, 9, 15),
+        rule_status="in_force",
+    )
+    frozen_today = date(2026, 9, 16)
 
-    freshness = build_freshness([chunk], today=date(2026, 9, 16), cited_indices=set())
+    scheduled_freshness = build_freshness(
+        [scheduled_chunk], today=frozen_today, cited_indices=set()
+    )
+    in_force_freshness = build_freshness([in_force_chunk], today=frozen_today, cited_indices=set())
 
-    assert len(freshness.notices) == 1
-    notice = freshness.notices[0]
-    assert notice.in_effect is True
+    assert scheduled_freshness.notices[0].in_effect is False
+    assert in_force_freshness.notices[0].in_effect is True
 
-    text = freshness_notice_text(freshness.notices)
-    assert text is not None
-    assert "took effect on September 15, 2026" in text
-    assert "takes effect on" not in text
+    scheduled_text = freshness_notice_text(scheduled_freshness.notices, today=frozen_today)
+    in_force_text = freshness_notice_text(in_force_freshness.notices, today=frozen_today)
+    assert "takes effect on September 15, 2026" in scheduled_text
+    assert "took effect on" not in scheduled_text
+    assert "took effect on September 15, 2026" in in_force_text
+    assert "takes effect on" not in in_force_text
 
 
 def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_sentence():
@@ -2110,8 +2197,12 @@ def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_s
     url_a = "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-procedure-faq"
     url_b = "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-quick-facts"
     chunks = [
-        _make_chunk(source_url=url_a, rule_effective_date=date(2026, 9, 15)),
-        _make_chunk(source_url=url_b, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            source_url=url_a, rule_effective_date=date(2026, 9, 15), rule_status="scheduled"
+        ),
+        _make_chunk(
+            source_url=url_b, rule_effective_date=date(2026, 9, 15), rule_status="scheduled"
+        ),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={2})
@@ -2123,7 +2214,7 @@ def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_s
     assert by_url[url_a].reason == "top_ranked"
     assert by_url[url_b].reason == "cited"
 
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
     assert text is not None
     assert (
         text.count("September 15, 2026") == 1
@@ -2134,12 +2225,20 @@ def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_s
 
 def test_freshness_notice_text_keeps_separate_sentences_for_different_dates():
     chunks = [
-        _make_chunk(source_url="https://example.gov/a", rule_effective_date=date(2026, 9, 15)),
-        _make_chunk(source_url="https://example.gov/b", rule_effective_date=date(2027, 1, 1)),
+        _make_chunk(
+            source_url="https://example.gov/a",
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
+        _make_chunk(
+            source_url="https://example.gov/b",
+            rule_effective_date=date(2027, 1, 1),
+            rule_status="scheduled",
+        ),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={2})
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
 
     assert text is not None
     assert "September 15, 2026" in text
@@ -2148,13 +2247,193 @@ def test_freshness_notice_text_keeps_separate_sentences_for_different_dates():
     assert text.count("https://example.gov/b") == 1
 
 
+def test_freshness_notice_text_keeps_scheduled_and_enjoined_separate_when_dates_match():
+    """Grouping is keyed on `(rule_effective_date, rule_status)`, not `(rule_effective_date,
+    in_effect)` (docs/adr/0023-curator-rule-status.md): two sources that happen to share a date but
+    NOT a status must render two separate sentences, never one collapsed sentence that would be
+    only half-true of either source. Keying on `in_effect` alone would have merged these two,
+    since both `scheduled` and `enjoined` read `in_effect=False`.
+    """
+    chunks = [
+        _make_chunk(
+            source_url="https://example.gov/a",
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
+        _make_chunk(
+            source_url="https://example.gov/b",
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="enjoined",
+            rule_status_source="https://www.federalregister.gov/d/2026-14439",
+            rule_status_source_evidences_status=False,
+        ),
+    ]
+
+    freshness = build_freshness(chunks, today=date(2026, 9, 19), cited_indices={2})
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+
+    assert text is not None
+    assert "takes effect on September 15, 2026" in text
+    assert "blocked by a court order" in text
+    assert "https://example.gov/a" in text
+    assert "https://www.federalregister.gov/d/2026-14439" in text
+    assert (
+        "https://example.gov/b" not in text
+    ), "the enjoined sentence must link rule_status_source, not the retrieved page itself"
+
+
 def test_build_freshness_without_rule_effective_date_produces_no_notice_and_no_text():
     chunk = _make_chunk(rule_effective_date=None)
 
     freshness = build_freshness([chunk], today=date(2026, 9, 5), cited_indices=set())
 
     assert freshness.notices == []
-    assert freshness_notice_text(freshness.notices) is None
+    assert freshness_notice_text(freshness.notices, today=date(2026, 9, 5)) is None
+
+
+def test_build_freshness_enjoined_status_with_no_date_still_produces_a_notice():
+    """`enjoined` (like `not_in_force`) may carry no `rule_effective_date` at all
+    (app/rule_status.py's own vocabulary table). The skip condition build_freshness uses is "no
+    status AND no date" (2026-09-19; it used to be "no date" alone), so a status-only chunk must
+    still get a notice -- the old, date-only skip would have silently dropped this exact case.
+
+    `rule_status_source_evidences_status=False` here: the real curated source for this project's own
+    fixed_admission entries points at the Federal Register notice, not the court's order (docs/adr/
+    0023-curator-rule-status.md), so this is the live shape, not merely one of two possibilities --
+    see test_build_freshness_enjoined_status_with_no_date_and_evidences_true_names_the_court below
+    for the other one.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/enjoined-no-date",
+        rule_effective_date=None,
+        rule_status="enjoined",
+        rule_status_source="https://www.federalregister.gov/d/2026-14439",
+        rule_status_source_evidences_status=False,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+
+    assert len(freshness.notices) == 1
+    notice = freshness.notices[0]
+    assert notice.rule_effective_date is None
+    assert notice.rule_status == "enjoined"
+    assert notice.rule_status_source_evidences_status is False
+    assert notice.in_effect is False
+
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+    assert text is not None
+    assert (
+        "One of the sources above describes a rule that has been blocked by a court order " in text
+    )
+    assert "That is recorded by this site's maintainer; the page above does not say it." in text
+    assert "[the rule as published](https://www.federalregister.gov/d/2026-14439)" in text
+    assert "the court's order" not in text
+    # 2026-09-19: enjoined/not_in_force no longer state "today, <date>" at all -- see
+    # freshness_notice_text's own docstring, "HONEST NOTICE WORDING".
+    assert "today, September 19, 2026" not in text
+
+
+def test_build_freshness_enjoined_status_with_no_date_and_evidences_true_names_the_court():
+    """The other evidences value for the same no-date shape as the test above: when
+    `rule_status_source` actually documents the court's order, the wording drops the maintainer
+    attribution and links it as such.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/enjoined-no-date-evidenced",
+        rule_effective_date=None,
+        rule_status="enjoined",
+        rule_status_source="https://www.courtlistener.com/order",
+        rule_status_source_evidences_status=True,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+    assert freshness.notices[0].rule_status_source_evidences_status is True
+
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+    assert text is not None
+    assert (
+        "One of the sources above describes a rule that has been blocked by a court order and "
+        "is not in force. See [the court's order](https://www.courtlistener.com/order)."
+    ) == text
+    assert "maintainer" not in text
+
+
+def test_build_freshness_enjoined_with_date_and_evidences_true_names_the_court():
+    """The evidences=True wording for an `enjoined` chunk that DOES carry a `rule_effective_date`
+    (the with-date companion to the two no-date tests above): the scheduled-date clause is kept, the
+    maintainer attribution is dropped, and the link is captioned as the court's order.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/enjoined-with-date-evidenced",
+        rule_effective_date=date(2026, 9, 15),
+        rule_status="enjoined",
+        rule_status_source="https://www.courtlistener.com/order",
+        rule_status_source_evidences_status=True,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+
+    assert text is not None
+    assert (
+        "One of the sources above describes a rule that was scheduled to take effect on "
+        "September 15, 2026. A court has blocked it and it is not in force. "
+        "See [the court's order](https://www.courtlistener.com/order)."
+    ) == text
+    assert "maintainer" not in text
+    assert "It has since been blocked" not in text
+
+
+def test_build_freshness_not_in_force_status_produces_a_notice_linking_its_source():
+    """`rule_status_source_evidences_status=False`: the source names the rule that was withdrawn,
+    not evidence of the withdrawal itself -- see test_build_freshness_not_in_force_evidences_true
+    below for the other value.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/withdrawn-rule",
+        rule_effective_date=None,
+        rule_status="not_in_force",
+        rule_status_source="https://www.federalregister.gov/withdrawal-notice",
+        rule_status_source_evidences_status=False,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+
+    assert freshness.notices[0].in_effect is False
+    assert text is not None
+    assert (
+        "One of the sources above describes a rule that is not in force. "
+        "That is recorded by this site's maintainer; the page above does not say it. "
+        "See [the rule as published](https://www.federalregister.gov/withdrawal-notice)."
+    ) == text
+    assert "blocked by a court order" not in text
+    assert "the source for that" not in text
+    assert "today, September 19, 2026" not in text
+
+
+def test_build_freshness_not_in_force_evidences_true():
+    """`not_in_force` deliberately never names a mechanism (vacated vs. withdrawn), so its
+    evidences=True label is the neutral "the source for that", never "the court's order" -- see
+    app/rule_status.py's own vocabulary table for why `not_in_force` carries no mechanism at all.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/withdrawn-rule-evidenced",
+        rule_effective_date=None,
+        rule_status="not_in_force",
+        rule_status_source="https://www.federalregister.gov/withdrawal-order",
+        rule_status_source_evidences_status=True,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+
+    assert (
+        "One of the sources above describes a rule that is not in force. "
+        "See [the source for that](https://www.federalregister.gov/withdrawal-order)."
+    ) == text
+    assert "maintainer" not in text
+    assert "the court's order" not in text
 
 
 # =================================================================================================

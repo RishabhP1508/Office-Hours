@@ -303,16 +303,20 @@ const _BLOCKED_COPY_BY_REASON: Record<string, { heading: string; body: React.Rea
     ),
   },
   // app/guardrails/temporal.py's BLOCK signal (that module's own docstring, "BLOCK VS INSERT"):
-  // the generated answer stated a rule that changes on a known future date as though it were
-  // already the rule in force, with nothing in it naming the version still in force today.
-  answer_states_future_rule_as_current: {
-    heading: "A rule here is about to change, so we're not guessing",
+  // the generated answer stated a rule that is not in force today -- a future-dated, an enjoined,
+  // or a withdrawn one (app/rule_status.py::RuleStatus) -- as though it were already the rule in
+  // force, with nothing in it naming the version still in force today. Renamed 2026-09-19 from
+  // answer_states_future_rule_as_current (docs/adr/0023-curator-rule-status.md): "future" stopped
+  // describing every case the moment an enjoined rule could trigger this same guard.
+  answer_states_not_in_force_rule_as_current: {
+    heading: "A rule here is contested or about to change, so we're not guessing",
     body: (
       <>
-        A rule affecting this answer changes on a specific date, and this tool could not state
-        both the current version and the upcoming one clearly enough to trust here, so it’s
-        withheld rather than shown. Check the source linked above directly, or talk to your DSO
-        or a licensed immigration attorney.
+        A rule affecting this answer is not settled today -- it may be changing on a specific
+        date, blocked by a court order, or no longer in force -- and this tool could not state
+        both the current version and the other one clearly enough to trust here, so it’s withheld
+        rather than shown. Check the source linked above directly, or talk to your DSO or a
+        licensed immigration attorney.
       </>
     ),
   },
@@ -320,7 +324,7 @@ const _BLOCKED_COPY_BY_REASON: Record<string, { heading: string; body: React.Rea
 
 function BlockedUnverified({ question, response }: { question: string; response: AnswerResponse }) {
   // Rendered through CitedProse (parseInline/InlineNodes), not bare text, since the temporal
-  // guard's own block message (refusal_reason="answer_states_future_rule_as_current",
+  // guard's own block message (refusal_reason="answer_states_not_in_force_rule_as_current",
   // app/pipeline.py::_future_rule_blocked_message) carries a markdown link to the real, retrieved
   // source -- a bare string render would leave that link inert. This used to be deliberately plain
   // text with a comment noting the fixed safe message never carries a bracket; that is no longer
