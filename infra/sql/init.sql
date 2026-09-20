@@ -84,16 +84,16 @@ COMMENT ON TABLE sources IS
 -- data/sources/raw/, which is gitignored -- a fresh checkout (a GitHub Actions runner, or
 -- production with no persistent volume) has no such file, so every source read as
 -- "meaningful, no_existing_snapshot" and the job could not run there at all without destroying
--- the corpus's freshness history. These two columns move the diff's baseline into the database,
--- which every environment this job runs in already has, so the runner needs nothing left behind
--- by a previous run.
+-- the corpus's freshness history. This column moves the diff's baseline into the database, which
+-- every environment this job runs in already has, so the runner needs nothing left behind by a
+-- previous run.
 --
 -- ADD COLUMN IF NOT EXISTS keeps this file idempotent (re-running it against the already-migrated
--- live database is a no-op for these two lines, same as every other ALTER COLUMN in this file).
--- Both are NULL on every row that existed before this migration -- see
--- app/backfill_source_bodies.py for the one-time, idempotent backfill that must run against
--- production BEFORE the refresh job runs again, and app/recrawl.py::_diff_node for how it refuses
--- to proceed on a source where the backfill has evidently not happened yet.
+-- live database is a no-op for this line, same as every other ALTER COLUMN in this file). NULL on
+-- every row that existed before this migration -- see app/backfill_source_bodies.py for the
+-- one-time, idempotent backfill that must run against production BEFORE the refresh job runs
+-- again, and app/recrawl.py::_diff_node for how it refuses to proceed on a source where the
+-- backfill has evidently not happened yet.
 ALTER TABLE sources
     -- The exact body app/recrawl.py::classify_change last compared THIS source against -- i.e.
     -- the same raw markdown app/ingest.py's snapshot file would have held, before frontmatter,
@@ -107,18 +107,29 @@ ALTER TABLE sources
     -- cosmetic verdict (app/recrawl.py::touch_last_verified) -- exactly the same reason
     -- `fetched_at` does not move on those paths either: this column's meaning is "the body
     -- currently indexed", not "the body most recently fetched".
-    ADD COLUMN IF NOT EXISTS last_indexed_body TEXT,
-    -- A mirror of the curator annotation app/recrawl.py::_diff_node used to read out of the
-    -- PREVIOUS snapshot file's own YAML frontmatter (see documents.rule_effective_date's own
-    -- comment below for what the annotation itself means) so the stateless differ has somewhere
-    -- to read it from without a file. This does NOT replace documents.rule_effective_date, which
-    -- stays the per-CHUNK value actually applied to citations and answers -- this column is the
-    -- single per-SOURCE value app/recrawl.py::reindex_source/touch_last_verified apply uniformly
-    -- to every one of that source's chunks, which mirrors exactly what those two functions already
-    -- did before this column existed (both only ever accepted one `rule_effective_date` for the
-    -- whole source, never one per chunk); it exists so that value survives between recrawl runs
-    -- without a file to carry it in.
-    ADD COLUMN IF NOT EXISTS rule_effective_date DATE;
+    ADD COLUMN IF NOT EXISTS last_indexed_body TEXT;
+
+-- REMOVED (19 September 2026, Option B -- see
+-- docs/adr/0022-manifest-authoritative-annotations.md): this ALTER TABLE used to also add
+-- `sources.rule_effective_date`, a mirror of the curator annotation kept so the stateless differ
+-- above had somewhere to read it from without a snapshot file. Production never received that
+-- column, so every statement against it raised UndefinedColumn -- the actual failure this whole
+-- migration exists to fix, reproduced by the fix itself. `data/sources/sources.yaml` is now
+-- authoritative for `rule_effective_date`: app/recrawl.py::_initial_state reads it from the
+-- manifest entry directly, so there is no longer anywhere in the refresh job that needs a
+-- per-source mirror of it on `sources` at all.
+--
+-- `documents.rule_effective_date` is UNAFFECTED by this removal and stays exactly what it always
+-- was: the per-chunk value citations and answers actually read (see its own ALTER TABLE comment
+-- below).
+--
+-- NO `DROP COLUMN` is issued here, on purpose. A developer database created before this change
+-- keeps `sources.rule_effective_date` as a harmless, nullable leftover -- nothing in this codebase
+-- writes or reads it anymore, so it cannot break anything. app/check_schema.py reports it as an
+-- "extra column" (its docstring already names this exact case) and deliberately does not fail the
+-- check on it: only a MISSING column is a guaranteed runtime failure, and dropping a column by
+-- hand on a database this project has no migration runner for is a bigger, riskier operation than
+-- leaving an inert one in place.
 
 CREATE TABLE IF NOT EXISTS documents (
     id                 BIGSERIAL PRIMARY KEY,
@@ -175,14 +186,50 @@ CREATE INDEX IF NOT EXISTS documents_embedding_hnsw ON documents USING hnsw (emb
 -- that moved, this is a per-CHUNK annotation, not a per-SOURCE one -- a single source page can (and
 -- the fixed-admission FAQ does) carry many chunks, and a future source could in principle state more
 -- than one dated rule across different sections of the same page. Collapsing it to `sources` would
--- lose that per-chunk granularity for no benefit this phase needs. `sources.rule_effective_date`
--- (added below, for the stateless recrawl diff -- docs/adr/0014-stateless-recrawl-diff.md) does NOT
--- reverse this: it is a separate, later addition holding the single value the refresh job applies
--- uniformly to every chunk of one source (which is all app/recrawl.py has ever done -- it has never
--- carried more than one `rule_effective_date` per source), kept only so that value survives between
--- recrawl runs without a snapshot file to read it from. THIS column stays the one citations and
--- answers actually read.
+-- lose that per-chunk granularity for no benefit this phase needs. A `sources.rule_effective_date`
+-- mirror existed briefly for the stateless recrawl diff (docs/adr/0014-stateless-recrawl-diff.md)
+-- and was removed under Option B (docs/adr/0022-manifest-authoritative-annotations.md, see the
+-- `sources` ALTER TABLE above): `data/sources/sources.yaml` is now authoritative for the value the
+-- refresh job applies uniformly to every chunk of one source, and this column was never what that
+-- mirror was for in the first place. THIS column stays the one citations and answers actually
+-- read, unaffected by that removal.
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS rule_effective_date DATE;
+
+-- 19 September 2026, docs/adr/0023-curator-rule-status.md: the injunction against the DHS
+-- fixed-period-of-admission rule showed that a date alone cannot answer "is this rule in force" --
+-- a court can block a rule without moving the date DHS published, and three consumers each
+-- inferred force from a date comparison and each got it wrong the moment the court order and the
+-- effective date disagreed. `rule_status` is the curator's STATED answer (app/rule_status.py::
+-- RuleStatus: in_force, scheduled, enjoined, not_in_force), read by every consumer through
+-- app/rule_status.py::is_in_force, which is `status == 'in_force'` and NEVER a date comparison.
+-- `rule_effective_date` keeps its original, narrower meaning -- the date the agency published --
+-- and stops being an input to any force decision.
+--
+-- THIS IS THE FIRST CHANGE IN THIS FILE THAT GENUINELY ADDS A COLUMN PRODUCTION DOES NOT ALREADY
+-- HAVE, rather than removing one (`sources.rule_effective_date`, above) or backfilling one already
+-- shipped (`sources.last_indexed_body`). It needs a REAL migration against Neon, run BEFORE the
+-- application code that reads these columns is deployed -- see the phase report for the exact
+-- order (schema migration, then `python -m app.sync_annotations` to backfill the two fixed_admission
+-- rows while the OLD code is still serving traffic and ignores both columns entirely, then deploy
+-- the new code). Nullable with no default, so this ALTER is instant and blocks nothing: every
+-- existing row reads NULL for both columns until sync_annotations (or a re-ingest) writes them.
+--
+-- Deliberately on `documents`, not `sources`: `rule_status` is exactly as per-chunk as
+-- `rule_effective_date` is (see that column's own comment above for why it was kept off the Phase 7
+-- `sources` normalization), and the two travel together -- a chunk's force and its date are one
+-- curator annotation, not two.
+-- `rule_status_source_evidences_status` (same day, same migration -- this ADD COLUMN has not been
+-- applied to production yet, so it adds no new migration step): whether `rule_status_source`
+-- actually documents the STATUS (a court's order) or merely the rule the status is ABOUT (e.g. the
+-- Federal Register notice for the rule itself). Curator-stated, required by
+-- app/rule_status.py::validate_rule_status whenever `rule_status_source` is set, never inferred
+-- from the URL -- inferring it would be the same guess this whole migration exists to stop making,
+-- moved rather than removed. Nullable with no default, same reasoning as `rule_status` above: every
+-- existing row reads NULL until sync_annotations (or a re-ingest) writes it.
+ALTER TABLE documents
+    ADD COLUMN IF NOT EXISTS rule_status TEXT,
+    ADD COLUMN IF NOT EXISTS rule_status_source TEXT,
+    ADD COLUMN IF NOT EXISTS rule_status_source_evidences_status BOOLEAN;
 
 -- Phase 7 migration: on a fresh database, `documents` above is already created in its final shape
 -- (source_url REFERENCES sources, no legacy columns), so this block is a no-op there -- it only

@@ -5,10 +5,23 @@ Pure: no network, no DB, no LangGraph. Given the chunks a query actually retriev
 order), the bracket indices the generated answer actually cited, and today's date, `build_freshness`
 produces a structured block (app/schemas.py::Freshness) recording, per distinct retrieved source,
 its page_last_updated/fetched_at/last_verified_at and any rule_effective_date it carries, plus one
-`FreshnessNotice` per distinct source that carries a rule_effective_date at all -- see
+`FreshnessNotice` per distinct source that carries a `rule_status` OR a `rule_effective_date` -- see
 build_freshness's own docstring, and "WHY THAT GATE WAS OVERRIDDEN" below, for why this is no
 longer additionally gated on rank or citation. `freshness_notice_text` turns those notices into the
 sentence(s) app/pipeline.py appends to the rendered answer.
+
+CURATOR-STATED FORCE (2026-09-19, docs/adr/0023-curator-rule-status.md; see REPORT.md, "The
+injunction, and why this is not fixed"). This module used to compare `rule_effective_date` to
+`today` with `<=` to decide `in_effect` and to choose "took effect on" vs. "takes effect on"
+wording. That comparison is gone. `in_effect` is now `app/rule_status.py::
+is_in_force(chunk.rule_status)` -- a curator-stated fact, never arithmetic -- and the wording is
+chosen from `rule_status` directly (see `freshness_notice_text` below), covering two states the
+date-only version had no way to express at all: `enjoined` (a court has blocked the rule; it may
+still take effect later) and `not_in_force` (set aside, vacated, or withdrawn; not coming back).
+The date comparison this replaces is exactly what inverted on 2026-09-15, asserting in this
+system's own uncited voice that a rule a federal court had enjoined the day before had "taken
+effect" -- see docs/adr/0020-temporal-qualification-guard.md's own amendment for the fuller
+account.
 
 CRITICAL SCOPE LIMIT: the appended TEXT fires ONLY on the effective-date condition -- never on "one
 of these sources was last verified N days ago" or any other crawl-freshness signal. An
@@ -64,6 +77,7 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 
 from app.db import RetrievedChunk
+from app.rule_status import RuleStatus, is_in_force
 from app.schemas import Freshness, FreshnessNotice, FreshnessSource
 
 
@@ -161,12 +175,15 @@ def build_freshness(
     source the query retrieved.
 
     `FreshnessNotice` (`Freshness.notices`): a DIFFERENT set from `sources` above, but -- as of the
-    2026-09-07 red-team fix -- narrower ONLY in that it excludes sources with no
-    `rule_effective_date` at all. It is NO LONGER gated on rank or citation: EVERY distinct
-    retrieved source that carries a `rule_effective_date` gets a notice (see the module docstring's
+    2026-09-07 red-team fix -- narrower ONLY in that it excludes a source with NEITHER a
+    `rule_status` NOR a `rule_effective_date`. It is NO LONGER gated on rank or citation: EVERY
+    distinct retrieved source that carries either one gets a notice (see the module docstring's
     "WHY THAT GATE WAS OVERRIDDEN" for why -- the previous top-ranked-or-cited gate suppressed the
-    notice on 5 of 6 real runs of the same real question, exactly when the reader needed the date
-    most).
+    notice on 5 of 6 real runs of the same real question, exactly when the reader needed it most).
+    2026-09-19: the skip condition used to be "no `rule_effective_date`" alone; it is now "no
+    `rule_status` AND no `rule_effective_date`", because `enjoined`/`not_in_force` can carry a
+    status with no date at all (`app/rule_status.py`'s own vocabulary table) and such a source must
+    still get a notice -- the old, date-only skip would have silently dropped exactly that case.
 
     `reason` records which one of three, mutually exclusive, ACCURATE facts holds for this source
     (round 2, 2026-09-08 -- see `app/schemas.py::FreshnessNotice.reason`'s own docstring):
@@ -209,17 +226,20 @@ def build_freshness(
                 rule_effective_date=chunk.rule_effective_date,
             )
         )
-        if chunk.rule_effective_date is None:
+        # 2026-09-19: skip only when NEITHER annotation is present -- see this function's own
+        # docstring. `chunk.rule_effective_date is None` alone used to be the skip; that silently
+        # dropped an `enjoined`/`not_in_force` source with a status but no date at all.
+        if chunk.rule_status is None and chunk.rule_effective_date is None:
             continue
 
         positions = positions_by_url[url]
         top_ranked = 1 in positions
         cited = any(p in cited_indices for p in positions)
         # Red-team fix, 2026-09-07: no gate here anymore -- a notice fires for every distinct
-        # source that reaches this point (i.e., carries a rule_effective_date), regardless of rank
-        # or citation. Round 2, 2026-09-08: `reason` now reports an accurate third value,
-        # "retrieved", for a source that is genuinely neither top-ranked nor cited, rather than
-        # defaulting to "cited" for that case (see this function's own docstring).
+        # source that reaches this point (i.e., carries a rule_status or a rule_effective_date),
+        # regardless of rank or citation. Round 2, 2026-09-08: `reason` now reports an accurate
+        # third value, "retrieved", for a source that is genuinely neither top-ranked nor cited,
+        # rather than defaulting to "cited" for that case (see this function's own docstring).
         if top_ranked:
             reason = "top_ranked"
         elif cited:
@@ -231,7 +251,12 @@ def build_freshness(
             FreshnessNotice(
                 source_url=url,
                 rule_effective_date=chunk.rule_effective_date,
-                in_effect=chunk.rule_effective_date <= today,
+                rule_status=chunk.rule_status,
+                rule_status_source=chunk.rule_status_source,
+                rule_status_source_evidences_status=chunk.rule_status_source_evidences_status,
+                # Curator-stated (app/rule_status.py::is_in_force), never a date comparison -- see
+                # this module's docstring, "CURATOR-STATED FORCE".
+                in_effect=is_in_force(chunk.rule_status),
                 reason=reason,
             )
         )
@@ -239,16 +264,21 @@ def build_freshness(
     return Freshness(as_of=today, sources=sources, notices=notices)
 
 
-def _join_source_links(urls: list[str]) -> str:
+def _join_source_links(urls: list[str], *, label: str = "source") -> str:
     """Render 1..N source URLs as markdown links joined in readable prose ("[the source](a)", "[the
     first source](a) and [the second source](b)", ...), never dropping any of them.
+
+    `label` is the noun phrase every link carries ("source" by default; `freshness_notice_text`
+    passes "rule as published", "court's order", or "source for that" for the enjoined/not_in_force
+    wordings -- see that function's own docstring) -- the ONLY hardcoded noun this module ever
+    prints for a link; it never describes what the rule itself says.
     """
     if len(urls) == 1:
-        return f"[the source]({urls[0]})"
+        return f"[the {label}]({urls[0]})"
 
     ordinals = ["first", "second", "third", "fourth", "fifth"]
     labels = [
-        f"[the {ordinals[i]} source]({url})" if i < len(ordinals) else f"[a source]({url})"
+        f"[the {ordinals[i]} {label}]({url})" if i < len(ordinals) else f"[a {label}]({url})"
         for i, url in enumerate(urls)
     ]
     if len(labels) == 2:
@@ -256,41 +286,151 @@ def _join_source_links(urls: list[str]) -> str:
     return ", ".join(labels[:-1]) + f", and {labels[-1]}"
 
 
-def freshness_notice_text(notices: list[FreshnessNotice]) -> str | None:
-    """The sentence(s) app/pipeline.py appends to the rendered answer, ONE PER DISTINCT
-    (rule_effective_date, in_effect) pair, not one per notice -- two retrieved sources that both
-    carry the same dated rule (the live case: both fixed_admission snapshots state
-    rule_effective_date=2026-09-15) collapse into a single sentence linking every source that
-    stated it, rather than repeating the same sentence once per source. `Freshness.notices` itself
-    stays one-per-source (that structured field is meant to be granular); only this rendered prose
-    collapses.
+def _subject(count: int) -> str:
+    if count == 1:
+        return "One of the sources above describes"
+    return "Some of the sources above describe"
 
-    Wording is generated entirely from each group's own date and in_effect flag -- never a
-    hardcoded description of what the rule changed (e.g. never "60 days to 30"), so this stays
-    correct for any future dated rule the corpus picks up, not just the one live today. Returns
-    None when there is nothing to say (no notices at all).
+
+def freshness_notice_text(notices: list[FreshnessNotice], *, today: date) -> str | None:
+    """The sentence(s) app/pipeline.py appends to the rendered answer, ONE PER DISTINCT
+    (rule_effective_date, rule_status) pair, not one per notice -- two retrieved sources that both
+    carry the same status and date (the live case: both fixed_admission snapshots state
+    rule_status="enjoined") collapse into a single sentence linking every source that stated it,
+    rather than repeating the same sentence once per source. `Freshness.notices` itself stays
+    one-per-source (that structured field is meant to be granular); only this rendered prose
+    collapses. 2026-09-19: the grouping key used to be `(rule_effective_date, in_effect)`; it is
+    now `(rule_effective_date, rule_status)` -- `in_effect` is a derived bit that collapses four
+    states into two (see app/schemas.py::FreshnessNotice's own docstring), and grouping on it
+    directly would merge, for example, a `scheduled` group with an `enjoined` group that happens to
+    share a date, rendering one sentence that is only half-true of either source.
+
+    `today` is `Freshness.as_of` from the SAME call that produced `notices` -- passed explicitly
+    (never read from the clock in here) the same way every date-taking function in this codebase
+    already is. 2026-09-19: `enjoined`/`not_in_force` no longer state `today` at all -- see below,
+    "HONEST NOTICE WORDING"; `in_force` with no `rule_effective_date` is now the only branch that
+    still does (`in_force`/`scheduled` with a date state their own date instead, exactly as before).
+
+    Wording is generated entirely from each group's own date and `rule_status` -- never a hardcoded
+    description of what the rule changed (e.g. never "60 days to 30"), so this stays correct for any
+    future dated or contested rule the corpus picks up, not just the one live today.
+
+    HONEST NOTICE WORDING (2026-09-19, docs/adr/0023-curator-rule-status.md). `enjoined`/
+    `not_in_force` link `rule_status_source` (the court order or withdrawal notice a curator gave),
+    never the chunk's own `source_url` -- linking the retrieved page would assert the block or
+    withdrawal in this system's own uncited voice, which is exactly what `rule_status_source` exists
+    to avoid (see app/rule_status.py's own docstring). But a bare "See [the source](url)" link
+    ITSELF asserted more than the link supported whenever that URL was the Federal Register notice
+    for the rule rather than the court's order: it implied the linked page said what the sentence
+    just said, when the page says no such thing. `rule_status_source_evidences_status` -- curator-
+    stated, never inferred from the URL (app/rule_status.py::validate_rule_status requires it
+    whenever `rule_status_source` is set) -- is what makes three things separate instead of
+    conflated: the force claim (attributed to "this site's maintainer" when the evidence does not
+    say it), the link's label (never a description of what the linked document is called -- see
+    `_join_source_links`'s own docstring), and whether the reader is told the source page is silent
+    on it. `not_in_force` deliberately never names a mechanism (vacated vs. withdrawn) even when
+    `rule_status_source_evidences_status` is True, so its label stays the neutral "the source for
+    that", never "the court's order" -- see app/rule_status.py's own vocabulary table for why
+    `not_in_force` carries no mechanism at all. `enjoined` handles a missing `rule_effective_date`
+    (allowed by that same vocabulary table) by dropping the "was scheduled to take effect on {date}"
+    clause and opening with a date-free sentence instead, for both evidences values.
+
+    Returns None when there is nothing to say (no notices at all).
     """
     if not notices:
         return None
 
-    groups: dict[tuple[date, bool], list[str]] = {}
+    groups: dict[tuple[date | None, str | None], list[FreshnessNotice]] = {}
     for notice in notices:
-        key = (notice.rule_effective_date, notice.in_effect)
-        urls = groups.setdefault(key, [])
-        if notice.source_url not in urls:
-            urls.append(notice.source_url)
+        key = (notice.rule_effective_date, notice.rule_status)
+        groups.setdefault(key, []).append(notice)
 
     sentences = []
-    for (rule_effective_date, in_effect), urls in groups.items():
-        date_str = _format_date(rule_effective_date)
-        verb_phrase = "took effect on" if in_effect else "takes effect on"
-        subject = (
-            "One of the sources above describes"
-            if len(urls) == 1
-            else "Some of the sources above describe"
-        )
-        sentences.append(
-            f"{subject} a rule that {verb_phrase} {date_str}, so the answer differs before and "
-            f"after that date. See {_join_source_links(urls)}."
-        )
+    for (rule_effective_date, rule_status), group_notices in groups.items():
+        source_urls = list(dict.fromkeys(n.source_url for n in group_notices))
+        subject = _subject(len(source_urls))
+
+        if rule_status in (RuleStatus.ENJOINED.value, RuleStatus.NOT_IN_FORCE.value):
+            # Falls back to the retrieved source_url only if rule_status_source is somehow absent
+            # -- app/rule_status.py::validate_rule_status requires it for enjoined/not_in_force at
+            # load time, so this is a defensive floor against a legacy/unsynced row, never the
+            # intended path; it still links SOMETHING rather than raising on an empty
+            # `_join_source_links` list.
+            status_source_urls = (
+                list(
+                    dict.fromkeys(
+                        n.rule_status_source for n in group_notices if n.rule_status_source
+                    )
+                )
+                or source_urls
+            )
+            # A legacy/unsynced row can carry rule_status_source with no
+            # rule_status_source_evidences_status at all (see app/schemas.py::FreshnessNotice's own
+            # docstring) -- treated as False, the cautious reading, never as True: a link this
+            # system cannot confirm actually documents the status must never be captioned as though
+            # it does.
+            evidences_status = bool(group_notices[0].rule_status_source_evidences_status)
+            # The maintainer-attribution clause, shared verbatim by every evidences=False wording
+            # below (enjoined and not_in_force alike) -- one string, not a phrase copied twice, so
+            # the wording cannot drift between the two the next time either changes.
+            maintainer_clause = (
+                "That is recorded by this site's maintainer; the page above does not say it."
+            )
+
+            if rule_status == RuleStatus.ENJOINED.value:
+                if evidences_status:
+                    court_order_link = _join_source_links(status_source_urls, label="court's order")
+                    if rule_effective_date is not None:
+                        sentences.append(
+                            f"{subject} a rule that was scheduled to take effect on "
+                            f"{_format_date(rule_effective_date)}. A court has blocked it and it "
+                            f"is not in force. See {court_order_link}."
+                        )
+                    else:
+                        sentences.append(
+                            f"{subject} a rule that has been blocked by a court order and is not "
+                            f"in force. See {court_order_link}."
+                        )
+                else:
+                    rule_link = _join_source_links(status_source_urls, label="rule as published")
+                    if rule_effective_date is not None:
+                        sentences.append(
+                            f"{subject} a rule that was scheduled to take effect on "
+                            f"{_format_date(rule_effective_date)}. It has since been blocked by a "
+                            f"court order and is not in force. {maintainer_clause} See "
+                            f"{rule_link}."
+                        )
+                    else:
+                        sentences.append(
+                            f"{subject} a rule that has been blocked by a court order and is not "
+                            f"in force. {maintainer_clause} See {rule_link}."
+                        )
+            else:  # not_in_force
+                if evidences_status:
+                    source_link = _join_source_links(status_source_urls, label="source for that")
+                    sentences.append(f"{subject} a rule that is not in force. See {source_link}.")
+                else:
+                    rule_link = _join_source_links(status_source_urls, label="rule as published")
+                    sentences.append(
+                        f"{subject} a rule that is not in force. {maintainer_clause} See "
+                        f"{rule_link}."
+                    )
+        elif rule_effective_date is not None:
+            # `in_force` or `scheduled` (or a legacy/unsynced row with rule_status None but a date
+            # -- see app/schemas.py::FreshnessNotice's own docstring on why that combination can
+            # transiently exist), both wordings UNCHANGED from before this fix.
+            in_effect = is_in_force(rule_status)
+            verb_phrase = "took effect on" if in_effect else "takes effect on"
+            sentences.append(
+                f"{subject} a rule that {verb_phrase} {_format_date(rule_effective_date)}, so the "
+                f"answer differs before and after that date. See {_join_source_links(source_urls)}."
+            )
+        else:
+            # `in_force` with no rule_effective_date at all -- allowed by app/rule_status.py's own
+            # vocabulary table (the date is optional for `in_force`), so this must not crash; there
+            # is no date to state, so the sentence says only that the rule is current.
+            sentences.append(
+                f"{subject} a rule that is in force today, {_format_date(today)}. See "
+                f"{_join_source_links(source_urls)}."
+            )
     return " ".join(sentences)

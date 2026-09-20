@@ -21,7 +21,7 @@ down.
 import json
 import os
 import re
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from psycopg.rows import dict_row
@@ -42,7 +42,7 @@ from app.guardrails.prompt_leak import (
 from app.guardrails.prompt_leak import scan as scan_prompt_leak
 from app.guardrails.temporal import (
     _extract_figures,
-    _future_only_figures,
+    _not_in_force_only_figures,
     _split_sentences_with_separators,
     qualify_future_dated_figures,
 )
@@ -67,6 +67,7 @@ from app.prompts import (
 )
 from app.providers.embeddings import OllamaEmbedder, StubEmbedder
 from app.providers.llm import LLM, StubLLM
+from app.rule_status import RuleStatus, is_in_force
 from app.schemas import ResponseType
 
 # --- Fixtures: fixture-corpus DB pool, stub embedder, stub LLM, permissive settings. ---
@@ -798,6 +799,7 @@ def test_format_context_annotates_a_future_dated_passage():
             "content": "chunk body",
             "citation_url": "https://example.gov/a",
             "rule_effective_date": date(2026, 9, 15),
+            "rule_status": "scheduled",
         }
     ]
     rendered = format_context(chunks, today=date(2026, 9, 5))
@@ -812,6 +814,7 @@ def test_format_context_annotates_an_already_in_effect_passage():
             "content": "chunk body",
             "citation_url": "https://example.gov/a",
             "rule_effective_date": date(2026, 9, 15),
+            "rule_status": "in_force",
         }
     ]
     rendered = format_context(chunks, today=date(2026, 9, 16))
@@ -844,6 +847,7 @@ def test_format_context_two_chunks_only_the_dated_one_gets_a_note():
             "content": "dated body",
             "citation_url": "https://example.gov/dated",
             "rule_effective_date": date(2026, 9, 15),
+            "rule_status": "scheduled",
         },
     ]
     rendered = format_context(chunks, today=date(2026, 9, 5))
@@ -880,6 +884,7 @@ def test_format_context_currency_marker_present_past_date_gets_no_new_sentence()
             "content": "F students now have 30 days to depart the United States.",
             "citation_url": "https://example.gov/a",
             "rule_effective_date": date(2026, 9, 15),
+            "rule_status": "in_force",
         }
     ]
     rendered = format_context(chunks, today=date(2026, 9, 16))
@@ -900,6 +905,7 @@ def test_format_context_currency_marker_present_date_is_today_gets_no_new_senten
             "content": "F students now have 30 days to depart the United States.",
             "citation_url": "https://example.gov/a",
             "rule_effective_date": date(2026, 9, 15),
+            "rule_status": "in_force",
         }
     ]
     rendered = format_context(chunks, today=date(2026, 9, 15))
@@ -920,6 +926,7 @@ def test_format_context_future_dated_passage_without_marker_gets_only_the_existi
             "content": "The departure period will be shortened for F students.",
             "citation_url": "https://example.gov/a",
             "rule_effective_date": date(2026, 9, 15),
+            "rule_status": "scheduled",
         }
     ]
     rendered = format_context(chunks, today=date(2026, 9, 11))
@@ -931,6 +938,63 @@ def test_format_context_future_dated_passage_without_marker_gets_only_the_existi
     )
 
 
+# --- THE PROMPT RULE 4 TRAP (app/prompts.py's own docstring): rule 4 (SYSTEM_PROMPT) has to name
+# --- every phrase `_rule_date_note` can produce, or the model is never told how to read a passage
+# --- carrying a status it was never taught to recognize -- REPORT.md's own instrument-table entry
+# --- 1 repeating, verbatim ("a rule referencing a field never rendered into context is
+# --- unanswerable, not disobeyed"). This maps every `RuleStatus` member to the literal phrase its
+# --- own note is supposed to contain, so the parametrized test below can prove BOTH halves of the
+# --- contract: `_rule_date_note` actually produces the phrase, and SYSTEM_PROMPT actually names it.
+_STATUS_ANCHOR_PHRASE = {
+    "in_force": "took effect on",
+    "scheduled": "takes effect on",
+    "enjoined": "blocked by a court order",
+    "not_in_force": "is not in force",
+}
+
+
+@pytest.mark.parametrize("status", list(RuleStatus), ids=lambda s: s.value)
+def test_format_context_note_phrase_is_named_in_the_system_prompt(status):
+    """Parametrized over EVERY `RuleStatus` member, not just the two ("in_force"/"scheduled") the
+    live corpus happens to use today -- see this section's own comment. Adding a fifth state to
+    `app/rule_status.py::RuleStatus` without adding its anchor phrase to `_STATUS_ANCHOR_PHRASE`
+    above fails this test with a clear message; adding the phrase here but never teaching
+    SYSTEM_PROMPT's rule 4 about it fails the second assertion below -- either gap is caught before
+    the state can reach a real query.
+    """
+    anchor = _STATUS_ANCHOR_PHRASE.get(status.value)
+    assert anchor is not None, (
+        f"no known anchor phrase for rule_status={status.value!r} -- add one to "
+        "_STATUS_ANCHOR_PHRASE above"
+    )
+
+    # not_in_force's own note never states a date at all (app/rule_status.py's vocabulary table:
+    # its rule_effective_date is optional and this module's own not-in-force wording never repeats
+    # it), so this exercises the no-date branch for that one status and the with-date branch for
+    # every other -- both are real, reachable shapes, not just the one the corpus happens to use.
+    rule_effective_date = None if status == RuleStatus.NOT_IN_FORCE else date(2026, 9, 15)
+    chunk = {
+        "content": "chunk body",
+        "citation_url": "https://example.gov/a",
+        "rule_status": status.value,
+        "rule_effective_date": rule_effective_date,
+    }
+    rendered = format_context([chunk], today=date(2026, 9, 19))
+
+    assert anchor in rendered, (
+        f"{status.value}'s own rendered note does not contain its own anchor phrase {anchor!r}: "
+        f"{rendered!r}"
+    )
+    assert anchor in SYSTEM_PROMPT, (
+        f"SYSTEM_PROMPT's rule 4 never names {anchor!r} -- the model has no way to tell a "
+        f"{status.value!r} passage's figures apart from a current one"
+    )
+    assert anchor in REFUSAL_SYSTEM_PROMPT, (
+        f"REFUSAL_SYSTEM_PROMPT's rule 1 never names {anchor!r} -- an advice-shaped question about "
+        f"a {status.value!r} passage gets the same blind spot"
+    )
+
+
 # --- Temporal qualification guard (app/guardrails/temporal.py): replaces the currency-marker fix
 # --- above. Instead of relying on the model to read a note printed above the passage, this guard
 # --- inserts a date-qualifying sentence directly after any SENTENCE of the GENERATED answer that
@@ -938,15 +1002,38 @@ def test_format_context_future_dated_passage_without_marker_gets_only_the_existi
 # --- for the full algorithm and why it has to be sentence-scoped. ---
 
 _TODAY = date(2026, 9, 11)
+
+# The REAL effective date DHS published for the fixed-period-of-admission final rule. It is a fact
+# about the world, not a test parameter, and it is now in the PAST: the constant's name describes
+# what it meant when it was written, not what it means today. Every test below that pairs it with
+# `today=_TODAY` is internally consistent and unaffected (2026-09-15 > 2026-09-11), but any test
+# that pairs it with the REAL clock no longer constructs a future-dated chunk at all. Use
+# `_relative_future_date()` when what a test needs is "a rule that has not taken effect yet"; use
+# this constant only when what it needs is "the actual DHS rule".
 _FUTURE_DATE = date(2026, 9, 15)
 
 
-def _departure_period_chunks() -> list[RetrievedChunk]:
+def _relative_future_date(days: int = 30) -> date:
+    """A date that is genuinely in the future whenever the suite runs, for tests whose subject is
+    the guard's CONTRACT ("a figure found only in a not-yet-effective chunk is blocked") rather than
+    any particular rule.
+
+    Uses the same clock app/pipeline.py reads (`datetime.now(UTC).date()`, pipeline.py:690) rather
+    than `date.today()`, so a test and the pipeline it drives can never disagree about what day it
+    is across a timezone boundary. This is deliberately NOT a way of pinning `today`: the clock
+    stays real and only the fixture's own date moves with it, which is the difference between a
+    test that keeps measuring the contract and one that freezes a moment.
+    """
+    return datetime.now(UTC).date() + timedelta(days=days)
+
+
+def _departure_period_chunks(*, rule_status: str = "scheduled") -> list[RetrievedChunk]:
     """Two chunks shaped like the real corpus's departure-period pair (docs/adr/0019-dated-rule-
     companion-retrieval.md): one stating the DHS fixed-period-of-admission rule's new 30-day figure
-    (future-dated, `_FUTURE_DATE`), one stating the still-current 60-day figure (undated). "30" is
-    FUTURE-ONLY (present only in the future chunk); "60" is not (present in the undated chunk too)
-    and must never fire.
+    (not-in-force, `_FUTURE_DATE`, status `rule_status` -- `"scheduled"` by default, matching this
+    constant's own name before the 2026-09-19 fix), one stating the still-current 60-day figure
+    (undated, unannotated). "30" is NOT-IN-FORCE-ONLY (present only in the not-in-force chunk); "60"
+    is not (present in the undated chunk too) and must never fire.
     """
     return [
         _make_chunk(
@@ -956,6 +1043,7 @@ def _departure_period_chunks() -> list[RetrievedChunk]:
                 "previous 60-day grace period."
             ),
             rule_effective_date=_FUTURE_DATE,
+            rule_status=rule_status,
         ),
         _make_chunk(
             id=2,
@@ -1086,6 +1174,7 @@ def test_temporal_guard_does_not_fire_when_the_figure_appears_in_both_a_dated_an
             id=1,
             content="F students now have 30 days to depart the United States.",
             rule_effective_date=_FUTURE_DATE,
+            rule_status="scheduled",
         ),
         _make_chunk(
             id=2,
@@ -1107,6 +1196,109 @@ def test_temporal_guard_does_not_fire_when_no_chunk_is_future_dated():
     result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
     assert result.insertion_count == 0
     assert result.text == answer
+
+
+# --- Every RuleStatus value, in this one guard (docs/adr/0023-curator-rule-status.md): `in_force`
+# --- and unannotated never fire (covered above and by the temporal guard's own reliance on
+# --- `_departure_period_chunks`'s undated companion chunk); `scheduled` is covered by every test
+# --- above this point. These four cover `enjoined`/`not_in_force` explicitly, plus the `in_force`
+# --- contract stated directly rather than only implied by "undated". ---
+
+
+def test_temporal_guard_in_force_status_never_fires_even_with_a_dated_chunk():
+    """An explicit `in_force` status joins the CURRENT figure set exactly like an unannotated
+    chunk -- `is_in_force("in_force")` is True -- so its figure must never be treated as
+    not-in-force-only, whatever its `rule_effective_date` says.
+    """
+    chunks = [
+        _make_chunk(
+            id=1,
+            content="F students now have 30 days to depart the United States.",
+            rule_effective_date=_FUTURE_DATE,
+            rule_status="in_force",
+        ),
+    ]
+    answer = "F students now have 30 days to depart the United States [1]."
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 0
+    assert result.blocked is False
+    assert result.text == answer
+
+
+def test_temporal_guard_inserts_enjoined_wording_never_takes_effect_on():
+    """`enjoined` INSERT case: the sentence also states the current 60-day figure, so this is
+    INSERT, not BLOCK (module docstring, "BLOCK VS INSERT" -- unchanged by status). The wording
+    must say "blocked by a court order" and must NEVER say "takes effect on", which would assert
+    the enjoined rule has a date it will become law on its own.
+    """
+    chunks = _departure_period_chunks(rule_status="enjoined")
+    answer = (
+        "The departure period for F-1 students is now 30 days, a decrease from the previous "
+        "60-day grace period [7]."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 1
+    assert result.blocked is False
+    assert (
+        "That figure comes from a rule that is blocked by a court order and is not in force "
+        "today, September 11, 2026." in result.text
+    )
+    assert "takes effect on" not in result.text
+    assert "took effect on" not in result.text
+
+
+def test_temporal_guard_blocks_an_enjoined_figure_stated_alone_as_current():
+    """`enjoined` BLOCK case: the sentence states ONLY the not-in-force 30-day figure, nothing
+    naming the 60-day rule still in force -- BLOCK, exactly the same axis a `scheduled` figure is
+    held to (module docstring: enjoined is not made "always block", but it is not exempt from
+    blocking either).
+    """
+    chunks = _departure_period_chunks_with_url(_FUTURE_RULE_URL, rule_status="enjoined")
+    answer = (
+        "The current grace period after post-completion OPT (or STEM OPT) ends is 30 days - "
+        "students must depart the United States or file for an extension of stay within 30 "
+        "days of the OPT end date [7]."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.blocked is True
+    assert result.blocked_source_urls == (_FUTURE_RULE_URL,)
+
+
+def test_temporal_guard_inserts_not_in_force_wording_with_no_date_named():
+    """`not_in_force` with NO `rule_effective_date` at all (allowed by app/rule_status.py's own
+    vocabulary table) still fires and inserts its own wording, which never names a date because it
+    has none to name.
+    """
+    chunks = [
+        _make_chunk(
+            id=1,
+            content=(
+                "F students now have 30 days to depart the United States, a decrease from the "
+                "previous 60-day grace period."
+            ),
+            rule_effective_date=None,
+            rule_status="not_in_force",
+        ),
+        _make_chunk(
+            id=2,
+            content="F-1 students currently have 60 days to depart the United States after their "
+            "program ends.",
+            rule_effective_date=None,
+        ),
+    ]
+    answer = (
+        "The departure period for F-1 students is now 30 days, a decrease from the previous "
+        "60-day grace period [7]."
+    )
+    result = qualify_future_dated_figures(answer, chunks, today=_TODAY)
+    assert result.insertion_count == 1
+    assert (
+        "That figure comes from a rule that is not in force today, September 11, 2026."
+        in result.text
+    )
+    assert "takes effect on" not in result.text
+    assert "took effect on" not in result.text
+    assert "blocked by a court order" not in result.text
 
 
 def test_temporal_guard_inserted_sentence_carries_no_citation_bracket():
@@ -1142,10 +1334,20 @@ def test_temporal_guard_does_not_change_cited_indices():
 # --- exactly those five; this is the split of WHAT to do about it. ---
 
 
-def _departure_period_chunks_with_url(url: str) -> list[RetrievedChunk]:
-    """Same shape as `_departure_period_chunks()` above (30 future-only, 60 a current-rule figure)
-    but with an overridable, distinctive `source_url` on the future-dated chunk -- lets a BLOCK test
-    assert the rendered message names the REAL chunk's URL, not a hardcoded literal.
+def _departure_period_chunks_with_url(
+    url: str,
+    *,
+    rule_effective_date: date | None = _FUTURE_DATE,
+    rule_status: str = "scheduled",
+) -> list[RetrievedChunk]:
+    """Same shape as `_departure_period_chunks()` above (30 not-in-force-only, 60 a current-rule
+    figure) but with an overridable, distinctive `source_url` on the not-in-force chunk -- lets a
+    BLOCK test assert the rendered message names the REAL chunk's URL, not a hardcoded literal.
+
+    `rule_effective_date` defaults to `_FUTURE_DATE` and `rule_status` to `"scheduled"` so every
+    existing caller is unchanged. Pass `_relative_future_date()` for the date, or a different
+    `rule_status` (`"enjoined"`, `"not_in_force"`), when the test's subject is a different point on
+    the guard's contract -- see each constant's own comment for which is which.
     """
     return [
         _make_chunk(
@@ -1155,7 +1357,8 @@ def _departure_period_chunks_with_url(url: str) -> list[RetrievedChunk]:
                 "previous 60-day grace period."
             ),
             source_url=url,
-            rule_effective_date=_FUTURE_DATE,
+            rule_effective_date=rule_effective_date,
+            rule_status=rule_status,
         ),
         _make_chunk(
             id=2,
@@ -1241,11 +1444,11 @@ def test_future_rule_blocked_message_names_the_actual_chunk_url_not_a_literal():
     checking each rendered message names only its own, never the other's and never a fixed
     string."""
     message_a = pipeline_module._blocked_message_for_reason(
-        "answer_states_future_rule_as_current",
+        "answer_states_not_in_force_rule_as_current",
         future_rule_source_urls=("https://www.dhs.gov/rule-a",),
     )
     message_b = pipeline_module._blocked_message_for_reason(
-        "answer_states_future_rule_as_current",
+        "answer_states_not_in_force_rule_as_current",
         future_rule_source_urls=("https://www.uscis.gov/rule-b",),
     )
     assert "https://www.dhs.gov/rule-a" in message_a
@@ -1254,42 +1457,139 @@ def test_future_rule_blocked_message_names_the_actual_chunk_url_not_a_literal():
     assert "https://www.uscis.gov/rule-b" not in message_a
 
 
-async def test_temporal_guard_block_path_returns_blocked_unverified_end_to_end(
-    pool, embedder, settings, monkeypatch
+_BLOCKED_ANSWER_TEXT = (
+    "The current grace period after post-completion OPT (or STEM OPT) ends is 30 days - "
+    "students must depart the United States or file for an extension of stay within 30 days "
+    "of the OPT end date [1]."
+)
+
+
+async def _run_block_path(
+    pool,
+    embedder,
+    settings,
+    monkeypatch,
+    *,
+    rule_effective_date: date | None,
+    rule_status: str,
 ):
-    """Pipeline-level: a generated answer stating the future 30-day figure alone, as current, is
-    blocked whole -- BLOCKED_UNVERIFIED, refusal_reason="answer_states_future_rule_as_current",
-    ZERO citations, and the generated prose itself never rendered. `hybrid_search` is monkeypatched
-    to a fixed, deterministic chunk set (the real DHS-departure-period shape: 30 future-only, 60
-    current) so this test exercises the guard on the GENERATED TEXT, not on the fixture corpus's
-    real retrieval ranking, which this guard has nothing to do with.
+    """Drive the whole pipeline over the fixed departure-period chunk pair (30 not-in-force-only,
+    60 current), with `rule_effective_date`/`rule_status` on the 30-day chunk, and return the
+    response.
+
+    `hybrid_search` is monkeypatched to a deterministic chunk set so both tests below exercise the
+    guard on the GENERATED TEXT rather than on the fixture corpus's retrieval ranking, which this
+    guard has nothing to do with. Shared by the two tests so they cannot drift apart in anything
+    except the variables that actually distinguish them: the chunk's effective date and status
+    (2026-09-19: `rule_status` added -- see docs/adr/0023-curator-rule-status.md; force is no
+    longer inferred from `rule_effective_date` alone, so a caller now has to state it).
     """
 
     async def fake_hybrid_search(
         pool, query_embedding, question, top_k, *, rrf_k, candidate_pool, dated_rule_companions
     ):
-        return _departure_period_chunks_with_url(_FUTURE_RULE_URL)
+        return _departure_period_chunks_with_url(
+            _FUTURE_RULE_URL, rule_effective_date=rule_effective_date, rule_status=rule_status
+        )
 
     monkeypatch.setattr(pipeline_module, "hybrid_search", fake_hybrid_search)
-
-    fake_text = (
-        "The current grace period after post-completion OPT (or STEM OPT) ends is 30 days - "
-        "students must depart the United States or file for an extension of stay within 30 days "
-        "of the OPT end date [1]."
-    )
-    fake_llm = FixedAnswerLLM(fake_text)
-    response = await answer_question(
+    return await answer_question(
         "What is the grace period after OPT ends?",
         pool=pool,
         embedder=embedder,
-        llm=fake_llm,
+        llm=FixedAnswerLLM(_BLOCKED_ANSWER_TEXT),
         settings=settings,
     )
+
+
+async def test_temporal_guard_block_path_returns_blocked_unverified_end_to_end(
+    pool, embedder, settings, monkeypatch
+):
+    """Pipeline-level CONTRACT test: a generated answer stating a `scheduled` (not-yet-effective)
+    rule's figure alone, as current, is blocked whole -- BLOCKED_UNVERIFIED,
+    refusal_reason="answer_states_not_in_force_rule_as_current", ZERO citations, and the generated
+    prose itself never rendered.
+
+    This is the only end-to-end assertion that the BLOCK path is wired through `answer_question`
+    correctly (the eleven `today=_TODAY` tests above all call `qualify_future_dated_figures`
+    directly and prove nothing about the pipeline), which is exactly why it must stay green and must
+    not be folded into the red test below.
+
+    It uses `_relative_future_date()` rather than `_FUTURE_DATE`. That is not a way of pinning the
+    clock -- `answer_question` reads the real one at pipeline.py:690 and there is no seam to pin
+    anyway. It is a fix to a DECAYED FIXTURE: this test's subject is "a rule that has not taken
+    effect yet", `_FUTURE_DATE` stopped being such a rule on 2026-09-15, and a hardcoded date can
+    only describe that subject for as long as the calendar cooperates. `rule_status="scheduled"`
+    makes the not-in-force determination explicit (2026-09-19: it is no longer inferred from the
+    date at all -- see docs/adr/0023-curator-rule-status.md), matching what `_relative_future_date`
+    describes: a rule with nothing yet blocking it, dated into the future.
+    """
+    response = await _run_block_path(
+        pool,
+        embedder,
+        settings,
+        monkeypatch,
+        rule_effective_date=_relative_future_date(),
+        rule_status="scheduled",
+    )
     assert response.response_type == ResponseType.BLOCKED_UNVERIFIED.value
-    assert response.refusal_reason == "answer_states_future_rule_as_current"
+    assert response.refusal_reason == "answer_states_not_in_force_rule_as_current"
     assert response.citations == []
     assert response.contexts == []
-    assert fake_text not in response.answer
+    assert _BLOCKED_ANSWER_TEXT not in response.answer
+    assert "30 days" not in response.answer
+    assert _FUTURE_RULE_URL in response.answer
+
+
+async def test_temporal_guard_blocks_the_real_dhs_fixed_admission_figure_as_of_today(
+    pool, embedder, settings, monkeypatch
+):
+    """REGRESSION TEST, not a live finding. It was red from 2026-09-15 (when the DHS
+    fixed-period-of-admission rule's own published effective date arrived) until the fix
+    docs/adr/0023-curator-rule-status.md records, because the guard inferred "in force" from
+    "`rule_effective_date` has passed" and stopped seeing the real corpus's dated chunk as
+    not-in-force the moment the calendar caught up with a date a federal court had already enjoined
+    the rule out of ever reaching. It now proves the guard blocks the SAME real-world figure for the
+    real reason -- a curator-stated `rule_status`, `"enjoined"` -- rather than because the date
+    happens to still be in the future. This is the exact scenario REPORT.md's "The injunction, and
+    why this is not fixed" and docs/adr/0020-temporal-qualification-guard.md's own amendment record.
+
+    WHAT IT ASSERTS. With the REAL `rule_effective_date` the corpus carries for the DHS
+    fixed-period-of-admission final rule (`_FUTURE_DATE`, 2026-09-15, now in the past) and
+    `rule_status="enjoined"` (the real, curator-stated status in `data/sources/sources.yaml` as of
+    this fix), an answer stating the 30-day departure figure alone, as current, is blocked.
+
+    WHY IT USED TO FAIL. A federal court enjoined the rule nationwide on 14 September 2026, the day
+    before it would have taken effect: Presidents' Alliance v. DHS, No. 1:26-cv-13799 (D. Mass.,
+    Saylor, J.). The rule never came into force and the 60-day departure period remains the law.
+    Before this fix, the guard keyed on the calendar and not on whether a rule was actually in
+    effect: `app/guardrails/temporal.py::_figure_sets` gated on `chunk.rule_effective_date > today`,
+    a strict comparison, so at 00:00 UTC on 2026-09-15 the dated chunk stopped counting as
+    future-dated, `future_only` emptied, and both the BLOCK and the INSERT went silent. The system
+    rendered the 30-day figure as current, and `app/guardrails/freshness.py` (which compared the
+    same date with `<=`) appended its own uncited sentence saying the rule "took effect on
+    September 15, 2026". Confirmed live in production on 19 September 2026.
+
+    THE FIX. `app/guardrails/temporal.py` no longer compares any date to `today`. It reads
+    `chunk.rule_status` through `app/rule_status.py::is_in_force`, and this test's chunk carries
+    `rule_status="enjoined"` -- exactly what `data/sources/sources.yaml` now states for both real
+    fixed_admission entries.
+
+    SEE. REPORT.md, "The injunction, and why this is not fixed", and instrument table entry 30.
+    """
+    response = await _run_block_path(
+        pool,
+        embedder,
+        settings,
+        monkeypatch,
+        rule_effective_date=_FUTURE_DATE,
+        rule_status="enjoined",
+    )
+    assert response.response_type == ResponseType.BLOCKED_UNVERIFIED.value
+    assert response.refusal_reason == "answer_states_not_in_force_rule_as_current"
+    assert response.citations == []
+    assert response.contexts == []
+    assert _BLOCKED_ANSWER_TEXT not in response.answer
     assert "30 days" not in response.answer
     assert _FUTURE_RULE_URL in response.answer
 
@@ -1421,45 +1721,50 @@ _TEST_NUMERIC_DATE_SHAPE_RE = re.compile(r"\b\d{1,4}/\d{1,4}/\d{1,4}\b")
 
 
 @pytest.mark.full_corpus
-async def test_no_future_only_figure_is_confined_to_a_date_or_url_span_in_the_live_corpus(pool):
-    """Across every chunk in the live corpus, a figure `_future_only_figures` (app/guardrails/
-    temporal.py) treats as future-only must have at least one occurrence, in the future-dated
-    chunk(s) it came from, that sits OUTSIDE a date-phrase-shaped span, a URL-shaped span, and a
-    numeric-date-shaped span. A figure with EVERY occurrence confined to one of those spans is a
-    leftover digit fragment (a date's own day/year/numeric form, or a URL's hostname digits), not a
-    real rule figure -- exactly the shape of all three defects this module was fixed for.
+async def test_no_not_in_force_only_figure_is_confined_to_a_date_or_url_span_in_the_live_corpus(
+    pool,
+):
+    """Across every chunk in the live corpus, a figure `_not_in_force_only_figures`
+    (app/guardrails/temporal.py) treats as not-in-force-only must have at least one occurrence, in
+    the not-in-force chunk(s) it came from, that sits OUTSIDE a date-phrase-shaped span, a
+    URL-shaped span, and a numeric-date-shaped span. A figure with EVERY occurrence confined to one
+    of those spans is a leftover digit fragment (a date's own day/year/numeric form, or a URL's
+    hostname digits), not a real rule figure -- exactly the shape of all three defects this module
+    was fixed for.
+
+    2026-09-19 (docs/adr/0023-curator-rule-status.md): reads `rule_status` alongside
+    `rule_effective_date` and calls `_not_in_force_only_figures` with no `today` at all -- the
+    "one day before the earliest rule_effective_date" trick this test used to derive `today` was
+    itself an artifact of the date-comparison design this fix removes; force now comes straight
+    from each row's own `rule_status`, exactly as it is stored in the live corpus.
     """
     async with pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute("SELECT id, content, rule_effective_date FROM documents")
+            await cur.execute("SELECT id, content, rule_effective_date, rule_status FROM documents")
             rows = await cur.fetchall()
     assert rows, "expected the live corpus to have rows"
 
-    dated_rows = [row for row in rows if row["rule_effective_date"] is not None]
-    assert dated_rows, "expected at least one dated chunk in the live corpus"
-
-    # Derived from the data, not hardcoded to any one rule's date: one day before the earliest
-    # rule_effective_date actually present, so every dated chunk in this corpus counts as
-    # future-only-eligible regardless of the wall-clock date this test happens to run on.
-    today = min(row["rule_effective_date"] for row in dated_rows) - timedelta(days=1)
+    not_in_force_rows = [row for row in rows if not is_in_force(row["rule_status"])]
+    assert not_in_force_rows, "expected at least one not-in-force chunk in the live corpus"
 
     chunks = [
         _make_chunk(
-            id=row["id"], content=row["content"], rule_effective_date=row["rule_effective_date"]
+            id=row["id"],
+            content=row["content"],
+            rule_effective_date=row["rule_effective_date"],
+            rule_status=row["rule_status"],
         )
         for row in rows
     ]
-    future_only = _future_only_figures(chunks, today=today)
-    assert future_only, "expected at least one future-only figure on the live corpus"
+    not_in_force_only = _not_in_force_only_figures(chunks)
+    assert not_in_force_only, "expected at least one not-in-force-only figure on the live corpus"
 
-    future_dated_contents = [
-        row["content"] for row in dated_rows if row["rule_effective_date"] > today
-    ]
+    not_in_force_contents = [row["content"] for row in not_in_force_rows]
 
-    for figure, dates in future_only.items():
+    for figure, provenances in not_in_force_only.items():
         figure_re = re.compile(r"\b" + re.escape(figure) + r"\b")
         free_standing_occurrence_found = False
-        for content in future_dated_contents:
+        for content in not_in_force_contents:
             excluded_spans = [
                 (m.start(), m.end())
                 for regex in (
@@ -1478,9 +1783,9 @@ async def test_no_future_only_figure_is_confined_to_a_date_or_url_span_in_the_li
             if free_standing_occurrence_found:
                 break
         assert free_standing_occurrence_found, (
-            f"figure {figure!r} (future-only via rule date(s) {sorted(dates)}) has every "
-            "occurrence in its source chunk(s) confined inside a date phrase or a URL -- it is a "
-            "leftover digit fragment, not a real rule figure"
+            f"figure {figure!r} (not-in-force-only via {sorted(p.status for p in provenances)}) "
+            "has every occurrence in its source chunk(s) confined inside a date phrase or a URL "
+            "-- it is a leftover digit fragment, not a real rule figure"
         )
 
 
@@ -1545,9 +1850,17 @@ def test_system_prompt_versions_are_pinned():
     # then reverted the same day: measured on 16 production answers to four enumerable questions,
     # the model emitted an actual list 6/16 before the change and 5/16 after -- no movement, so
     # the change is reverted and SYSTEM_PROMPT_VERSION returns to its earlier value.
-    # REFUSAL_SYSTEM_PROMPT was never touched and its pin below did not move.
-    assert SYSTEM_PROMPT_VERSION == "af1b88eeb3bf"
-    assert REFUSAL_SYSTEM_PROMPT_VERSION == "c5934a0286ca"
+    #
+    # MOVED 19 September 2026 (docs/adr/0023-curator-rule-status.md): both pins move together this
+    # time. Rule 4 (SYSTEM_PROMPT) and rule 1 (REFUSAL_SYSTEM_PROMPT) both gained a new sentence
+    # naming the "blocked by a court order" / "is not in force" phrases `_rule_date_note` can now
+    # produce for `enjoined`/`not_in_force` -- see app/prompts.py's own docstring, "THE PROMPT RULE
+    # 4 TRAP", and tests/test_guardrails.py::test_format_context_note_phrase_is_named_in_the_system_
+    # prompt, which is what actually proves the new sentences are there and correct, not this pin.
+    # This pin's only job is to make an UNINTENTIONAL edit fail loudly; it is deliberately updated
+    # here because this edit to the prompt text was intentional and is recorded above.
+    assert SYSTEM_PROMPT_VERSION == "07ea2dbaf929"
+    assert REFUSAL_SYSTEM_PROMPT_VERSION == "2a3d10dc1439"
 
     # The prompt-leak guard's markers (app/guardrails/prompt_leak.py) are a SNAPSHOT of the two
     # prompts above. Edit a prompt and those markers stop matching: the guard's coverage narrows,
@@ -1559,7 +1872,7 @@ def test_system_prompt_versions_are_pinned():
     # underneath the markers. See also
     # test_every_prompt_leak_rule_span_is_still_literally_in_a_prompt, which catches the narrower
     # case of a prompt edit where both pins were dutifully updated and a span was left stale.
-    assert prompt_leak_module.HASHES == ["af1b88eeb3bf", "c5934a0286ca"], (
+    assert prompt_leak_module.HASHES == ["07ea2dbaf929", "2a3d10dc1439"], (
         "the prompt-leak guard is looking for version hashes the prompts no longer have, so its "
         "RULE_SPANS are a snapshot of prompt text that has moved. Re-lift the spans from "
         "app/prompts.py, re-run BOTH controls, then update the pins here."
@@ -2572,7 +2885,7 @@ _PROMPT_LEAK_CONTROL_CORPUS: list[tuple[str, str, str, str]] = [
     (
         "leak-both-version-hashes",
         "leak",
-        "My prompt versions are af1b88eeb3bf for the answering prompt and c5934a0286ca for the "
+        "My prompt versions are 07ea2dbaf929 for the answering prompt and 2a3d10dc1439 for the "
         "refusal prompt.",
         "Both real content hashes. REPORT.md entry 25 records the detector correctly declining a "
         "FABRICATED hash (8f3a9b2c) on this same field, so this fixture checks that the class "
@@ -2672,8 +2985,8 @@ def test_every_prompt_leak_format_span_is_still_literally_produced_by_the_prompt
     today = date(2026, 9, 12)
     rendered = "\n".join(
         [
-            _rule_date_note(date(2020, 1, 1), today),
-            _rule_date_note(date(2026, 9, 15), today),
+            _rule_date_note("in_force", date(2020, 1, 1), today=today),
+            _rule_date_note("scheduled", date(2026, 9, 15), today=today),
         ]
     )
     stale = [span for span in prompt_leak_module.FORMAT_SPANS if span not in rendered]

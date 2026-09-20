@@ -81,12 +81,51 @@ jobs:
       # `sources.last_indexed_body`, never from a snapshot file -- see
       # docs/adr/0014-stateless-recrawl-diff.md), so an empty/absent raw_dir on its own is no
       # longer a reason to skip anything once a database exists.
+      # The skip below is CORRECT and deliberate (see the step's own body). What was wrong, until
+      # 19 September 2026, is that it was SILENT: a run that did nothing and a run that fetched all
+      # 14 sources and found nothing changed produced the identical pair of signals, a green check
+      # and a runtime of roughly half a minute. Fourteen consecutive days of daily "success" went by
+      # that way while the corpus aged twelve days, and nothing in this repository could have said
+      # so. That ambiguity is the same shape as the `sources` table being unable to tell a failed
+      # fetch from an unchanged page, one layer up.
+      #
+      # The annotation and summary below break the tie without lying in the other direction. Note
+      # what is deliberately NOT done here: this step still `exit 0`s. Failing the run would mark a
+      # deliberate, known, currently-correct configuration as broken, and fourteen red runs a day is
+      # how a team learns to ignore red. Turning this into a hard failure is the right move the
+      # moment DATABASE_URL is expected to be set, and not one day before.
       - name: No database configured yet -- the scheduled refresh is inert (Phase 8 not landed)
         if: steps.db.outputs.mode == 'dry-run'
         run: |
           echo "No DATABASE_URL secret configured yet."
           echo "Skipping the crawl entirely: there is nowhere to read a diff baseline from or write"
           echo "a result to. This step is a deliberate no-op until a database exists."
+
+          echo "::warning title=Scheduled refresh did NOT run::No DATABASE_URL secret is configured, so zero sources were fetched and no freshness clock moved. This run is green because skipping is currently correct, not because the corpus was checked."
+
+          {
+            echo "## Scheduled refresh SKIPPED -- nothing was fetched"
+            echo ""
+            echo "**No \`DATABASE_URL\` secret is configured**, so this run took the no-op branch:"
+            echo "zero HTTP requests, zero sources checked, zero freshness clocks moved."
+            echo ""
+            echo "This run is green because the skip is currently correct (Phase 8 has not landed a"
+            echo "hosted database, and fetching 14 government pages to discard the result would be"
+            echo "worse behaviour, not better). **It is not green because the corpus was verified.**"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Sources fetched | **0 of 14** |"
+            echo "| Diff baseline read | none (no database) |"
+            echo "| \`last_verified_at\` updated | **no** |"
+            echo "| Corpus age | unchanged by this run, and still growing |"
+            echo ""
+            echo "To make this run do something, set the \`DATABASE_URL\` repository secret."
+            echo "Before doing that, check REPORT.md: the fetcher currently 403s on all 14 sources"
+            echo "from at least one environment, and that defect is latent only because this gate"
+            echo "has never let a fetch happen."
+          } >> "$GITHUB_STEP_SUMMARY"
+
           exit 0
 
       # Once Phase 8 stands up a hosted database and a hosted embedder, this step also needs

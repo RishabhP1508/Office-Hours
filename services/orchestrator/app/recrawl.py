@@ -61,11 +61,15 @@ from app.ingest import (
     fetch_page,
     load_existing_snapshot_index,
     load_snapshot,
+    manifest_annotation,
+    manifest_annotation_bool,
+    manifest_annotation_str,
     mint_snapshot_filename,
     read_manifest,
     render_snapshot,
 )
 from app.providers.embeddings import Embedder, get_embedder
+from app.rule_status import validate_rule_status
 
 # ---------------------------------------------------------------------------------------------
 # normalize_for_diff: line-based normalization that strips boilerplate before anything is compared
@@ -399,19 +403,29 @@ async def touch_last_verified(
     *,
     now: datetime,
     rule_effective_date: date | None,
+    rule_status: str | None = None,
+    rule_status_source: str | None = None,
+    rule_status_source_evidences_status: bool | None = None,
 ) -> int:
     """Bookkeeping only: moves `sources.last_verified_at` (and `last_success_at`, and clears any
     prior failure bookkeeping -- a source that was previously failing but is now reachable again
     and unchanged is exactly as healthy as one that never failed) and syncs
-    `documents.rule_effective_date` and `sources.rule_effective_date`. Never touches
-    `sources.fetched_at`/`page_last_updated`/`last_indexed_body`, or `documents.content`/
-    `embedding` -- see the WHY THE SPLIT comment above, and infra/sql/init.sql's comment on
-    `last_indexed_body`: an unchanged/cosmetic verdict means nothing is being re-indexed, so the
-    body app/recrawl.py::_diff_node will next compare against must stay exactly what it already was.
-    `rule_effective_date` is synced here (even though nothing else changed) because it is a curator
-    annotation, not fetched page content, so keeping both tables' copies current is bookkeeping in
-    exactly the sense `last_verified_at` is. All writes happen in one transaction. Returns the
-    number of `documents` rows whose `rule_effective_date` was synced.
+    `documents.rule_effective_date`/`rule_status`/`rule_status_source`/
+    `rule_status_source_evidences_status`. Never touches `sources.fetched_at`/`page_last_updated`/
+    `last_indexed_body`, or `documents.content`/`embedding` -- see the WHY THE SPLIT comment above,
+    and infra/sql/init.sql's comment on `last_indexed_body`: an unchanged/cosmetic verdict means
+    nothing is being re-indexed, so the body app/recrawl.py::_diff_node will next compare against
+    must stay exactly what it already was.
+
+    Does NOT sync anything onto `sources` -- none of these four annotations has ever existed as a
+    `sources` column (Option B; see docs/adr/0022-manifest-authoritative-annotations.md and
+    docs/adr/0023-curator-rule-status.md). `data/sources/sources.yaml` is now the authoritative copy
+    of all four annotations; `documents` is the one table retrieval and the guards actually read
+    (app/db.py selects `d.rule_effective_date`, `d.rule_status`, `d.rule_status_source`,
+    `d.rule_status_source_evidences_status`), so it stays the only table this function writes any of
+    them onto. All writes happen in one transaction. Returns the number of `documents` rows synced
+    (the four columns move together, one UPDATE, so this is a single count for all four, not four
+    separate ones).
     """
     async with conn.transaction():
         async with conn.cursor() as cur:
@@ -423,15 +437,22 @@ async def touch_last_verified(
                     consecutive_failures = 0,
                     last_error = NULL,
                     last_http_status = NULL,
-                    status = 'ok',
-                    rule_effective_date = %s
+                    status = 'ok'
                 WHERE source_url = %s
                 """,
-                (now, now, rule_effective_date, source_url),
+                (now, now, source_url),
             )
             await cur.execute(
-                "UPDATE documents SET rule_effective_date = %s WHERE source_url = %s",
-                (rule_effective_date, source_url),
+                "UPDATE documents SET rule_effective_date = %s, rule_status = %s, "
+                "rule_status_source = %s, rule_status_source_evidences_status = %s "
+                "WHERE source_url = %s",
+                (
+                    rule_effective_date,
+                    rule_status,
+                    rule_status_source,
+                    rule_status_source_evidences_status,
+                    source_url,
+                ),
             )
             return cur.rowcount
 
@@ -502,11 +523,17 @@ async def reindex_source(
     body: str,
     chunks: list[dict],
     now: datetime,
+    rule_status: str | None = None,
+    rule_status_source: str | None = None,
+    rule_status_source_evidences_status: bool | None = None,
 ) -> int:
     """A meaningful change: delete this source's old rows and insert freshly embedded chunks, all
     in one transaction, setting `fetched_at = last_verified_at = now` (this source was both
-    re-fetched and re-checked right now) plus the new `page_last_updated`/`rule_effective_date`/
-    `last_indexed_body`.
+    re-fetched and re-checked right now) plus the new `page_last_updated`/`last_indexed_body` on
+    `sources`, and the new `rule_effective_date`/`rule_status`/`rule_status_source`/
+    `rule_status_source_evidences_status` on every one of this source's `documents` rows. None of
+    the four is written onto `sources` -- none of these columns exists in production (Option B; see
+    docs/adr/0022-manifest-authoritative-annotations.md and docs/adr/0023-curator-rule-status.md).
 
     `body` is the freshly fetched raw markdown this call is indexing -- the SAME text
     `_chunk_node` just wrote to the snapshot file and chunked (`state["body"]`, never
@@ -529,6 +556,9 @@ async def reindex_source(
         page_last_updated=page_last_updated,
         body=body,
         rule_effective_date=rule_effective_date,
+        rule_status=rule_status,
+        rule_status_source=rule_status_source,
+        rule_status_source_evidences_status=rule_status_source_evidences_status,
         chunks=chunks,
         now=now,
         mark_changed=True,
@@ -580,6 +610,9 @@ class RefreshState(TypedDict):
     resolved_url: str | None
     page_last_updated: str | None  # ISO date string, or None
     rule_effective_date: str | None  # ISO date string, or None
+    rule_status: str | None  # plain string (app/rule_status.py::RuleStatus value), or None
+    rule_status_source: str | None  # plain string (a URL), or None
+    rule_status_source_evidences_status: bool | None  # plain bool, JSON/msgpack-safe as-is, or None
     body: str | None
     verdict: dict | None  # a serialized ChangeVerdict (dataclasses.asdict)
     chunks: list[dict]  # chunk_markdown's output; internal plumbing between chunk -> embed/reindex
@@ -605,6 +638,38 @@ class RefreshDeps:
 
 
 def _initial_state(entry: dict, run_id: str, max_attempts: int) -> RefreshState:
+    # `rule_effective_date`/`rule_status`/`rule_status_source`/
+    # `rule_status_source_evidences_status` all come from the manifest entry itself (Option B; see
+    # docs/adr/0022-manifest-authoritative-annotations.md), never from a `sources` column -- none of
+    # the four has ever existed there. `manifest_annotation` returns a `date | None` -- YAML parses
+    # `2026-09-15` into a real `datetime.date`, and `_parse_iso_date` returns a `date` unchanged --
+    # so `.isoformat()` is REQUIRED for that one: every value in this TypedDict has to survive a
+    # round trip through LangGraph's checkpointer, which persists state with ormsgpack, and the
+    # module docstring's own rule is no `datetime`/`date` objects in state. Skipping that call would
+    # work today (nothing serializes state in these tests) and fail the first time a real
+    # checkpointer tried to persist a source carrying this annotation. `rule_status`/
+    # `rule_status_source` (`manifest_annotation_str`) are already plain strings -- YAML never
+    # parses either into anything but a `str` -- and `rule_status_source_evidences_status`
+    # (`manifest_annotation_bool`) is already a plain `bool` (or `None`) -- msgpack-safe as-is -- so
+    # none of the three needs a conversion here.
+    manifest_rule_effective_date = manifest_annotation(entry, "rule_effective_date")
+    manifest_rule_status = manifest_annotation_str(entry, "rule_status")
+    manifest_rule_status_source = manifest_annotation_str(entry, "rule_status_source")
+    manifest_rule_status_source_evidences_status = manifest_annotation_bool(
+        entry, "rule_status_source_evidences_status"
+    )
+    # Load-time validation (docs/adr/0023-curator-rule-status.md): the scheduled refresh job hits
+    # this the same way a hand-run ingest does -- a manifest mistake fails this source loudly
+    # (isolated by run_refresh's own per-source try/except, see that function's docstring) rather
+    # than silently defaulting a force decision from a date.
+    validate_rule_status(
+        source_url=entry["url"],
+        rule_status=manifest_rule_status,
+        rule_effective_date=manifest_rule_effective_date,
+        rule_status_source=manifest_rule_status_source,
+        rule_status_source_evidences_status=manifest_rule_status_source_evidences_status,
+        today=datetime.now(UTC).date(),
+    )
     return {
         "source_url": entry["url"],
         "topic": entry["topic"],
@@ -618,7 +683,12 @@ def _initial_state(entry: dict, run_id: str, max_attempts: int) -> RefreshState:
         "http_status": None,
         "resolved_url": None,
         "page_last_updated": None,
-        "rule_effective_date": None,
+        "rule_effective_date": (
+            manifest_rule_effective_date.isoformat() if manifest_rule_effective_date else None
+        ),
+        "rule_status": manifest_rule_status,
+        "rule_status_source": manifest_rule_status_source,
+        "rule_status_source_evidences_status": manifest_rule_status_source_evidences_status,
         "body": None,
         "verdict": None,
         "chunks": [],
@@ -701,17 +771,22 @@ def _after_fetch(state: RefreshState) -> str:
 
 async def _load_diff_baseline(
     conn: psycopg.AsyncConnection, source_url: str
-) -> tuple[str | None, date | None, bool]:
-    """The three facts `_diff_node` needs to decide what it is looking at: the body it should diff
-    the freshly fetched page against (`sources.last_indexed_body`), the curator annotation to carry
-    forward (`sources.rule_effective_date`), and whether `documents` already holds chunks for this
-    source_url -- the signal that tells "genuinely new source" apart from "backfill has not run"
-    when the body comes back NULL (see `_diff_node`'s own docstring). Returns
-    `(None, None, has_existing_chunks)` when no `sources` row exists at all yet.
+) -> tuple[str | None, bool]:
+    """The two facts `_diff_node` needs to decide what it is looking at: the body it should diff
+    the freshly fetched page against (`sources.last_indexed_body`), and whether `documents` already
+    holds chunks for this source_url -- the signal that tells "genuinely new source" apart from
+    "backfill has not run" when the body comes back NULL (see `_diff_node`'s own docstring). Returns
+    `(None, has_existing_chunks)` when no `sources` row exists at all yet.
+
+    Used to also return the curator annotation (`sources.rule_effective_date`) as a third element.
+    That column was removed from `sources` under Option B (see
+    docs/adr/0022-manifest-authoritative-annotations.md): the manifest is now authoritative for the
+    annotation, and `_initial_state` seeds it into graph state before `_diff_node` ever runs, so
+    there is nothing left for this function to carry forward.
     """
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT last_indexed_body, rule_effective_date FROM sources WHERE source_url = %s",
+            "SELECT last_indexed_body FROM sources WHERE source_url = %s",
             (source_url,),
         )
         source_row = await cur.fetchone()
@@ -722,9 +797,9 @@ async def _load_diff_baseline(
         (has_existing_chunks,) = await cur.fetchone()
 
     if source_row is None:
-        return None, None, has_existing_chunks
-    last_indexed_body, rule_effective_date = source_row
-    return last_indexed_body, rule_effective_date, has_existing_chunks
+        return None, has_existing_chunks
+    (last_indexed_body,) = source_row
+    return last_indexed_body, has_existing_chunks
 
 
 async def _diff_node(deps: RefreshDeps, state: RefreshState) -> dict:
@@ -732,8 +807,14 @@ async def _diff_node(deps: RefreshDeps, state: RefreshState) -> dict:
     snapshot file on disk (see infra/sql/init.sql's comment on that column and
     docs/adr/0014-stateless-recrawl-diff.md for why: a snapshot file is gitignored and does not
     survive between runs on a stateless runner, but every environment this job runs in already has
-    the database). Always read, dry-run or not -- dry-run only forbids writes. Also carries forward
-    `sources.rule_effective_date`, the curator annotation, unchanged from whatever it already was.
+    the database). Always read, dry-run or not -- dry-run only forbids writes.
+
+    Does NOT touch `state["rule_effective_date"]`. The curator annotation now comes from the
+    manifest entry, read once by `_initial_state` before this node ever runs (Option B; see
+    docs/adr/0022-manifest-authoritative-annotations.md) -- there is no `sources` column left to
+    read it from. This node deliberately returns no `rule_effective_date` key at all, so the value
+    `_initial_state` already put in state survives untouched into the return-dict merge LangGraph
+    performs on this node's output.
 
     A NULL `last_indexed_body` is ambiguous on its own -- it means EITHER "this source has never
     been indexed before" (a genuinely new manifest entry) OR "this source was indexed before this
@@ -754,9 +835,7 @@ async def _diff_node(deps: RefreshDeps, state: RefreshState) -> dict:
     source_url = state["source_url"]
 
     async with deps.conn_factory() as conn:
-        last_indexed_body, rule_effective_date, has_existing_chunks = await _load_diff_baseline(
-            conn, source_url
-        )
+        last_indexed_body, has_existing_chunks = await _load_diff_baseline(conn, source_url)
 
     if last_indexed_body is not None:
         verdict = classify_change(last_indexed_body, state["body"])
@@ -776,7 +855,6 @@ async def _diff_node(deps: RefreshDeps, state: RefreshState) -> dict:
 
     return {
         "verdict": asdict(verdict),
-        "rule_effective_date": rule_effective_date.isoformat() if rule_effective_date else None,
         "node_trail": trail,
     }
 
@@ -862,6 +940,8 @@ async def _reindex_node(deps: RefreshDeps, state: RefreshState) -> dict:
             resolved_url=state.get("resolved_url"),
             page_last_updated=page_last_updated,
             rule_effective_date=rule_effective_date,
+            rule_status=state.get("rule_status"),
+            rule_status_source=state.get("rule_status_source"),
             body=state["body"],
             chunks=chunks,
             now=now,
@@ -891,6 +971,8 @@ async def _verify_only_node(deps: RefreshDeps, state: RefreshState) -> dict:
                 state["source_url"],
                 now=now,
                 rule_effective_date=rule_effective_date,
+                rule_status=state.get("rule_status"),
+                rule_status_source=state.get("rule_status_source"),
             )
 
     return {

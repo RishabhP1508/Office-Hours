@@ -18,7 +18,7 @@ The agent read `docs/reports/phase-4.md`, `phase-5.md`, `phase-7.md`, `phase-8.m
 
 ## The pattern worth taking away from this build
 
-Twenty-nine times in this build, an instrument was the thing worth writing down rather than the thing it measured, and in twenty-seven of those the instrument was the one that was broken. I directed this build and verified its results; Claude Code did the building and most of the measuring, and **fifteen of the twenty-nine belong to the agent**, including the one that nearly closed a finding on a wrong diagnosis, and including entry 28, which did not merely risk a wrong write-up: it was written up, shipped into this report and into the README, and had to be retracted. I am keeping that ratio in the report rather than trimming it, because it is the point: whatever was doing the checking was wrong about as often as the thing being checked, and every one of them surfaced only because something forced the underlying data into view. The healthy case looked fine each time, which is why each survived as long as it did.
+Thirty-four times in this build, an instrument was the thing worth writing down rather than the thing it measured, and in thirty-two of those the instrument was the one that was broken. I directed this build and verified its results; Claude Code did the building and most of the measuring, and **fifteen of the first twenty-nine belong to the agent**, including the one that nearly closed a finding on a wrong diagnosis, and including entry 28, which did not merely risk a wrong write-up: it was written up, shipped into this report and into the README, and had to be retracted. I am keeping that ratio in the report rather than trimming it, because it is the point: whatever was doing the checking was wrong about as often as the thing being checked, and every one of them surfaced only because something forced the underlying data into view. The healthy case looked fine each time, which is why each survived as long as it did. **Entry 30 is deliberately outside that fifteen and assigned to neither of us.** It surfaced because an external event inverted an assumption the agent and I had both signed off on, and neither of us would have gone looking for it unprompted. The numerator is scoped, not stale. **Entry 31, added 19 September, is outside it too, and it is the first one where the instrument was a piece of this build's own shipping code being used as a probe.**
 
 | # | The instrument | What it could not see | How it surfaced |
 |---|---|---|---|
@@ -52,6 +52,12 @@ Twenty-nine times in this build, an instrument was the thing worth writing down 
 
 | 28 | The agent's transport, `curl -d` with an inline body, probing production in Korean | **The only entry here that reached a deliverable before being caught.** Git Bash converts non-ASCII command-line arguments to the system codepage before handing them to a native Windows binary, so the server received mojibake, not Korean. Mojibake has few content words, so production answered `query_too_vague` -- **which is exactly what finding 7 predicts**, so the corrupted result read as confirmation of a known defect and went into this report and the README as "the script gate is not live in production". It is live. Re-sent with `--data-binary @file` and with Python's explicit `.encode("utf-8")`, the same string returns `blocked_unverified` with 5 citations, and 28 probes show the gate firing on all seven scripts it covers. The generalisable form: **a result that agrees with what you already believe gets less scrutiny than one that does not, so a probe reproducing a known finding is the moment to check the probe, not to stop checking.** | Re-running one probe through a second transport, only because a 28-probe batch sent a different way disagreed with it. Nothing about the original result looked wrong on its own. |
 | 29 | Every unit test of `_is_predominantly_non_latin`, as evidence that the gate runs, and the agent's prediction that it does not | A guard's unit tests call it directly with strings and assert its boolean. They pass, and not one of them can answer whether step 1.5 is ever *reached*: step 1 runs first, reads the same input, and returns early on an overlapping predicate. **Reachability is a property of the pipeline, and no unit test of the guard can report it in either direction.** This is entry 1 rearranged, a rule about a field the model was never shown, now a guard behind a guard that consumes the same input. What keeps it separate is that the measurement came out against that prediction: the agent expected unreachable and measured it firing 8 times of 28 across all seven scripts, so the lesson is not "guards behind guards are unreachable" but that you cannot know without probing the front door. | Probing `answer_question` end to end through the real entry point at four question-length tiers, rather than reasoning from the two predicates. The project has no reachability test for any guard; every existing guardrail test bypasses the pipeline that would stop it. |
+| 30 | The pinned `qualify_future_dated_figures` tests, and then the inference this report drew from them about the whole suite | **CORRECTED 19 September 2026. Two failures here, and the second one is this report's, not the suite's.** First, the real defect: eleven call sites in `test_guardrails.py` pin `today` to a literal (`_TODAY = date(2026, 9, 11)`) while the guard's only trigger is `chunk.rule_effective_date > today` against `datetime.now(UTC).date()`, so those eleven assert behaviour at a date that can never arrive again and cannot observe the one input that changes on its own. At 00:00 UTC on 15 September 2026 the strict `>` went false, `future_only` emptied, and both the BLOCK and the INSERT died. **Second: from those pinned call sites this entry concluded "Nothing goes red, the suite stays green", and that claim was false on the day it was written.** A twelfth path existed and was missed. `test_temporal_guard_block_path_returns_blocked_unverified_end_to_end` reaches the guard through `answer_question`, not by calling it directly, and `answer_question` computes `today` at `app/pipeline.py:690` from the real clock with no parameter to override. It began failing on 15 September, the same day this entry published the opposite, and was still failing when CI surfaced it four days later. The count was wrong too: eleven pinned call sites in the suite plus one in `app/pipeline.py`, not twelve in the suite; the pipeline's own call was counted as though it were a test. Worse than a silent expiry: `freshness.py` compares the same date with `<=`, so the appended notice did not stop, it inverted, from "takes effect on September 15, 2026" to "took effect on" -- a system-authored sentence, grounded in no retrieved chunk, asserting that a rule enjoined the previous day is in force. A court blocked the rule on 14 September; the code had no way to know. | The defect surfaced by reading the comparison operator after an external event inverted the assumption ADR 0020 had written down as self-resolving, measured by running the guard at 14, 15 and 16 September against the real chunk text: the same answer string that returns `BLOCKED_UNVERIFIED` on the 14th renders byte-for-byte on the 15th. **The bad inference surfaced four days later, the way it always does: CI went red on the path this entry said could not exist.** The lesson is not that pinning time hides things, which is only the mechanism. **It is that a property measured on most of a set was asserted of all of it.** Eleven call sites really do pin the clock; the conclusion drawn was about the SUITE, a different object, and the single member that behaved differently was the only one that could have mattered. Nothing about the eleven was wrong. The quantifier was. That is the same shape as entries 1, 8 and 29, and it is why the count error (eleven read as twelve) is the less interesting of the two mistakes: getting the number right would not have saved a conclusion that was about the wrong set. **Why the twelfth path caught it is worth stating exactly, because the flattering explanation is wrong: it is not that that test was written more carefully.** It is the only test that reaches the guard through `answer_question` instead of calling it directly, and that path reads the wall clock with no seam to pin, so it inherits the real date by construction rather than by intent. Entry 29 again: what a test can observe is decided by the path it takes to the code, not by the assertions it carries. **Resolution, 19 September:** the test was split rather than pinned or xfailed. The contract half now uses a relative future date on the FIXTURE (the decayed constant, not the clock) and is green, preserving the only end-to-end proof that the BLOCK path is wired through `answer_question`. The real-rule half keeps the actual 2026-09-15 date, stays RED deliberately, carries no marker, and names the injunction and this entry in its docstring. |
+| 31 | `app/ingest.py::fetch_page`, the build's own production fetcher, used on 19 September as the probe for "has DHS changed these pages?" | **It returned 403 on all 14 sources, which is a readable, plausible, entirely wrong finding: "fourteen government sources are refusing us."** The verdict table would have shown 14 `fetch_failed` rows with real reason codes and real HTTP statuses, and every one of them would have been an artefact of the probe. The tell was uniformity: 14 of 14 failing identically, including `ice.gov/robots.txt`, is a broken client, not fourteen broken pages, because these are four different hosts with different publishing schedules and they do not all break in the same hour. Controlled by holding everything constant but the client: same machine, same network, same URL, same declared bot UA, httpx 403 and curl 200. Then the natural next hypothesis, that the bot UA is being refused, was tested and also failed: httpx with no custom UA at all is still 403. The WAF is fingerprinting the client (httpx here is HTTP/1.1 only, `h2` is not installed), so the honest identification the project deliberately sends is not what is being rejected. | By refusing to report 14 identical failures as 14 findings. The same session then used the instrument correctly, and it discriminated: 12 `unchanged`, 2 `meaningful`, which is the control that the classifier is not simply flagging everything. **The general form, and it is the sharpest one in this table: when a tool you built is used to measure the world, a total failure reads as news about the world.** A partial failure would have been easier to catch, because some sources would have disagreed with the others. This one is outside the agent/author split because neither of us wrote the WAF rule, but the fetcher is ours and it is what production runs. **A second, sharper lesson arrived hours later and is recorded because the first write-up got it wrong:** the 403 was interesting enough that it was reported as the probable cause of production's twelve-day staleness, with the Actions history named as the thing that would confirm it. The history refuted it. Fourteen green runs at 24 to 37 seconds each, no fetch attempted in any of them, because the secret is unset and the job skips. **A vivid defect found in the room crowds out a dull one outside it**, and the fact that the 403 is genuinely real made it a better story and a worse explanation. The fix is not to distrust vivid findings but to notice when a cause is being assigned to an effect measured somewhere the cause has never run. |
+| 32 | The FAQ snapshot's `heading_note`, as the record of why that page's chunking is unusual | **A note whose entire job is to describe a structure has outlived the structure it describes, silently, because the mechanism preserving it was working exactly as designed.** The note says the page's group labels "(Transition Period, Understanding the Admit Until Date, Extensions of Stay, Maintaining Status, Departure Period) are h3". Measured against the file it sits in: all five are **h4**, and the real h3 layer (`General`, `F Students`, `School Officials`) is not mentioned at all. DHS evidently added a grouping level at some point; the note was written before that and has been wrong ever since. **The mechanism is the part worth keeping.** `build_frontmatter` preserves every non-base frontmatter key verbatim across a body rewrite, which is correct and is the behaviour ARCHITECTURE.md demands so curator annotations are never lost. The consequence is that an annotation which DESCRIBES the body is carried unchanged across exactly the event that invalidates it: the 5 September re-fetch rewrote the body and copied the note forward untouched. A preservation guarantee and a staleness guarantee are the same guarantee when the thing preserved is a description of the thing replaced. Nothing in the repo compares a `heading_note` to the headings, and no test could have gone red. | Not by any check, and not by anything looking for it. It surfaced only because the annotation was being MOVED to a tracked file, and the move was verified by reading the file it describes rather than by copying the string. A byte-identical round-trip check, which is what a careful migration would normally run and which this one did run, passes on a false value: it proves the move was faithful, which is a different claim from the value being true. **The general form, and it is the one to carry: curator annotations divide into facts about the world and observations about the artifact.** `rule_effective_date` and `federal_register` are facts; they survive any re-fetch unchanged because they never described the page in the first place. `heading_note` and the redirect `note` are observations; a re-fetch is precisely what can falsify them. Storing both classes in the same place, beside the body, gives the second class a guarantee of silent rot, and the fix is not better discipline about updating notes but recognising that the two classes have opposite relationships to the same event. |
+| 33 | The re-crawl's own failure reporting, as the account of why a run against production failed | **The error path is the only part of `app/recrawl.py` that still works against production's schema, so a total failure of the success path would have rendered as a specific, plausible, entirely wrong diagnosis.** Production's Postgres is frozen post-Phase-5, pre-ADR-0014: `documents.rule_effective_date` and `documents.content_tsv` exist, `sources.rule_effective_date` and `sources.last_indexed_body` do not (confirmed against `information_schema`: false, false, true, true). `infra/sql/init.sql` reaches a database only through the local compose mount at `docker-entrypoint-initdb.d`, which runs only on an empty data directory; nothing applies it to a hosted database, so Neon holds whatever was applied by hand at one moment and nothing since. Every success-path statement touches a column that is not there. `_diff_node`'s FIRST statement, before any fetch, is `SELECT last_indexed_body, rule_effective_date FROM sources`. `touch_last_verified` and `_embed_and_store` both write `rule_effective_date`. **`record_source_failure` touches only original-shape columns, so it succeeds.** The first run would therefore catch `UndefinedColumn` per source, route to the failure path, and write `status='fetch_failed'`, an incremented `consecutive_failures`, and the `UndefinedColumn` text into `last_error`, for **all 14 sources, without fetching a single page**. Not a crash. A corpus-wide health state that is confidently, specifically wrong. | **Not by running it, and it could not have been.** It surfaced sideways: `app/sync_annotations.py`, a new tool written against the same table, failed with a raw `UndefinedColumn` on its first SELECT, because it is small enough to have no failure handler standing between the database and the person reading the output. The re-crawl has one, and that handler would have converted the same error into a domain verdict. **The generalisable form, and it is the sharpest in this table: when the failure handler depends on LESS of the system than the success path does, it outlives the success path, and a total failure renders as a confident specific diagnosis in the failure handler's own vocabulary.** The vocabulary here is fetching, so a schema problem would have reported as fourteen fetch failures. That reading was available, adjacent, and already half-believed: the httpx TLS block (entry 31) is real, affects all 14 sources, and had nothing whatever to do with this. Two independent findings pointing at the same 14 rows, one of them the wrong explanation for the other's symptom. The defensive form: a failure handler that requires less than the thing it reports on is not a safety net, it is an unreliable narrator with better uptime than the narrator it replaced. |
+| 34 | A local run of `tests/test_backfill_source_bodies.py`, as evidence that those tests are correct | **Those tests already fail on this machine for a known, accepted, unrelated reason, so when the synchronous conversion broke them they went on failing and nothing changed.** The conversion (19 September) made `app/backfill_source_bodies.py` sync and left its five tests on the async `conn` fixture, calling `await backfill_source_bodies(...)` on a function that no longer returns an awaitable. Five real breakages, in the tests for the tool that had just written to production. A local run could not report it: on Windows those tests fail before reaching any assertion, because psycopg refuses to run in async mode on the ProactorEventLoop (and with no local Postgres they would fail anyway on connection). **The verdict before the breakage and the verdict after it were the same word.** The severity is not that the tests fail locally, which was known and accepted; it is that a known-failing check has no remaining capacity to report anything new. | CI, on Linux, where the accepted local reason does not apply, so the real defect produced a DIFFERENT and specific error (`TypeError: '_AsyncGeneratorContextManager' object does not support the context manager protocol`) instead of being absorbed into an existing one. **The generalisable form: an accepted failure is an ABSORBING STATE for new failures.** Once a check is known-broken for a reason everyone has agreed to look past, it can take on unlimited further breakage at no visible cost, and the agreement to look past it is what disables it. That is the same family as entry 33 (a failure handler outliving the success path it reports on), the scheduled job reporting green while skipping, and the backfill's own `--dry-run` reporting `0 still NULL` for a run that wrote nothing: in every case a signal that should separate two states cannot. **The honest note on the fix: it does not make these tests runnable here.** The scaffolding fixture stays async on purpose, because it shares ~50 lines of insert/delete SQL with `test_freshness.py`, whose subject genuinely is async. So the absorbing state persists on Windows and CI remains the only place these tests can speak. Knowing that is the mitigation; pretending the conversion fixed it would be a second instance of the same error. |
+
 
 **A second layer on entry 18, found 12 September.** Entry 18 ends by naming the remedy: read the
 withheld generation from the Langfuse trace or the orchestrator log instead of `response["answer"]`.
@@ -186,8 +192,17 @@ measurements, after the redeploy" below. The table now reflects the deployed sta
 
 | Finding | Status |
 |---|---|
+| **NEW, 15 September: the fixed-period rule was enjoined, and the temporal guard went inert the same night** | **OPEN, deliberately not fixed. This is the first thing to address before the site goes public.** A nationwide preliminary injunction issued 14 September 2026 in *Presidents' Alliance v. DHS*, No. 1:26-cv-13799 (D. Mass., Saylor, J.), blocks the DHS fixed-period-of-admission rule. The rule did not take effect on the 15th and the duration of status framework remains in place. As of 00:00 UTC on 15 September the temporal guard is inert, the freshness notice has inverted to "took effect on", and the system will state the 30-day figure as current alongside an uncited system-generated sentence asserting the rule took effect. All of that is measured, not predicted. See "The injunction, and why this is not fixed" below, and instrument table entry 30. **Update, 19 September: the fail-open in item 2 of that section is CONFIRMED LIVE in production, not merely derived from the code. Production answers that the rule "took effect on September 15, 2026".** |
+| **NEW, 19 September: the scheduled refresh reports success daily while doing nothing, and that is why nothing has refreshed** | **OPEN, not fixed, and this is the actual cause of the twelve-day staleness.** Fourteen scheduled runs, one a day through today, all green, all 24 to 37 seconds. None attempted a fetch: `DATABASE_URL` is unset, so `recrawl.yml` sets `mode=dry-run`, the no-op step exits 0, `Re-crawl (live)` is skipped on its `if:`, and the missing artifact is ignored by `if-no-files-found: ignore`. 14 pages at a 2.0s delay cannot finish in 24s; those seconds are the pip install. The skip itself is correct and deliberate (Phase 8 has no hosted database). **The defect is that a job doing nothing and a job finding nothing changed are both a green check at 30 seconds**, which is the `sources` table's failed-vs-unchanged ambiguity one layer up. **Option D is now BUILT** in `recrawl.yml`: the skip step emits a `::warning title=Scheduled refresh did NOT run::` annotation and a summary block reading "Sources fetched: **0 of 14**", verified by executing the step against a temporary `GITHUB_STEP_SUMMARY`. It still exits 0 deliberately, because the skip is currently correct; option A (fail the run) lands with the `DATABASE_URL` secret. **Sequencing note, 19 September, REVISED the same day: still do not set that secret, but NOT for the reason first given.** The original note said the first live run would die on `_diff_node`'s opening SELECT and mark all 14 sources `fetch_failed` without fetching anything, which made the skip the only thing preventing a corpus-wide corruption of the health state. **That is no longer true.** The schema divergence is closed (see its row above: `check_schema` reports no missing objects against production), so the first live run would reach the fetcher instead of dying before it. Two different blockers now stand in front of the secret: the TLS block, which would produce fourteen GENUINE fetch failures rather than fourteen spurious ones, and the unimplemented `HostedEmbedder` seam, which means a meaningful change could be detected and then not re-indexed. The skip is still correct. **The corpus-corruption argument for it is retired, and the record should not carry a retired reason as if it were current.** **Option E, the staleness watchdog, is approved and planned but NOT built** (see "Option E in detail": a separate scheduled workflow first, Grafana Cloud alerting as the better long-term home, alert at `age_hours > 48`, escalate at 7 days). **Corrects an earlier row that blamed the 403 for the staleness.** |
+| ~~NEW, 19 September: production's schema is frozen pre-ADR-0014, and the first re-crawl would mark all 14 sources fetch_failed without fetching anything~~ **RESOLVED, 19 September** | **CLOSED. `python -m app.check_schema` ran against production and reported no missing objects: 6 tables, 33 columns, one extra (`playing_with_neon`, Neon's default demo table, correctly non-fatal). The user ran it; the figures in this row are theirs.** The gap was closed from the CODE side, not the database side: `sources.rule_effective_date` does not appear in that output as an extra either, because production never had it and `infra/sql/init.sql` no longer declares it (Option B, ADR 0022). Nothing was migrated, no DDL was run against Neon, and `sources.last_indexed_body` was already added and backfilled in step 2. **Setting `DATABASE_URL` is no longer the corpus-corrupting move this row described**: `_diff_node`'s opening SELECT no longer names a column production lacks, so the first live run would not mark 14 sources `fetch_failed` without fetching. It is still not SAFE to set, for two different reasons now standing in front of it: the TLS block in the row below, and the unimplemented `HostedEmbedder` seam (`recrawl.yml` says so in its own comment) which means a meaningful change could be detected and then not re-indexed. **The reason to wait has changed and the record should say which.** Original entry follows. Confirmed against production's `information_schema`: `sources.rule_effective_date` and `sources.last_indexed_body` are ABSENT; `documents.rule_effective_date` and `documents.content_tsv` are present. Production is post-Phase-5, pre-ADR-0014. `infra/sql/init.sql` only ever reaches the local compose postgres via `docker-entrypoint-initdb.d` (which runs only on an empty data dir); there is no migration runner and nothing applies it to Neon, so the hosted schema froze at whatever was applied by hand. **The consequence is worse than a failed run.** `_diff_node`'s first statement selects both missing columns, and `touch_last_verified`/`_embed_and_store` both write one, so every success path is dead; but `record_source_failure` touches only original-shape columns and SUCCEEDS. The first run would write `status='fetch_failed'`, bump `consecutive_failures`, and store the `UndefinedColumn` text in `last_error` for **all 14 sources, having fetched nothing** -- a corpus-wide health state that is specifically and confidently wrong. **It also explains the 7 September timestamp**: no re-crawl has ever run against production. That `last_verified_at` was written by an ingest, from a code version predating ADR 0014, since today's `_embed_and_store` would fail on this schema too. Surfaced by `sync_annotations` failing with a raw `UndefinedColumn`; see instrument table entry 33. |
+| NEW, 19 September: the fetcher is blocked at the TLS layer **SEQUENCING RESTORED: it is first again** | **OPEN, not fixed, and now FIRST in the queue.** The sequencing on this row has moved twice in one day and both moves are recorded rather than overwritten. It was first; then the schema finding displaced it; now the schema finding is CLOSED (see the row above), so this is first again, alongside the unimplemented `HostedEmbedder` seam. **The defect itself has not changed at any point and none of this is new evidence about it.** What follows is the original text, including the retired sequencing claim in the paragraph after the header, which is left visible because a reader who sees only the current verdict cannot tell that the ordering was wrong twice. **Original entry follows.** Setting `DATABASE_URL` was next on the list and would not have reached a fetch at all: the re-crawl dies on `_diff_node`'s opening SELECT, before the fetcher is ever called, and would have reported the result as fourteen fetch failures -- pointing straight back at this TLS block, which had nothing to do with it. Fix the schema question first; this one is latent behind it, not in front of it.**Original entry follows.** `app/ingest.py::fetch_page` (httpx) returns 403 on all 14 sources including `ice.gov/robots.txt`. Never once reached in CI, because CI has never got past the gate above. Four causes eliminated: not the UA (httpx with no UA still 403s; curl with the project's exact bot UA is served), not the headers (httpx trimmed byte-identical to curl still 403s), not the HTTP version (the installed curl has no HTTP/2 at all, so every 200 was HTTP/1.1, same as httpx), not the client code (stdlib urllib fails identically). What remains is the TLS fingerprint: Python links OpenSSL 3.0.18, the curl that works uses Schannel. **All 14 URLs are explicitly ALLOWED by each host's live robots.txt under the project's real UA and parser, 14 allowed / 0 denied**, so a permitted, honestly-identified, rate-limited crawler is being refused by a bot-detection layer that never reads that permission. **No honest fix exists at the HTTP layer and none was applied**: every remaining lever (`curl_cffi impersonate=`, `tls-client`, a browser UA) works by forging the client's identity, which is outside this project's crawl policy and was refused. **The measurement that must come first has not been taken**: every number here is from Windows/Schannel, a TLS stack that does not exist on Linux, where CI and production run and where curl links the same OpenSSL Python does. See "The 19 September re-crawl" below. |
+| **NEW, 19 September: DHS removed every concrete date from both fixed_admission pages, and added no injunction notice** | **OPEN, reported for decision, deliberately not acted on.** `Sept. 15, 2026` goes 6 to 0 (FAQ) and 4 to 0 (Quick Facts); `Nov. 14, 2030` 1 to 0 on both; `March 18, 2027` 2 to 0 and 1 to 0. Each replaced by "the final rule's effective date". Two passages deleted outright. No injunction language anywhere in either page's raw HTML or its JavaScript-rendered form, verified with a positive control on the same instrument. Causation is not in evidence: the FAQ changed content without moving its own `page_last_updated`, and Quick Facts reports 10 September, four days before the injunction. The source decision is yours and was not made. See "The 19 September re-crawl" below. |
+| ~~NEW, 19 September: `broken_source_count` reports 14 while all 14 sources report ok~~ **WITHDRAWN. Not a bug.** | **This row previously claimed a counting bug. It was wrong and is corrected rather than deleted.** `source_health_state` returns `broken` when `last_success_at` is older than `SOURCE_BROKEN_NO_SUCCESS_DAYS` (7). Every source last succeeded 2026-09-07, twelve days ago, so all 14 are broken **correctly**. `status: "ok"` is the last crawl's outcome and `consecutive_failures: 0` is true because nothing ran to fail; neither field is about staleness and the clause that fired is. **The real finding is the inverse of the one filed: four separate signals (`broken_source_count`, `stale_source_count`, `freshness_state`, `age_hours`) were all correct throughout the outage, served publicly, and consumed by nothing.** That is the argument for option E. Residual, much smaller: the payload names the verdict without naming which clause produced it, so a `reason` field on `BrokenSource` would help the next reader. Not built. |
+| **NEW, 19 September: the sites' own robots.txt permits every URL the WAF refuses** | **Recorded, not actionable on its own, and it stands whatever the Linux measurement returns.** All 14 URLs tested against each host's live `robots.txt` with the project's own `RobotFileParser` and its real UA: **14 allowed, 0 denied.** The single `Disallow: /` on `studyinthestates.dhs.gov` and `ice.gov` belongs to a `User-agent: PetalBot` block, not to `*`. A crawler these sites explicitly permit, identifying honestly with a contact address and honouring an unrequested two-second delay, is refused by a bot-detection layer that never reads that permission. **This is what makes the disguise question a dilemma rather than an obvious no**, and it is also why it still resolves to no: a published robots.txt is permission to crawl, not consent to be deceived about who is crawling. |
+| ~~NEW, 19 September: two hand-run tools that write to production have NO tests, and their only verification was thrown away~~ **CLOSED, same day** | **FIXED.** `tests/test_sync_annotations.py` (16 tests) and `tests/test_check_schema.py` (15) promoted from the throwaway harnesses, plus 3 statement-level tests added to `tests/test_backfill_source_bodies.py`. Suite 505 -> 539. **All 34 run with NO DATABASE**, against fake connections that record every statement and transaction boundary, so they are the only tests in this project executable on the Windows machine that holds the snapshots -- stated at the top of each file rather than left to be discovered. The three findings the harnesses made are kept as REGRESSIONS, not scenarios: the never-written column list for `sync_annotations` (the `_SYNCED_ANNOTATIONS` decorative-constant defect), the headline-matches-exit-code invariant for `check_schema` (which regressed as `schema ok` printed on a run exiting 1, now parametrised over all three ways a drift can be fatal), and the proof that `backfill_source_bodies` no longer writes `rule_effective_date`. Each forbidden-column check ships with a CONTROL asserting the predicate trips on the pre-fix statement, because an absence check pointed at nothing passes forever. Each file states what a fake connection cannot establish: `rowcount` semantics and the real commit boundary are stubbed, measured for the backfill by its production run and still unobserved for the other two. **Original entry follows.** **OPEN, not fixed.** `app/sync_annotations.py` and `app/check_schema.py` have no test file and are imported by no test; `grep` across `tests/` returns nothing for either. (`app/recrawl.py` and `app/ingest.py` ARE covered, under differently-named files -- `test_freshness.py` and `test_chunking.py` -- so this is a gap of two modules, not five.) `sync_annotations` is the worse of the two: it writes `sources` AND `documents` in production, and exists specifically to be reached for when a legally-consequential annotation has to change quickly. **The sharper problem is what it was verified WITH.** Both were checked against fake-connection harnesses that recorded every statement and transaction boundary, drove five and six scenarios respectively, and caught two real defects (a decorative constant, and a `schema ok` headline printed on a run that exits 1). Those harnesses live in a session scratchpad, not in the repository. **They did real work and then evaporated**, which is the same shape as the diff baseline existing only in a gitignored directory: the artifact that establishes correctness is not kept anywhere the project can find it again. Promoting them to `tests/test_sync_annotations.py` and `tests/test_check_schema.py` is mostly mechanical, since the fakes are already written and already pass. Not done. |
+| **NEW, 19 September: the Linux measurement that must precede any fetcher fix** | **PENDING. `.github/workflows/fetch-probe.yml` is written and on disk; it has not been run, because running it requires a push and that is yours.** One throwaway `workflow_dispatch` job, no secret, no database, no writes: it fetches all 14 manifest URLs from `ubuntu-latest` with both httpx and curl, plus each host's robots.txt, and prints a per-source and per-host table with an auto-computed verdict. It distinguishes the only three outcomes that matter: httpx 200 means there is no bug outside one Windows laptop and the whole finding collapses to a note; httpx 403 with curl 200 means a real client problem that reproduces where CI runs; both 403 means address reputation (Actions runners are Azure-ranged) and a client-side fix would be aimed at the wrong thing. **No fetcher fix is recommended until this lands.** Delete the file once it has reported. |
 | 3. Claims to be official USCIS guidance | **DEPLOYED and verified.** 21 production answers across 7 injection variants, 0 authority claims, 0 detector/production discrepancies. See "Fix 3" and "Production measurements" item 3. |
-| 1 + 2. The 60/30-day temporal gap | **Deployed and OPEN. Highest-consequence item; the rule takes effect 15 September 2026.** Notices fire 15 of 18. The prose gap is a retrieval miss, and it is NOT lexical: the chunk stating the replacement already contains the phrase "grace period" and still loses on RRF fusion. Three of the four fix options written up below are measurably incapable of fixing it. See "The four fix options, measured" and "What does work: a dated-rule companion slot". |
+| 1 + 2. The 60/30-day temporal gap | **Deployed and OPEN. Highest-consequence item. Superseded in its premise by the injunction row above: the rule did NOT take effect on 15 September 2026, so the 30-day figure this finding is about is not merely premature, it is wrong.** Notices fire 15 of 18. The prose gap is a retrieval miss, and it is NOT lexical: the chunk stating the replacement already contains the phrase "grace period" and still loses on RRF fusion. Three of the four fix options written up below are measurably incapable of fixing it. See "The four fix options, measured" and "What does work: a dated-rule companion slot". |
 | 4. Rate limiter inert (and 15, no max question length) | **DEPLOYED and verified.** The gateway returns 429s against Upstash over TLS, with "Redis reachable at startup" in the deploy logs. The question-length cap ships with it. See "Fix 4". |
 | 5. Non-Latin scripts rejected | **Clarifier fixed; script stopgap built, not deployed. Finding stays open.** Spanish reproduces the same confident-wrong-number failure in Latin script, so the stopgap does not cover it. Cross-lingual retrieval is the real gap. |
 | Undiagnosed: "How do I apply for an EOS?" | **Open, not diagnosed.** That chunk is not retrieved even when asked in its own wording, unlike every other case measured, where institutional wording works. Different shape from the vocabulary mismatch and not explained. |
@@ -269,6 +284,8 @@ citations with no model involved, which is exactly why it survives everything ab
 > **As of 11 September 2026, the DHS fixed-period-of-admission rule takes effect in four days, on 15 September, and the single chunk in the corpus that states the new 30-day departure period cannot be reached by anyone asking in ordinary words.** It is retrieved only by questions containing the literal phrase "departure period". A student asking "what is my grace period" gets the outgoing 60-day rule. The freshness notice does fire alongside it, so the page carries a dated warning, but the answer text still gives the number that stops being true this week.
 >
 > This is the highest-consequence open item in this report, above finding 5. It is diagnosed down to the mechanism (see "The semantic arm finds the chunk. RRF drops it.") and the fix options are laid out below, unmeasured. It is four days from the date it matters.
+>
+> **Overtaken by events, 15 September 2026.** The rule was enjoined nationwide on 14 September (*Presidents' Alliance v. DHS*, 1:26-cv-13799, D. Mass.), so it did not take effect and the number that "stops being true this week" did not stop being true. The 60-day answer this callout treats as the outgoing rule is the one still in force. What the report got right is that this was the highest-consequence temporal item; what it could not anticipate is that the guard built for it would go inert on the same date, and that the freshness notice would invert rather than stop. See "The injunction, and why this is not fixed".
 
 **Fix before this goes in front of students.**
 
@@ -299,7 +316,9 @@ Options for closing this are costed below under "Closing the CI coverage gap"; n
 
 ### 1. CRITICAL: the 60-day departure answer omits the 30-day replacement 5 times in 6
 
-> **Status: partly fixed on disk, not deployed.** See "Fix 1 + 2" at the top. Everything below records the defect as found in production on 7 September 2026 and still describes the deployed site.
+> **Status: partly fixed on disk, not deployed.** See "Fix 1 + 2" at the top.
+>
+> **Overtaken by events, 15 September 2026.** The rule was enjoined nationwide on 14 September (*Presidents' Alliance v. DHS*, 1:26-cv-13799, D. Mass.) and did not take effect. The 60-day answer this finding calls incomplete is now simply correct, and the 30-day replacement it asks for is wrong. See "The injunction, and why this is not fixed". Everything below records the defect as found in production on 7 September 2026 and still describes the deployed site.
 
 **Input:** `How many days do I have to depart the US after my F-1 program ends?`
 
@@ -340,6 +359,8 @@ The freshness notice, which is the backstop, fires only when the dated source is
 ### 2. CRITICAL: other phrasings answer with the 30-day rule as if it were already in force
 
 > **Status: fixed on disk, not deployed.** The phrasing below no longer states the future rule alone. See "Fix 1 + 2" at the top.
+>
+> **Overtaken by events, 15 September 2026.** The rule was enjoined nationwide on 14 September (*Presidents' Alliance v. DHS*, 1:26-cv-13799, D. Mass.) and did not take effect. The guard that stopped this went inert at 00:00 UTC on the 15th, so this exact failure is live again, and the figure is now false rather than premature. See "The injunction, and why this is not fixed".
 
 **Inputs and what happened:**
 
@@ -644,7 +665,7 @@ And on a network error, the same block with "Failed to fetch Try asking again."
 
 **Input:** `How long do I have to leave the United States after my OPT ends?` (the exact question `freshness.py`'s docstring names as the live Phase 5 case)
 
-**What happened.** `blocked_unverified` / `answer_missing_citation`, twice. Retrieval was good: `[1]`, `[2]`, `[3]` were all fixed-admission chunks. The model wrote something uncited and the guard withheld it.
+**What happened.** `blocked_unverified` / `answer_missing_citation`, twice. **15 September 2026: the guard described here no longer fires at all, so this question now returns an answer rather than nothing. That is not an improvement. See "The injunction, and why this is not fixed".** Retrieval was good: `[1]`, `[2]`, `[3]` were all fixed-admission chunks. The model wrote something uncited and the guard withheld it.
 
 The guard behaved correctly. The outcome is that the single question this rule change most affects returns nothing at all, and the user is told to rephrase, which is how they land on the phrasings in findings 1 and 2 that answer wrongly.
 
@@ -1085,9 +1106,104 @@ Two things worth knowing before deciding what to do about it.
 Recommendation: keep the rule, because it is correct and costs nothing, but do not record finding 5's language half as fixed. Measure it on `gpt-oss:120b` after deploy, and only build enforcement if the production model also ignores it.
 
 
+### The injunction, and why this is not fixed
+
+**Added 15 September 2026. Everything below this heading and above it about the temporal work was
+written on the assumption that the DHS fixed-period-of-admission rule would take effect on
+15 September 2026. It did not.**
+
+A federal court in Massachusetts issued a nationwide preliminary injunction on 14 September 2026
+blocking the rule: *Presidents' Alliance v. DHS*, No. 1:26-cv-13799 (D. Mass.), Judge F. Dennis
+Saylor IV. The duration of status framework stays in place. The 60-day post-completion departure
+period remains in force and the 30-day figure did not become true on the 15th.
+
+**What the system does as of 00:00 UTC on 15 September, measured from the code rather than assumed.**
+**Update, 19 September 2026: item 2 below is no longer derived from the code. It has been measured
+against the deployed system and it is live in production.** See "The 19 September re-crawl" below.
+
+`docs/adr/0020-temporal-qualification-guard.md` recorded that the guard self-resolves on the effective
+date, because the figure stops being future-dated and the detector stops firing. That reasoning is
+mechanically correct and it is now a fail-open. Three things happen at once:
+
+1. **The guard goes inert.** `app/guardrails/temporal.py::_figure_sets` gates on
+   `chunk.rule_effective_date > today`, a strict comparison against `datetime.now(UTC).date()`.
+   `2026-09-15 > 2026-09-15` is false, so the dated chunks fall through to the current branch, their
+   figures join `current_figures`, and `future_only` empties. Both the BLOCK and the INSERT stop.
+   Run against the real chunk text at three dates, the same answer string that returns
+   `blocked_unverified` on the 14th renders byte-for-byte on the 15th:
+
+       today=2026-09-14  future_only={'30': ['2026-09-15']}  blocked=True   insertions=1
+       today=2026-09-15  future_only={}                      blocked=False  insertions=0
+       today=2026-09-16  future_only={}                      blocked=False  insertions=0
+
+2. **The freshness notice inverts rather than stopping.** `app/guardrails/freshness.py` compares the
+   same date with `<=`, so the appended sentence flips from "takes effect on September 15, 2026" to
+   "took effect on September 15, 2026, so the answer differs before and after that date." That
+   sentence is generated from the date column and never from the page text, so it carries no citation.
+   The system now asserts in its own uncited voice that an enjoined rule is in force. This is worse
+   than the guard merely going quiet, and it is the part that was not anticipated anywhere.
+   **CONFIRMED LIVE, 19 September 2026.** This paragraph was written from the code four days earlier.
+   Production now returns it verbatim: asked when the rule takes effect, the deployed gateway answers
+   that it "becomes effective on September 15, 2026" and appends "Some of the sources above describe a
+   rule that **took effect on September 15, 2026**, so the answer differs before and after that date",
+   with seven citations to the two fixed-admission pages. Predicted from the operator, then measured
+   on the deployed system. It is no longer a forecast.
+
+3. **The prompt annotation flips too, which silences prompt rule 4.** `app/prompts.py::_rule_date_note`
+   moves to "took effect on ... (on or before today)". Rule 4's trigger is anchored on the presence of
+   a "takes effect on" future-dated passage. After the 15th no passage carries that phrase, so the
+   instruction that tells the model to state both rules with both dates no longer applies, and the
+   model reads a past-dated 30-day passage beside an undated 60-day one.
+
+Retrieval is unchanged. The `companions` CTE in `app/db.py` matches on equal `rule_effective_date`,
+never on future versus past, so the chunk stating "F students now have 30 days" still reaches the
+generator exactly as before.
+
+**Nothing goes red. CORRECTED 19 September 2026: this was false when it was written.** Eleven
+`qualify_future_dated_figures` call sites in the test suite pin `today` to a literal, so those eleven
+stay green, and the twelfth call site counted here was never a test at all but `app/pipeline.py`'s
+own. What the count missed is a twelfth PATH:
+`test_temporal_guard_block_path_returns_blocked_unverified_end_to_end` reaches the guard through
+`answer_question`, which reads the real clock at `pipeline.py:690` with no seam to pin, and it began
+failing on 15 September, the day this paragraph was written, surfacing in CI on the 19th. **The suite
+did go red.** This report asserted otherwise from a count of pinned call sites, which is instrument
+table entry 30's second failure. The test has since been split: a contract half, green, with a
+relative date on the fixture, and a real-rule half that stays red on purpose until the decision below
+is made. The re-crawl reasoning that follows is unaffected and still stands. The daily re-crawl does not help either: if DHS leaves
+the pages alone the verdict is `unchanged` and the run is green by design, and if DHS rewrites them the
+verdict is `meaningful` but no golden row cites either fixed-admission URL, so the golden-impact gate
+in `docs/adr/0009-golden-impact-gates-recrawl-red.md` returns nothing and the run is still green. That
+gate was designed with these exact two sources in mind and the tradeoff was sound for a correct
+rewrite landing on schedule. It is the wrong tradeoff for a change that inverts the rule. This is
+instrument table entry 30.
+
+**Why this is deliberately not fixed.**
+
+The site is not public and has no users. No student is getting a wrong number from it. The urgency that
+would justify acting at speed does not apply, and acting at speed would mean one of two bad things:
+editing `rule_effective_date` to a date DHS never published, which puts a fabricated figure into two
+pieces of system-authored prose and into the prompt the model sees, or curating a citable source for a
+court order on the night it issued. Both are worse than waiting. A third option, removing the two
+fixed-admission sources from `data/sources/sources.yaml` and the corpus, was costed in full
+(53 chunks, corpus 221 to 168, no test or golden row depends on them) and is a live candidate, but it
+also removes those two pages from the re-crawl manifest, which blinds the refresh to the pages most
+likely to carry DHS's own correction.
+
+The plan is to revisit in two or three days, once DHS has likely updated the pages and the coverage has
+settled, and then choose between removal, adding the injunction as a cited source, and a curator field
+that does not depend on a date comparison at all. The third is the largest and the only one where the
+behaviour after the change is described by what a field means rather than by an arithmetic accident.
+
+**This is the first thing to address before the site goes public.** Going public is precisely what
+turns this from a dormant defect into a live one, and the failure it produces is the worst shape this
+system can produce: a confident, plausible, correctly formatted answer, citing a real government page,
+stating a number that is not the law, with the system's own sentence vouching for it.
+
 ### Temporal: closed as far as it is going, with the gap stated
 
 Decided 8 September 2026 after the production measurement: **stop here rather than tune.**
+
+**Read "The injunction, and why this is not fixed" immediately above this section first.** Everything below was written on the assumption that the rule would take effect on 15 September 2026. A court enjoined it on the 14th, so the notice this section reports as the thing worth shipping now reads "took effect on September 15, 2026" about a rule that did not.
 
 What shipped and works: the model is now shown each passage's `rule_effective_date`, and the dated-rule notice fires whenever retrieval returns any source carrying one, regardless of rank or citation. Production notice rate is **15 of 18 runs across the six phrasings, against a baseline of zero** on the phrasing that mattered most. Every one of those answers renders a visible "A rule affecting this answer takes effect on September 15, 2026" block.
 
@@ -1586,6 +1702,12 @@ Worth stating plainly because the deadline makes it concrete: on 15 September a 
 
 
 ### Does the corpus state the new rule as already current? Measured across all 53 dated chunks.
+
+> **15 September 2026.** Those 53 chunks are the two fixed-admission sources, and the rule they
+> describe was enjoined on 14 September. The corpus now states an enjoined rule as current, and
+> nothing in the pipeline marks it. Removing both sources is one of the options under
+> consideration; it would take the corpus from 221 chunks to 168. See "The injunction, and why
+> this is not fixed".
 
 Asked because one after-run wrote "took effect" four days early and three more wrote "is now 30
 days", and the rendered prompt annotation was confirmed correct. If the corpus states the new rule in
@@ -5776,6 +5898,963 @@ rendering surface lands: what was this counted over, and is that still what the 
 
 ---
 
+## The 19 September re-crawl: the fetch pipeline has been down twelve days, and two pages were quietly de-dated
+
+Run on 19 September 2026 as a read-only dry run over all 14 manifest sources, at my instruction, to
+answer one question: has DHS updated the two `fixed_admission` pages to say the rule was enjoined?
+Nothing was written. No database connection was opened, no snapshot rewritten, no checkpoint created,
+no re-index. Five things came back, and four of them are findings in their own right.
+
+**One correction is folded in below rather than hidden.** The first version of this section, written
+before the Actions run history was available, treated the twelve-day staleness and the fetcher's 403
+as a single finding and implied the 403 was the cause. It is not. The staleness is caused by an unset
+secret and a gate that skips and reports green; the 403 is a separate, latent defect that CI has never
+reached. Both are below, separately, in that order.
+
+**Verdicts, all 14.** 12 `unchanged` / `identical_after_normalization`, 2 `meaningful` /
+`content_lines_changed`. The two meaningful ones are exactly the two `fixed_admission` sources:
+the FAQ at +6/-6 (30148 to 30086 chars) and Quick Facts at +4/-5 (12951 to 12512).
+
+### FINDING, HIGH: the scheduled refresh has reported success for fourteen consecutive days while doing nothing
+
+**Corrected 19 September 2026, after the Actions run history was read.** An earlier version of this
+section treated the twelve-day staleness and the 403 below as one finding, with the 403 as the likely
+cause. That was wrong. They are two separate problems, and **only one of them has actually happened.**
+
+Fourteen scheduled runs, one a day through today, every one green, every one between 24 and 37
+seconds. No fetch was attempted in any of them. `recrawl.yml` gates the crawl on whether a database is
+configured, and every one of those runs took the gate:
+
+- `Decide whether a real database is configured` sets `mode=dry-run` when `secrets.DATABASE_URL` is empty.
+- The next step prints "No DATABASE_URL secret configured yet", explains that it is a deliberate no-op, and `exit 0`.
+- `Re-crawl (live)` carries `if: steps.db.outputs.mode == 'live'` and is skipped entirely.
+- `Upload the refresh report` carries `if-no-files-found: ignore`, so the missing artifact is not an error either.
+
+`DATABASE_URL` is unset, so every run takes that branch, exits 0, and reports success. The runtimes
+corroborate it independently: 14 pages at `CRAWL_DELAY_SECONDS=2.0` cannot complete in 24 seconds. The
+per-host delay alone forces roughly 16 seconds of sleep before a single byte is parsed, and that is
+before checkout, `setup-python`, and `pip install -e "./services/orchestrator[dev,freshness]"`. Those
+24 to 37 seconds are the install, not a crawl.
+
+**So the reason nothing has refreshed since 7 September is the unset secret. The 403 has never been
+reached in CI, not once.**
+
+**The finding is not the skip. The skip is correct and deliberate.** Phase 8 has not landed a hosted
+database, there is nowhere to write, and burning 14 requests against government pages for a report
+with nowhere to go would be worse. The finding is that **a job which does nothing is indistinguishable,
+from the outside, from a job which did everything and found nothing changed.** Both are a green check
+and a 30-second runtime. For fourteen days the Actions tab has been reporting daily success for a
+freshness pipeline that has never once run, and nothing anywhere in the repository could have said so.
+
+**This is the same shape as the `sources` table being unable to tell a failed fetch from an unchanged
+page**, one layer up. In both cases the healthy state and the broken state are encoded identically, so
+no amount of looking at the signal distinguishes them. That is the property worth fixing, not the skip
+itself. Options are written up in "Making a skip visible" below; none is built.
+
+### FINDING, HIGH: the fetcher is blocked at the TLS layer (sequencing corrected: this is not the first thing in the way)
+
+Separate from the above, real, measured locally, and **latent rather than active**: it has never run
+in CI because CI has never got that far.
+
+**Sequencing corrected, 19 September, after this was written.** This section originally said the
+fetcher "has to be fixed before the secret goes in, not after", on the reasoning that setting
+`DATABASE_URL` would convert silent green into red. That is wrong, and the finding below it says why:
+the re-crawl dies on `_diff_node`'s opening SELECT against production's schema, **before the fetcher
+is called at all**. This defect is behind a schema defect, not in front of one, and the run would
+never have got far enough to exhibit it. The finding itself is unchanged and still has to be fixed
+before any live re-crawl fetches anything; it is simply not first.
+
+The project's own fetcher (`app/ingest.py::fetch_page`, httpx) returns **403 Forbidden on all 14
+sources**, including `ice.gov/robots.txt`. 14 of 14 failing identically is a broken client, not
+fourteen broken government pages, so it was isolated rather than reported. Each row below holds
+everything constant but the one named variable, same machine, same network, same URL:
+
+| Client | Headers | HTTP | TLS stack | Result |
+|---|---|---|---|---|
+| httpx | project bot UA | 1.1 | Python OpenSSL 3.0.18 | **403** |
+| httpx | + `Accept` | 1.1 | Python OpenSSL 3.0.18 | **403** |
+| httpx | no custom UA at all | 1.1 | Python OpenSSL 3.0.18 | **403** |
+| httpx | **trimmed to byte-identical to curl's** | 1.1 | Python OpenSSL 3.0.18 | **403** |
+| urllib (stdlib, different client code) | minimal | 1.1 | Python OpenSSL 3.0.18 | **403** |
+| curl | **identical project bot UA** | **1.1** | **Schannel** | **200** |
+
+**Four candidate causes were eliminated, in this order.** The user agent is not it: httpx with no
+custom UA at all still 403s, and curl sending the project's exact bot UA is served. The header set is
+not it: httpx trimmed to exactly curl's headers still 403s. The HTTP version is not it, and this is
+the one that overturned the earlier working hypothesis. The installed curl has **no HTTP/2 support
+compiled in** (`curl 8.18.0 ... Schannel`), so every 200 recorded here was negotiated over HTTP/1.1,
+the same version httpx uses. `curl --http1.1` returns 200 explicitly. Finally, the client code is not
+it: urllib and httpx share nothing but the interpreter and both fail.
+
+**What is left is the TLS layer.** Python links OpenSSL 3.0.18; the curl that succeeds uses Windows
+Schannel. The two produce different ClientHello fingerprints, and that is the only variable still
+standing after the other four were removed.
+
+**The block contradicts the sites' own published policy.** All 14 URLs were tested against each host's
+live `robots.txt` using the project's real `RobotFileParser` and the project's real UA: **14 allowed, 0
+denied.** The single `Disallow: /` on `studyinthestates.dhs.gov` and `ice.gov` belongs to a
+`User-agent: PetalBot` block, not to `*`. So a crawler the site explicitly permits, identifying
+honestly, honouring the delay, is being refused by a bot-detection layer that never reads that
+permission.
+
+**No honest fix was found, and this is where it stops.** Every remaining lever that would make httpx
+succeed works by changing what the TLS handshake looks like, which means presenting this client as
+some other client. `curl_cffi` with `impersonate="chrome"`, `tls-client`, and every equivalent exist
+specifically to defeat fingerprinting by forging a browser's ClientHello. **That is disguise, it is
+outside the crawl policy this project set for itself, and it was not done and is not recommended.**
+Changing the UA to a browser string is the same thing one layer up and is equally refused. The
+constraint is deliberate: a bot that lies about what it is has no standing to complain when it is
+blocked, and this project's whole claim is that it is transparent about its sourcing.
+
+**The one measurement that must come before any fix is chosen, and it has not been taken.** Every
+number above is from Windows, where the working client uses Schannel, a TLS stack that does not exist
+on Linux. CI runs `ubuntu-latest` and production is a Linux container, where curl links OpenSSL, the
+same library Python uses. **So the curl-succeeds result may not transfer at all**, and "switch the
+transport to curl" is not a proven fix, it is an untested one that happens to work on the wrong
+operating system. It is equally possible the block is partly address reputation, in which case a
+GitHub Actions or Fly address behaves differently again and there is nothing to fix in the client.
+Measuring from `ubuntu-latest` and from the Fly container costs one throwaway workflow run and settles
+which of these is true. Nothing should be built before that.
+
+### FINDING, HIGH: production's schema is frozen pre-ADR-0014, and the only working part of the re-crawl is its error path
+
+> **RESOLVED, 19 September 2026, the same day, and the fix was in the code rather than in the
+> database.** `python -m app.check_schema` against production returns no missing objects: 6 tables,
+> 33 columns, one extra (`playing_with_neon`, Neon's default demo table, correctly non-fatal). Run by
+> the user. **`sources.rule_effective_date` is not in that output as an extra either**, because
+> production never had it and `infra/sql/init.sql` stopped declaring it under Option B (ADR 0022).
+> That is the whole resolution: the divergence was closed by deleting the column from the
+> declaration, not by migrating Neon. No DDL was run against production for it, and the option this
+> section refuses below (making `_diff_node` tolerant of the missing column) was never taken. The
+> consequence described in this section, fourteen sources marked `fetch_failed` without a page being
+> fetched, can no longer happen, because no success-path statement names a column production lacks.
+> **Read the rest of this section as the record of a closed finding**, kept in full because the
+> reasoning about why tolerance was refused is the part worth keeping.
+
+Found on 19 September, after the section above was written, by `app/sync_annotations.py` failing
+against production with `UndefinedColumn` on its first SELECT. Confirmed against production's
+`information_schema`:
+
+| column | in production |
+|---|---|
+| `sources.rule_effective_date` | **absent** |
+| `sources.last_indexed_body` | **absent** |
+| `documents.rule_effective_date` | present |
+| `documents.content_tsv` | present |
+
+Both absent columns are ADR 0014's additions. Both present ones predate it. **Production is
+post-Phase-5, pre-ADR-0014, and no column was dropped**: the code moved and the database did not.
+
+**How a schema drifts with nothing to notice.** `infra/sql/init.sql` is the only SQL file under
+`infra/`, there is no migration runner, and the file reaches a database exactly one way: mounted
+into the local compose postgres at `docker-entrypoint-initdb.d`, which Postgres executes **only when
+the data directory is empty**. Nothing applies it at app startup, in CI, or from the Fly config. So
+every later `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in that file is applied to a developer's
+laptop on first boot and to nowhere else. A hosted database holds whatever was applied by hand at one
+moment. The idempotent `IF NOT EXISTS` form makes the file safe to re-run and creates the impression
+that re-running is happening.
+
+**The consequence, which is the actual finding.** Every success-path statement in the re-crawl
+touches a column that is not there. `_diff_node`'s **first** statement, before any fetch:
+
+    SELECT last_indexed_body, rule_effective_date FROM sources WHERE source_url = %s
+
+`touch_last_verified` and `_embed_and_store` both write `rule_effective_date`. So the unchanged path,
+the meaningful path, and the diff that chooses between them are all dead.
+
+**`record_source_failure` touches only original-shape columns, so it works.** Which means the first
+live run does not crash. `run_refresh`'s per-source `try/except` catches `UndefinedColumn`, routes to
+the failure path, and that path succeeds fourteen times: `status='fetch_failed'`,
+`consecutive_failures` incremented, and the `UndefinedColumn` text written into `last_error`, **for
+all 14 sources, with not one page fetched.** A broken system reporting its brokenness through the one
+mechanism still functioning, in that mechanism's own vocabulary, which is fetching. See instrument
+table entry 33 for the general form.
+
+**It also settles the 7 September question.** There are exactly two writers of
+`sources.last_verified_at`: `_embed_and_store` and `touch_last_verified`. In today's code both
+reference `sources.rule_effective_date`, so neither can run against this schema. **No re-crawl has
+ever run against production.** The 7 September timestamp was written by an ingest, from a code
+version predating ADR 0014. ADR 0014's own text corroborates it, instructing that the backfill "must
+run against production BEFORE the refresh job runs again" -- the language of a job that has not yet
+run there. `touch_last_verified` does write `last_verified_at` exactly as expected; it simply has
+never been in a position to.
+
+**This retires a piece of sequencing that was about to be acted on.** Setting the `DATABASE_URL`
+secret was the next item on the list, and it would have produced exactly the corruption above. Worse,
+the report it produced would have been credible: fourteen fetch failures, on a corpus whose fetcher
+is independently and genuinely blocked at the TLS layer (see the finding above), measured hours
+earlier, affecting the same fourteen sources. **Two real findings, one of them the wrong explanation
+for the other's symptom, pointing at the same fourteen rows.** The TLS block is no longer the first
+thing in the way. It is behind this.
+
+**What is NOT affected, and it matters for the decision.** The guard reads only
+`documents.rule_effective_date` (`app/db.py` selects `d.rule_effective_date`; `sources` supplies
+freshness columns only). That column exists in production and holds `2026-09-15`, which is why the
+temporal annotation demonstrably fires there. **Production's answer correctness has never depended on
+`sources.rule_effective_date`.** By `init.sql`'s own comment that column exists for exactly one
+purpose: to give the stateless differ somewhere to read the annotation without a snapshot file. No
+migration was written and no schema was changed.
+
+**THE OPTION THAT WAS CONSIDERED AND REFUSED, recorded so it is not proposed again.** Make
+`_diff_node` tolerant of the missing columns: catch `UndefinedColumn`, or probe
+`information_schema` first, and degrade to a no-baseline path when they are absent.
+
+It is the cheapest thing on the table by a wide margin. No DDL, no production access, no backfill,
+no snapshots, no coordination with anyone, and the red goes away the same afternoon. **It is the
+option a reasonable person reaches for under deadline**, which is exactly why it is written down
+here rather than left unchosen and available.
+
+It was refused because of what "degrade" means in this specific function. `_diff_node` already has a
+no-baseline branch, and it already refuses to use it in this situation: a NULL `last_indexed_body`
+on a source that already has chunks in `documents` raises loudly, deliberately, because treating it
+as a new source would re-index and re-embed content that has not changed and reset `fetched_at`,
+destroying freshness history `infra/sql/init.sql` marks "not reconstructable after the fact".
+Tolerance would route the schema error into precisely the branch that was built to reject it, and
+the result would not be a visible degradation. It would be fourteen sources re-indexed on a day
+nothing changed, `fetched_at` and `change_count` quietly wrong forever, and a green run.
+
+**The general form: it converts a loud, specific, correct error into a quiet, plausible, wrong
+success.** That is the same shape as instrument entry 33 one layer down, and the same shape as the
+`sources` table being unable to distinguish a failed fetch from an unchanged page. This report has
+now documented that pattern three times in three different components, which is the argument for
+refusing it on sight rather than re-deriving the reasoning each time under time pressure.
+
+### The diff baseline is irreplaceable, and it exists in one gitignored directory on one laptop
+
+`sources.last_indexed_body` means "the body currently indexed". Populating it is mandatory under
+every option above: after the column is added, every row is NULL while `documents` holds chunks,
+which is exactly the state `_diff_node` refuses to proceed on. So the question of where that body can
+come from is not academic, and it has exactly three candidate answers. Two are ruled out, with
+numbers.
+
+**Reconstructing it from `documents` chunks: rejected, measured.** ADR 0014 investigated this and
+recorded the figure: concatenating one real source's stored chunks back into a body gives **12,574
+characters against the original snapshot's 12,321**. The 253-character gap is `chunk_markdown`'s own
+breadcrumb prefix, one inserted line per chunk. `classify_change` is line-based
+(`normalize_for_diff` plus a line-by-line comparison), so every one of those breadcrumbs reads as a
+changed line at every chunk boundary. Undoing the prefix is not available either: it carries the
+parent/heading structure it exists to provide.
+
+**Seeding it from a fresh fetch of the live page: worse than lossy, and this is a finding rather
+than a rejected option.** A fetch returns today's body, not the indexed one, so it does not
+approximate the baseline, it replaces it with a different thing that looks identical in the column.
+Every change that happened between the last ingest and the seeding fetch is silently absorbed into
+the new baseline and can never be detected, because the next diff compares today against today.
+
+**This is not hypothetical here. It would erase a discovery this project has already made.**
+Production was ingested on 7 September. Between then and 19 September, DHS rewrote both
+`fixed_admission` pages, removing every concrete date (`Sept. 15, 2026` 6 to 0 on the FAQ, 4 to 0 on
+Quick Facts; `Nov. 14, 2030` and `March 18, 2027` likewise to 0) and adding no injunction notice.
+That change is the most consequential thing this corpus has seen, it took a live fetch to find, and
+it is what the temporal finding above rests on. Seed `last_indexed_body` from a fetch and the
+baseline becomes the scrubbed text; the next re-crawl reports **`unchanged`**, correctly by its own
+logic and wrongly in every sense that matters, and goes on reporting it forever. The system would
+have no record that the pages ever said anything else.
+
+**So the snapshots are irreplaceable, not merely convenient.** Taken together the two measurements
+establish it: reconstruction is provably lossy in exactly the dimension the differ reads, and
+re-fetching is not a reconstruction of the baseline at all. The 14 files in `data/sources/raw/` are
+the only faithful copy of what is currently indexed.
+
+**The dated risk, stated plainly because it cuts against everything else in this section.** That
+directory is gitignored. It exists on one laptop. **If it is lost before the backfill runs,
+`last_indexed_body` becomes unrecoverable**, and the only remaining paths are a lossy seed or a full
+re-index that resets `fetched_at` and `change_count` -- values `infra/sql/init.sql` marks "not
+reconstructable after the fact". There is no second copy anywhere: not in git, not in production
+(the column does not exist), not in `eval/fixtures/sources/` (four trimmed files).
+
+**The tension is real and should be visible rather than reconstructed later.** Every other finding
+in this section argues for moving slowly: the schema is frozen, the first live re-crawl would
+corrupt fourteen health rows, the fetcher is blocked, the sequencing has already been wrong twice.
+This one argues for moving soon, and it is not in conflict with the others so much as orthogonal to
+them. The backfill does not require the re-crawl to work, the fetcher to be unblocked, or the
+`rule_effective_date` question to be settled. It requires one column, one script, and a directory
+that currently exists. **The window in which this is cheap is open now and closes if that laptop
+does.** Nothing here argues for rushing the parts that are genuinely entangled; it argues for
+recognising that this particular part is not entangled with them.
+
+### The first piece of Option B, landed ahead of the rest, and why that was deliberate
+
+**A future reader finding half of a decision implemented should see that it was on purpose.** Option
+B (delete the `sources.rule_effective_date` dependency rather than add the column to production) is
+approved but mostly not built. One line of it landed early, on 19 September 2026:
+`app/backfill_source_bodies.py`'s UPDATE now writes `last_indexed_body` and nothing else, where it
+used to write `rule_effective_date` as well.
+
+**The reason is sequencing, not tidiness.** The backfill is on the critical path for every option,
+because `last_indexed_body` must be populated under all of them: after the column is added every row
+is NULL while `documents` holds chunks, which is exactly the state `_diff_node` refuses to proceed
+on. But Option B adds ONLY `last_indexed_body` to production and never adds
+`sources.rule_effective_date`. Run the two-column form against that schema and it raises
+`UndefinedColumn` and the entire backfill fails, on the one step everything else waits behind.
+
+The alternatives were costed and are worse. Adding both columns reverts the DDL to Option A and
+leaves a column that step 3 immediately makes vestigial, which is the specific outcome Option B was
+chosen to avoid. Adding both and dropping one later means performing production DDL twice, by hand,
+through the same process that produced the drift this whole section documents.
+
+**What is NOT done, so the half-state is legible.** `app/recrawl.py`'s `touch_last_verified` and
+`reindex_source` still write `sources.rule_effective_date`; `_diff_node` still reads it;
+`app/sync_annotations.py` still writes it. All of that is the rest of Option B and is untouched.
+
+**Update, later the same day: the second piece landed too, and it was not a one-line change.**
+`app/sync_annotations.py` now touches the `sources` table in NO statement at all. Removing its
+`UPDATE sources` alone would not have made it runnable, because its before-and-after diff read
+`SELECT rule_effective_date FROM sources`, against the same absent column: **the read was as fatal
+as the write, and only the write was obvious.** The read moved to
+`SELECT DISTINCT rule_effective_date FROM documents`, which is the copy retrieval actually uses and
+was always the load-bearing one. Three cascades came with it: a summary line in `main()` that read
+a dict key the rename had removed (a `KeyError` on every invocation, caught by lint and tests rather
+than by a user), the `missing_sources_row` field renamed to `not_in_corpus` because it no longer
+describes a `sources` row, and the module's exhaustive blast-radius list rewritten to one column in
+one table. **One capability arrived for free**: reading per-chunk instead of per-source makes a
+source whose chunks disagree about the date visible for the first time, which was structurally
+unobservable while the value came from a single `sources` row. It is reported as `before_is_mixed`
+rather than silently flattened. Still untouched and still the rest of Option B:
+`app/recrawl.py`'s `touch_last_verified` and `reindex_source` write the column, `_diff_node` reads
+it, and `infra/sql/init.sql` still declares it.
+Nothing has been removed from `infra/sql/init.sql`, and no migration has been written. The backfill
+was pulled forward alone because it is the only piece that blocks the next step.
+
+**Other changes in the same pass**, all to make a hand-run tool behave like one: the synchronous
+conversion (it was async with no concurrency, which made it unrunnable on Windows, where the only
+copy of the snapshots lives), clear errors naming `RAW_SNAPSHOT_DIR` and `DATABASE_URL` with the
+password masked, a bounded `connect_timeout` (11s measured, against roughly 120s unbounded), and
+`register_vector_async` deleted rather than converted since the script touches no vector column.
+
+**Two behaviours that were worse than merely unhelpful, and are the same shape as findings elsewhere
+in this report.** `--dry-run` used to return `sources_rows_still_null_after: 0` unconditionally,
+because nothing had been written. That is a clean bill of health for work not done, which is exactly
+the skipped-cron problem and the failed-versus-unchanged problem in a third place. It now subtracts
+the rows the pass would fill and PREDICTS the post-run number, and it NAMES the leftovers rather than
+counting them, because the count says something is wrong and only the URLs say which sources
+`_diff_node` is about to raise on. Separately, if `RAW_SNAPSHOT_DIR` pointed somewhere with no
+snapshots, the glob returned nothing and the script reported a contented `0 updated` for a run that
+read no files at all; it now exits with an explanation, distinguishing "does not exist" from "exists
+but holds no snapshots".
+
+**A standing verification caveat, recorded here rather than left to be forgotten once a dry run
+passes.** Neither this script nor `app/sync_annotations.py` has ever been executed against a real
+database from this machine; there is no Postgres here. Both were verified against a fake connection
+that records every statement and transaction boundary, which is strong evidence about WHICH
+statements are issued and useless as evidence about how the database responds to them. **Two things
+in particular a fake can agree with and reality can disagree with, and a dry run exercises neither:**
+
+1. `cur.rowcount` on the guarded `UPDATE ... WHERE ... AND last_indexed_body IS NULL`. The
+   concurrent-write branch (rowcount 0, treated as already-populated rather than an error) is
+   reasoned about, not observed.
+2. The commit boundary of `conn.transaction()` on a non-autocommit connection. The per-source
+   durability claim rests on psycopg issuing a real BEGIN/COMMIT around each block.
+
+A `--dry-run` issues no UPDATE and commits nothing, so **passing the dry run leaves both of these
+exactly as unverified as they are now.** Only a real write settles them.
+
+**RESOLVED, 19 September 2026, by the real run. Both are now measured rather than predicted.** Step 2
+completed against production: `sources.last_indexed_body` added, then the backfill run for real,
+**14 of 14 rows written and none left NULL**. That exercises exactly the two things a dry run could
+not.
+
+1. **`cur.rowcount` on the guarded UPDATE: measured, on the success path.** Fourteen UPDATEs each
+   reported `rowcount == 1` against live psycopg, so `updated` counted 14 rather than silently
+   falling through to the concurrent-write branch. The `rowcount == 0` branch itself remains
+   unexercised, because nothing was writing concurrently; that branch is still reasoning, not
+   observation, and it is the smaller of the two claims.
+2. **The `conn.transaction()` commit boundary: measured.** All fourteen per-source blocks committed
+   and persisted, confirmed by a subsequent read finding zero NULL rows. The per-source durability
+   claim is now observed behaviour on a non-autocommit connection.
+
+**A corroboration worth recording, because it confirms the backfill wrote the right bytes and not
+merely some bytes.** ADR 0014's reconstruction argument quotes an original snapshot at 12,321
+characters, which is the STEM OPT page. That source's local snapshot body measures **12,320**, and
+the value production returned after the backfill is **12,320** -- identical to the local file, and
+one character from the ADR's figure, almost certainly a trailing newline counted differently when
+that measurement was taken. The two independent paths agree exactly with each other. (An initial
+concern about a 40,425-character body was a misattribution: 40,425 is `travel-ice-sevp-travel-faq`,
+the largest source in the corpus, and has nothing to do with the figure in ADR 0014.)
+
+### Step 3 built: the schema drift check, and why it does not parse init.sql
+
+`.github/workflows/drift-checks.yml` and `services/orchestrator/app/check_schema.py`, landed
+19 September 2026. It compares production's schema against what `infra/sql/init.sql` declares and
+fails loudly on anything missing. The full reasoning lives in the workflow file's own header rather
+than only here, deliberately: whoever next thinks about parsing `init.sql`, or adds a migration
+runner, or wonders what the check covers, will be reading code.
+
+**The expected schema is not parsed out of `init.sql`. Postgres parses it.** The check applies
+`init.sql` to a throwaway `pgvector/pgvector:pg16` service container and reads that database's
+`information_schema`, so the comparison is between two `information_schema` queries and nothing
+re-implements SQL. The precedent already existed: `.github/workflows/eval.yml` applies the same file
+the same way to its own service container.
+
+The alternative, parsing the file, is the obvious implementation and the fragile one. That file's net
+column set is `CREATE TABLE IF NOT EXISTS`, plus multi-column `ALTER TABLE ... ADD COLUMN IF NOT
+EXISTS` with SQL comments interleaved between the columns, plus a `DROP COLUMN` inside a conditional
+`DO $$` block guarded on whether the legacy columns are present. **A naive parser applying that DROP
+unconditionally still gets `documents` right, but only because those columns are absent from its
+CREATE TABLE anyway: correct by luck, not by design, and the luck is invisible to whoever wrote it.**
+Given thirty-three entries in the instrument table about instruments that were quietly wrong, a
+bespoke SQL parser is not a surface worth adding. Cost when someone adds a column: zero, with nothing
+to remember. It also verifies that `init.sql` is applicable at all, which nothing previously did.
+
+**Strict on missing, report-only on extra, and the asymmetry is principled.** A missing table or
+column is a guaranteed runtime failure with a known severity, and is the case that actually happened.
+An extra one is by construction referenced by no code, so it cannot break anything -- and after
+Option B lands, `sources.rule_effective_date` is exactly that on every developer database created
+before the change. A check that failed on it would be red everywhere for a condition that breaks
+nothing, which is how a check gets muted. One refinement: an extra column that is `NOT NULL` with no
+default IS fatal, because every INSERT not naming it fails. Types are not compared in this version,
+because `text` versus `character varying` across a pinned reference and a hosted target produces
+false positives, and a check that is noisy on its first outing gets ignored rather than fixed.
+
+**A defect found in the check's own output, during its own verification.** The first version derived
+the headline from the missing-object test alone, so a run whose only fault was a fatal extra column
+printed `schema ok` as its first line and then exited 1. A green headline on a red outcome, in the
+check built to catch exactly that shape, caught only because the verification drove a case where the
+two could disagree. The headline is now derived from the same `drift.ok` property that decides the
+exit code, so there is one source of truth for the verdict.
+
+**Two things recorded as decided rather than omitted.**
+
+*The `pull_request` trigger is deferred, not forgotten.* It would catch "you added a column to
+`init.sql` but production does not have it" at the moment of introduction, which is strictly earlier
+and more useful than a daily schedule. It is not taken because it would hand every PR production
+database credentials and would sit red from the moment anyone adds a column until the migration
+happens, making an unrelated PR the place a production migration decision surfaces. Catching this a
+day later is better than that.
+
+*The staleness job is planned and deliberately not built*, though this file is its home and names it.
+Its alert threshold is still open, and it would be RED from the moment it lands (`age_hours` was
+283.9 when it was designed). **Landing one green check is worth more than two where one is red by
+design and therefore ignored from birth** -- the same reasoning that kept option A out of
+`recrawl.yml`.
+
+**Verification, and what is prediction.** Six cases against the real `compare`/`render`, including
+production's actual 19 September drift, a missing table (the `usage_totals` case `app/usage.py`
+documents), a nullable leftover that must stay green, and a fatal `NOT NULL` extra: 6/6 correct. What
+is NOT measured: no run against a real database, and in particular `read_schema`'s single
+`information_schema` SELECT has never been executed. The first CI run is the first evidence for it.
+
+**MEASURED, 19 September 2026. This was the check's first real execution, and it worked.** Run by the
+user, not by the agent. `read_schema`'s `information_schema` SELECT had never touched a database
+before this and ran correctly against BOTH ends of the comparison: a pg16 reference with `init.sql`
+applied, and Neon. The verdict was clean: **6 tables, 33 columns, no missing objects**, with one extra
+(`playing_with_neon`, Neon's default demo table) reported and correctly treated as non-fatal, which is
+the asymmetry above doing exactly what it was designed to do on its first outing rather than on a
+contrived case. The `6/6 correct` figure above was six cases against `compare`/`render` with
+hand-built inputs; this is the first time the reading half of the tool was exercised at all.
+
+### FINDING: DHS removed every concrete date from both fixed_admission pages, and added no injunction notice
+
+Both pages were edited between the 6 September baseline and today. No sentence was added about the
+court, the injunction, or the rule not taking effect. What changed is that **every specific date tied
+to the rule taking effect was deleted and replaced with a phrase.**
+
+| String | FAQ | Quick Facts |
+|---|---|---|
+| `Sept. 15, 2026` | 6 to **0** | 4 to **0** |
+| `Nov. 14, 2030` | 1 to **0** | 1 to **0** |
+| `March 18, 2027` | 2 to **0** | 1 to **0** |
+
+Representative before-and-after pairs, from the diff the classifier produced:
+
+- "Beginning on **Sept. 15, 2026**, F students will be admitted to the United States for a fixed
+  period of time..." becomes "Beginning on **the final rule's effective date**, F students will be
+  admitted to the United States for a fixed period of time..."
+- "...not to exceed **Nov. 14, 2030** (four years, plus a 60-day departure period)" becomes "...not to
+  exceed **four years, plus a 60-day departure period**".
+- "...who timely file for post-completion OPT or STEM OPT on or before **March 18, 2027** (six months
+  after the final rule's effective date)" becomes "...on or before **six months after the final rule's
+  effective date**".
+- "Yes, current F students can continue to travel; however, **as of Sept. 15, 2026**, upon returning to
+  the United States..." becomes "...however, **after the final rule's effective date**, upon
+  returning...".
+
+Two passages were deleted outright with no replacement:
+
+- FAQ: "The final rule will take effect on Sept. 15, 2026. F students will continue to be admitted for
+  duration of status until this date."
+- Quick Facts: the SEVIS Release 6.89.1 deployment window, "Monday, **Sept. 14, 2026**, from 8 p.m. to
+  Tuesday, **Sept. 15, 2026**, at 12 a.m. EDT". The sentence now retains only the planning-guide link.
+
+The Quick Facts "Latest Updates" section still says content across Study in the States and ICE.gov/SEVP
+"will be updated to reflect the final rule on and after the final rule's effective date", which now
+refers to a date the page no longer states anywhere.
+
+**No injunction notice, and this was checked properly rather than eyeballed.** The raw HTML of both
+pages was searched for `enjoin*`, `injunction`, `vacatur`, `vacated`, `court order`, `federal court`,
+`district court`, `litigation`, `stayed`, `not take effect`, `postponed`, `on hold`, `blocked by`.
+Zero matches on either page. **A zero-match grep proves nothing until it is shown it could have
+matched**, so the same instrument was run against strings known to be present: `final rule` hits 32
+times in the FAQ and 30 in Quick Facts, `duration of status` 8 and 5. The instrument works; there is
+nothing there. Both pages were then re-fetched through a JavaScript-capable renderer with
+`onlyMainContent: false`, in case a notice was injected client-side into a region the parser strips.
+Still nothing, including in banners, header and footer.
+
+**Causation cannot be settled from this data, and the timestamps actively cannot settle it.** The
+obvious reading is that DHS de-dated the pages because the rule was enjoined the day before it would
+have taken effect. The page timestamps do not support that inference and do not refute it:
+
+| | baseline `page_last_updated` | live `page_last_updated` |
+|---|---|---|
+| FAQ | 2026-08-31 | **2026-08-31, unchanged, despite the content having changed** |
+| Quick Facts | 2026-08-31 | 2026-09-10, which is **four days before** the injunction |
+
+The FAQ's self-reported date did not move even though its text demonstrably did, so that field is
+provably unreliable on these pages. Quick Facts reports 10 September, which precedes the 14 September
+injunction, and would point to a pre-injunction edit if the field could be trusted at all, which the
+FAQ has just shown it cannot. All that is established is that the edits landed somewhere between 6 and
+19 September. **A government page removing every concrete date from a rule that was enjoined the day
+before it would have taken effect is worth recording precisely, whatever the reason, and the reason is
+not in evidence here.** Search-index lag is not the explanation for either page; these are live
+fetches.
+
+**A second-order consequence worth naming:** the FAQ changed its content without moving its own
+`page_last_updated`. Any freshness scheme keyed on a page's self-reported date would have scored this
+as unchanged. The content diff is what caught it, which is the design
+`docs/adr/0014-stateless-recrawl-diff.md` already chose, now with a real instance behind it rather
+than a rationale.
+
+### The fail-open is confirmed live, not anticipated
+
+"The injunction, and why this is not fixed" predicted, from reading the code on 15 September, that
+`freshness.py`'s `<=` comparison would invert the appended notice from "takes effect on" to "took
+effect on". **That is now measured against the deployed system.** `POST /v1/query` to the production
+gateway on 19 September, asking when the fixed period of admission rule takes effect:
+
+> The final rule that establishes a fixed period of admission for F-1 students becomes effective on
+> September 15, 2026[1][2][7].
+>
+> Some of the sources above describe a rule that **took effect on September 15, 2026**, so the answer
+> differs before and after that date.
+
+Seven citations, all to the two `fixed_admission` pages. So production is telling a user that an
+enjoined rule became effective, in its own uncited system-generated sentence, exactly as predicted,
+with the guard inert. The prediction and the measurement now agree; this moves from derived to
+confirmed. It also confirms, as a side effect, that production's indexed copy still holds the
+pre-scrub text, since it can still cite "September 15, 2026" from pages that no longer contain it.
+
+### CORRECTED: `broken_source_count: 14` is not a bug. It is the only alarm in this system that fired.
+
+**This entry previously read "FINDING, LOW: `broken_source_count` reports 14 while all 14 sources
+report ok", and called it a counting bug worth fixing. That was wrong, and reading the rule instead of
+the payload settled it in about a minute.** The correction matters more than the original claim did.
+
+`app/guardrails/freshness.py::source_health_state` returns `broken` when ANY of four clauses holds:
+`consecutive_failures >= SOURCE_BROKEN_CONSECUTIVE_FAILURES` (3), `status == "robots_disallowed"`,
+`last_success_at is None`, or **`last_success_at` older than `SOURCE_BROKEN_NO_SUCCESS_DAYS`, which
+defaults to 7.** Every source's `last_success_at` is 2026-09-07. Today is the 19th. Twelve days is
+older than seven, so all 14 are `broken`, correctly, by the fourth clause.
+
+The two fields that made it look self-contradictory are each also correct. `status: "ok"` is the
+outcome of the last crawl that actually ran, and the last one that ran succeeded. `consecutive_failures: 0`
+is true because nothing has failed: nothing has run. **Neither field is about staleness, and the
+clause that fired is.**
+
+So the endpoint was not confused. It was right, in three separate fields at once:
+
+    broken_source_count  14        <- correct, via the no-success-in-7-days clause
+    stale_source_count   14        <- correct, via last_verified_at < now() - 24h
+    freshness_state      "stale"   <- correct, via the weakest link's age
+    age_hours            283.9     <- correct
+
+**Four correct signals, computed daily, served on a public endpoint, and consumed by nothing.** The
+system detected its own twelve-day outage and had no way to tell anyone. That is the finding, it is
+considerably worse than a counting bug, and it is the entire argument for option E below. A monitoring
+gap is not usually a missing measurement; here the measurement already existed and was already right.
+
+**The residual, which is real but small.** The payload reports the verdict without naming which of the
+four clauses produced it, so `broken` sitting beside `"status": "ok", "consecutive_failures": 0` reads
+as a contradiction until you go and read `source_health_state`. I misread it exactly that way, in a
+document whose whole subject is misreading instruments. A `reason` field on `BrokenSource` naming the
+clause would remove the ambiguity for the next reader. Not built, not urgent, and a much smaller thing
+than what this entry originally claimed.
+
+### FINDING: the sites' own robots.txt permits every URL the WAF refuses
+
+Recorded because it is what turns the disguise question from an obvious no into an actual dilemma, and
+it stands whatever the Linux measurement returns.
+
+All 14 manifest URLs were tested against each host's **live** `robots.txt`, fetched today, using the
+project's own parser (`urllib.robotparser.RobotFileParser`, the same class `app/ingest.py::RobotsCache`
+uses) and the project's own User-Agent: **14 allowed, 0 denied.**
+
+The one `Disallow: /` present on `studyinthestates.dhs.gov` and `ice.gov` belongs to a
+`User-agent: PetalBot` block at the end of the file, not to `User-agent: *`. Under `*` these sites
+disallow `/admin/`, `/search/`, `/user/login`, Drupal internals, and a list of README files. Nothing
+resembling the fourteen pages this project reads. `uscis.gov` likewise permits all of its six.
+
+So the position is: **a crawler these sites explicitly permit, identifying itself honestly with a
+contact address, honouring a two-second delay it was never asked for, requesting fourteen pages once a
+day, is refused by a bot-detection layer that never reads the permission the same site publishes.**
+The robots.txt is the site's stated policy. The WAF is a different system with a different rule, and
+the two disagree.
+
+**Why this is a dilemma rather than a grievance.** It would be easy to read "they said yes in
+robots.txt" as licence to get past the WAF by whatever means work, and that reasoning is wrong: a
+published robots.txt is permission to crawl, not consent to be deceived about who is crawling. The
+operator of a WAF is entitled to block traffic it cannot identify even when robots.txt would have
+allowed it, and forging a TLS fingerprint to defeat that is not made honest by a favourable line in a
+text file. What the permission does change is the **framing of the fix**: this is not a site that does
+not want to be read, so the legitimate routes are real ones rather than polite fictions. Ask, using
+the contact address already in the UA, which is what that address is for. Use an official channel
+where one exists (the Federal Register publishes the rule itself, document 2026-14439, through a
+documented public API). Or measure whether the block even reproduces where the job actually runs,
+which is the pending question and the reason no fix is recommended yet.
+
+**Had robots.txt said `Disallow: /`, this would be a two-line finding: stop crawling those pages.**
+It does not, which is why the section above ends in a stop rather than an answer.
+
+### Making a skip visible: options, costed. D is built, E is planned, A is deferred.
+
+**Status as of 19 September:** D is BUILT and is in `recrawl.yml`. E is approved and planned in detail
+in the next section, deliberately not built yet. A is scheduled to land with the `DATABASE_URL` secret
+and not before. B and C are not being taken, because E supersedes the need for them. The problem
+being solved is narrow and worth stating exactly: **a run that does nothing and a run that fetched
+everything and found nothing changed currently produce the same two signals**, a green check and a
+runtime of roughly half a minute. Any fix has to break that tie.
+
+**A. Exit non-zero when the job skips.** Replace the no-op step's `exit 0` with a failure.
+Impossible to miss: a red X in the Actions list and GitHub's own failure notification. The cost is
+that it is a lie in the other direction. The skip is currently *correct*: Phase 8 has not landed a
+hosted database, and fetching 14 government pages to throw the result away would be worse behaviour,
+not better. Fourteen red runs a day for a deliberate, known configuration is how a team learns to
+ignore red, which is the disease rather than the cure. **This becomes the right answer the moment
+`DATABASE_URL` is expected to be set**, because from then on a skip really does mean something is
+broken. Not before.
+
+**B. Make the run render as "Skipped" rather than "Success".** Move the gate from a step to the job,
+so the job shows grey rather than a green check. `secrets` is not available to a job-level `if:`, so
+this needs a small preflight job that reads the secret into an output, with `refresh` gaining
+`needs: [preflight]` and `if: needs.preflight.outputs.has_db == 'true'`. Honest encoding: a skipped
+job is genuinely skipped, and no step lies about having succeeded. The weakness is distance. The
+**workflow run** still reports overall success in the Actions list, so this only helps someone who
+opens the run. Costs one extra job of a few seconds per day.
+
+**C. Put the state in the run's title.** `run-name:` renders per-run in the Actions list, so the list
+itself can read `Refresh: SKIPPED (no DATABASE_URL)`. This is the best signal-to-effort ratio of
+anything here, because it works at a glance from the tab you would actually be looking at. One
+wrinkle: `run-name` is evaluated before any step runs and cannot read a step output or a secret, so
+the flag has to come from somewhere it can see, in practice a repository **variable** rather than the
+secret itself. That duplicates the real condition in a second place, and two places can drift.
+
+**D. A warning annotation and a job-summary line. BUILT, 19 September 2026.** The skip step in
+`recrawl.yml` now emits a `::warning title=Scheduled refresh did NOT run::` annotation and writes a
+summary block stating "Sources fetched: **0 of 14**", that no `last_verified_at` moved, and that the
+run is green because skipping is currently correct rather than because the corpus was checked. It
+still `exit 0`s, on purpose; see option A. Verified by extracting the step out of the parsed YAML and
+executing it against a temporary `GITHUB_STEP_SUMMARY`: exit 0, annotation on stderr, summary renders
+with its backticks and table intact. Yellow annotation on the run page, visible summary, no structural
+change, essentially free. Like B, it only reaches someone already looking at the run, **which is
+exactly why it is a floor and not the answer.** It was worth building immediately because it costs
+nothing and is correct regardless of what the Linux measurement returns.
+
+**E. Stop checking the job and check the data instead.** A separate scheduled workflow (or any
+external uptime monitor) that reads `GET /v1/sources/status` and fails when `freshness_state` is not
+fresh, or when `age_hours` exceeds a deliberate threshold. The endpoint already computes precisely
+this and is already public: it returned `age_hours: 283.9`, `stale_source_count: 14`,
+`freshness_state: "stale"` during this session, correctly, while the Actions tab showed fourteen
+consecutive successes.
+
+**E is different in kind from A through D and it is the one worth having.** A through D make *this
+skip* visible. E makes *staleness* visible, and it does not care what caused it: the unset secret
+today, the TLS block the moment the secret is set, a crawl that runs and silently writes nothing, a
+DNS failure, a database that accepts writes and rolls them back. It measures the outcome the project
+actually promises (the corpus is current) instead of a process believed to produce it. **It is also
+the only option on this list that would have caught the last twelve days**, because it is the only one
+that does not depend on knowing in advance which step would fail.
+
+Two things to weigh on E before building it. It must not live in the same workflow as the refresh, or
+it inherits the failure it exists to detect. And it will go red immediately and stay red, correctly,
+until either the corpus is refreshed or the threshold is set with the current state in mind. That is
+the alarm working, but it is a decision to make knowingly rather than discover. **Both points are
+settled in "Option E in detail" below, together with the two thresholds and where it runs.**
+
+**Decided, 19 September.** D now, built, because it costs nothing and removes the silent case today.
+E as the real fix, planned in the next section with its home and its thresholds settled in advance
+rather than discovered by watching it go red. A lands with the `DATABASE_URL` secret, when a skip
+stops being a legitimate state, and not one day before. B and C are dropped: both are partial
+substitutes for E, and taking a partial substitute for a thing you have already decided to build is
+how two half-measures end up maintained instead of one real one.
+
+### Option E in detail: the staleness watchdog. Planned, not built.
+
+Approved in principle on 19 September, to be built once the two open questions below are settled. The
+reason it is the one worth having, restated because it is the whole justification: **A through D all
+require knowing in advance which step will fail.** E does not. It reads the outcome the project
+actually promises, that the corpus is current, and goes off regardless of cause: the unset secret
+today, the TLS block the moment the secret is set, a crawl that runs and silently writes nothing, a
+database that accepts writes and rolls them back, a manifest entry quietly dropped. It is the only
+option on the list that would have caught the last twelve days.
+
+**What it reads.** `GET /v1/sources/status`, which already computes everything needed and is already
+public. No new endpoint, no new query, no schema change. It returns `age_hours` (the age of the
+**weakest** link, `min(last_verified_at)`, deliberately not the freshest, see that handler's own
+docstring), `freshness_state`, `stale_source_count`, and `broken_source_count`. As established two
+sections up, all four were correct throughout the outage. The watchdog's entire job is to be the
+consumer they never had.
+
+#### Where it lives
+
+It cannot live in `recrawl.yml`, for the reason that makes it worth building: a watchdog inside the
+thing it watches shares the failure it exists to detect. The candidates, in the order I would take
+them:
+
+**1. A separate scheduled workflow in this repository.** Zero new infrastructure, same place the
+existing signals already are, roughly twenty lines. It satisfies the stated requirement (it is not in
+the workflow it watches) and it is enough to close the gap that has been open for twelve days.
+**Its one real weakness should be named rather than discovered:** GitHub disables scheduled workflows
+in a repository with no activity for 60 days, so a watchdog living here can be switched off by the
+repository going quiet, which is not perfectly uncorrelated with a project nobody is looking at. For
+an actively developed repo it will not fire, and GitHub emails the owner when it does. Acceptable to
+start; worth remembering.
+
+**2. Grafana Cloud alerting, which this project already pays nothing for and already exports to.**
+Both services already send OTLP to `otlp-gateway-prod-us-east-2.grafana.net`. If the orchestrator
+emitted the weakest link's age as a gauge, the alerting that exists there would do this natively, with
+real notification routing and no dependence on GitHub at all. This is the better long-term home and
+the more honest architecture: freshness is a property of the running system, so it belongs with that
+system's telemetry rather than in a CI product. The cost is a small code change in the orchestrator
+(one gauge) plus an alert rule, which is why it is second rather than first.
+
+**3. An external uptime monitor with a JSON assertion.** Fully independent failure domain, alerts
+without either GitHub or Grafana. Rejected as the starting point only because it means another account
+and another place to remember, for a check the two options above can already express.
+
+Not option 4, and stated so it is not proposed later: **a check inside the orchestrator that alerts on
+its own staleness.** A service reporting on its own health cannot report that it is down, which is the
+failure mode that produced the twelve days.
+
+#### What the threshold is, and why
+
+The point of setting this deliberately is that a threshold discovered by watching something go red is
+a threshold chosen by whatever happened to be true that week. Two different questions are being asked
+and they deserve two different numbers.
+
+**Operational, "the pipeline is broken": alert when `age_hours` exceeds 48.**
+
+The job runs daily at 08:17 UTC, so a healthy `age_hours` sits between 0 and 24. 24 is therefore the
+wrong alarm: GitHub explicitly does not guarantee scheduled start times and delays them under load,
+sometimes by tens of minutes and occasionally much longer, so a 24-hour line would fire on ordinary
+lateness and train exactly the indifference option A was rejected for. **48 hours means two
+consecutive daily ticks have failed to land**, which no amount of routine queue delay produces. It is
+tight enough that the twelve-day outage would have been caught on 9 September, three days into it and
+five days before the injunction, and loose enough to sit quiet on a normal week. Note this is measured
+on the weakest link, so it also catches the subtler failure where thirteen sources refresh and one
+silently stops.
+
+**Editorial, "the corpus is too old to answer from": escalate at 7 days.**
+
+Distinct from the above and deliberately aligned with `SOURCE_BROKEN_NO_SUCCESS_DAYS = 7`, which is
+already the number `source_health_state` uses to call a source broken. Reusing it rather than
+inventing a second one means the watchdog and the endpoint agree about what "too old" means, and there
+is no second constant to drift. Seven days is a defensible line for this corpus on its own terms: the
+observed change rate is low (12 of 14 sources unchanged across roughly two weeks) but the changes that
+do land are exactly the ones that matter, and this session watched two pages be rewritten inside a
+single week in a way that inverted a rule's status.
+
+**A deliberate consequence to accept before building, not after.** Set against today's state, this
+alarm goes red immediately, at `age_hours` 283.9, and stays red until the corpus is actually
+refreshed. That is the alarm working. It does mean the watchdog cannot be built and left alone: it
+should land either after the refresh pipeline is fixed, or together with an explicit, dated
+acknowledgement of the current staleness. Building it into a red state and muting it would recreate
+the disease in a new place.
+
+**What it should not do.** Not page anyone; this is a daily-cadence signal, not an outage. Not gate
+deploys. Not go red on `broken_source_count` alone, which is derived from the same clock and would
+double-count the same condition. One alarm, on the weakest link's age, with the two thresholds above
+distinguished by severity rather than by separate checks.
+
+### What this run deliberately did not do
+
+- **No source decision.** Whether to remove, re-index, or annotate the two `fixed_admission` sources
+  is open and is mine to make. Nothing was re-indexed, refreshed, or removed.
+- **The CPT gap goes on the list, not into the corpus.** The SEVP curricular practical training
+  guidance issued in August is unaffected by the injunction and continues to restrict Day 1 CPT. It is
+  a separate story from everything above and must not be folded into it. No manifest source covers it:
+  "Day 1 CPT" appears nowhere in the corpus. CPT appears incidentally in three sources, all verdict
+  `unchanged` (Maintaining Status, 3 mentions; F-1 OPT, 4; the fixed_admission FAQ, 2, both about
+  employment during the departure period and the 240-day pending-EOS window). None of those mentions
+  is in a changed line. **That is a coverage gap, not a change**, and it is recorded here as an open
+  item rather than acted on.
+
+### Two caveats on this run, stated rather than buried
+
+1. **The diff baseline was the local snapshots in `data/sources/raw/`, not production's
+   `sources.last_indexed_body`.** The production database could not be reached from this session:
+   `fly ssh console` and credential lookup were both refused by the permission classifier, and Fly
+   exposes only secret digests. The two `meaningful` verdicts are corroborated against production
+   independently, by the `/v1/query` result above showing production still citing the pre-scrub dates.
+   **The 12 `unchanged` verdicts are not corroborated that way** and rest on the local snapshots
+   matching what production indexed. They should be re-run against the real baseline before being
+   relied on.
+2. **Transport was curl, not httpx**, for the reason in the first finding. Parsing and classification
+   used the project's real `select_main_container`, `remove_noise`, `promote_definition_lists`,
+   `html_to_markdown` and `classify_change`, unmodified, so the normalization the diff depends on is
+   the production one. Only the blocked transport was swapped, and the project's own bot UA was kept.
+
+---
+
+## Option B completed: the manifest is authoritative, and `sources.rule_effective_date` is gone
+
+Landed 19 September 2026, after the backfill and the schema drift check. This is the rest of Option B,
+the part the section above lists as "still untouched": `app/recrawl.py`'s `touch_last_verified` and
+`reindex_source` writing the column, `_diff_node` reading it, and `infra/sql/init.sql` declaring it.
+
+**The defect this closes is not the missing column. It is the loop.** `_diff_node` read
+`rule_effective_date` out of `sources` and wrote it back to `sources`, so the value re-derived itself
+from itself on every run. A curator editing `data/sources/sources.yaml` changed nothing, because the
+refresh job never looked there. That is the specific thing that blocks adding a `status` field for the
+court injunction: the manifest was tracked but not authoritative, and the difference only shows up when
+someone tries to change a value.
+
+**Nine edits, and three of them were not in the original brief.** The brief named `_initial_state`,
+`_diff_node` and `_ingest_from_manifest`. A search for the full set found three more sites, and leaving
+any of them would have left a manifest that is authoritative over a job that still cannot run, which is
+worse than the current state because it looks finished.
+
+| Site | What it did | Now |
+|---|---|---|
+| `recrawl.py::_initial_state` | seeded `rule_effective_date: None` | reads `manifest_annotation(entry, ...)`, `.isoformat()` |
+| `recrawl.py::_load_diff_baseline` | `SELECT last_indexed_body, rule_effective_date FROM sources` | drops the column; returns a 2-tuple |
+| `recrawl.py::_diff_node` | returned `rule_effective_date` from the DB | returns no such key; the manifest value survives |
+| `recrawl.py::touch_last_verified` | `UPDATE sources SET ... rule_effective_date = %s` | clause removed; the `documents` write stays |
+| `ingest.py::_embed_and_store` | upserted it into `sources` | removed from column list, VALUES and `DO UPDATE SET` |
+| `ingest.py::_ingest_from_manifest` | read it from snapshot frontmatter | reads it from the manifest entry |
+| `ingest.py::_ingest_from_snapshots` | read it from frontmatter | unchanged, documented exception |
+| `infra/sql/init.sql` | declared `sources.rule_effective_date` | declaration removed, no `DROP COLUMN` |
+| `sync_annotations.py::manifest_annotation` | defined here | moved to `ingest.py`, re-exported |
+
+**`init.sql` is the one that would have bitten on the day the secret goes in.** `app/check_schema.py`
+is strict on a MISSING column and report-only on an extra one. Leaving the declaration in place while
+production lacks the column means the drift check reports a fatal missing column the moment
+`DATABASE_URL` is set, which is the event this whole thread exists to unblock. Its own docstring
+already anticipated the other direction: "After Option B lands, `sources.rule_effective_date` is
+exactly this case on every developer database created before that change."
+
+**Two hazards, both measured before any code changed rather than reasoned about after.**
+
+    ...procedure-faq   -> datetime.date(2026, 9, 15)  date
+    ...procedure-quick -> datetime.date(2026, 9, 15)  date
+    entries with annotations: 3 of 14
+    json.dumps(date) raises: TypeError: Object of type date is not JSON serializable
+
+YAML parses an unquoted `2026-09-15` into a real `datetime.date`, and `_parse_iso_date` returns a
+`date` unchanged, so it is not a conversion point. `RefreshState` must hold serializable values because
+LangGraph's checkpointer persists them, a rule `app/recrawl.py`'s own module docstring already states
+("no `datetime`/`date` objects"). Without `.isoformat()` this would pass every test in the repository
+and fail the first time a real checkpointer persisted a source carrying the annotation.
+
+### What was verified, on a machine with no database and no langgraph
+
+Baseline taken before the change, with `RAW_SNAPSHOT_DIR` pointed at the real snapshots:
+
+    tests/test_freshness.py tests/test_chunking.py
+    2 failed, 59 passed, 15 skipped, 9 errors in 45.97s
+
+After:
+
+    2 failed, 69 passed, 15 skipped, 9 errors in 46.65s
+
+Ten new passes, no new failure. The 2 failures and 9 errors are the same tests, for the same
+environmental reasons, confirmed by reading the exception types rather than by assuming:
+
+    9  psycopg.InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run in async mode
+    1  httpx.ConnectTimeout                  (no Ollama on this machine)
+    1  psycopg_pool.PoolTimeout               (no Postgres on this machine)
+
+`tests/test_sync_annotations.py tests/test_check_schema.py tests/test_backfill_source_bodies.py`:
+`35 passed, 5 errors`, unchanged from before. `black --check`: 48 files unchanged.
+
+**The blast radius was checked against file modification times, not against the agent's summary.**
+Seven files changed: `app/recrawl.py`, `app/ingest.py`, `app/sync_annotations.py`, `infra/sql/init.sql`,
+`tests/test_freshness.py`, and the two ADRs. `eval/golden.jsonl` last modified 29 August.
+`app/db.py` last modified 12 September. `tests/test_guardrails.py` untouched, and
+`test_temporal_guard_blocks_the_real_dhs_fixed_admission_figure_as_of_today` still fails, still
+unmarked, still not skipped.
+
+**The two DB-backed tests were amended, not deleted.** `test_touch_last_verified_...` and the renamed
+`test_embed_and_store_first_index_writes_last_indexed_body_and_the_documents_annotation` each used to
+assert the `sources` write happened. Each now asserts what it can honestly establish against a
+database: that `last_indexed_body` and the `documents` annotation are written. The claim that the
+`sources` write is GONE moved to the fake-connection tests, where it is a statement-level fact rather
+than a property of whichever database happens to be open. Both DB tests still need a connection and
+neither runs here.
+
+**Four new tests run on this machine and each ships with a control.** Two fake-connection regression
+tests drive the real `touch_last_verified` and `_embed_and_store` against a connection that records
+every statement, and assert that NO statement touching `sources` names the column, checked across the
+whole class rather than against the one statement the fix changed. A fifth test reads the real
+`data/sources/sources.yaml` and asserts the annotation comes back as a `datetime.date`, pinning the
+premise `.isoformat()` exists for. It was run with `SOURCES_MANIFEST_PATH` unset as well, to confirm it
+finds the manifest by upward search and does not quietly skip.
+
+### What is NOT verified, and will not be called verified
+
+- **Nothing here was run against a database.** The change exists so the first live re-crawl does not
+  die on `_diff_node`'s opening SELECT and mark fourteen sources `fetch_failed` without fetching a
+  page. That outcome is unverifiable from this machine and is the only evidence that would settle it.
+- **All 14 `test_graph_*` tests need BOTH a connection and langgraph.** Neither exists here. The change
+  therefore ships through the graph untested end to end: no test that actually compiles the StateGraph,
+  runs `_initial_state` into `_diff_node`, and observes the manifest value surviving the node boundary
+  has ever been executed against this code.
+- **The `json.dumps` assertion approximates a boundary LangGraph crosses with ormsgpack.** It is a
+  stand-in for "no `date` objects in state", not a measurement of the checkpointer. The two libraries
+  do not reject the same set of types. The test says so in its own docstring.
+- ~~**`infra/sql/init.sql` has not been applied to a Postgres.**~~ **MEASURED, 19 September, by the
+  user.** `check_schema` applied the edited file to a `pgvector/pgvector:pg16` reference and read its
+  `information_schema` back, so the `ALTER TABLE sources` is valid SQL after the clause removal and
+  not merely re-read by hand. Comparing that reference against production returned **6 tables, 33
+  columns, no missing objects**, one non-fatal extra (`playing_with_neon`).
+  `sources.rule_effective_date` appears on neither side, which is the direct evidence that removing
+  the declaration closed the divergence rather than papering over it.
+- **`cur.rowcount` on the `documents` UPDATE, now that the `sources` statement no longer precedes it in
+  that cursor.** The fake connection returns a stubbed rowcount. Real psycopg semantics are unobserved.
+
+### Two things the verification found, both fixed the same day
+
+**The first version of these tests asserted a schema fact against the wrong database, and that was
+caught in review rather than by any check.** Both DB-backed tests originally ended by querying
+`information_schema.columns` for the absence of `sources.rule_effective_date`, with a message reading
+"must not be present on the reference schema". But the `conn` fixture points at a developer's
+long-lived scratch database (`officehours_freshness`), not at a fresh container with `init.sql`
+applied, and `init.sql` deliberately issues no `DROP COLUMN`. A developer whose scratch database
+predates this change still has the column, so both tests would have been red there for a condition
+that breaks nothing. **That is precisely the shape `app/check_schema.py` refuses on principle one
+layer up**, on the grounds that a check red everywhere for a harmless condition is how a check gets
+muted. Worse, a schema query cannot tell a harmless leftover apart from a restored write, which is
+the only thing worth catching.
+
+Both `information_schema` blocks were removed. The claim now lives where it can be made precisely: a
+statement-level assertion in the fake-connection tests, which need no database and run on the Windows
+machine that holds the snapshots.
+
+**The control was a re-implementation, and is now the real predicate.** Each control originally
+re-derived the "targets `sources` and names `rule_effective_date`" test inline against a hand-typed
+copy of the old statement, so the control and the regression test evaluated two separate pieces of
+logic that could drift apart while both stayed green. That is the `_SYNCED_ANNOTATIONS` decorative-
+constant defect this report already records, in a second place. One module-level predicate,
+`_statements_writing_sources_rule_effective_date`, is now called by both regression tests and both
+controls.
+
+**It was then mutation-checked rather than trusted.** Driving the real `touch_last_verified` through
+the fake connection and applying the shared predicate:
+
+    real code      -> violations: []
+                      sources stmts issued: 1
+    restored write -> violations: 1
+
+Green on the real code, red the moment the pre-Option-B `UPDATE sources ... rule_effective_date = %s`
+is put back, and the real code still issues one `sources` statement, so the "bookkeeping is still
+written" half is not vacuous either.
+
+**`data/sources/sources.yaml`'s header was corrected too.** Line 9 said the daily re-crawl "writes
+them to `sources` and `documents` on every run". Only `documents` is true now. That line was written
+as part of this work, so it was corrected as part of it, with a clause recording that the `sources`
+mirror was removed under Option B. No `url`, `title`, `topic` or annotation value was touched, and the
+manifest still parses to 14 sources with the same three annotation blocks.
+
+---
+
 ## Method, and what was not finished
 
 **How the testing ran.** Playwright against the live Vercel frontend for everything involving rendering, navigation, viewport, keyboard, contrast and the DOM. Direct HTTP to `https://oh-gateway-rp.fly.dev/v1/query` and `/v1/query/stream` for the bulk question batteries, because that is the same gateway and orchestrator the browser calls and it allowed six repeats of a question where the browser would have allowed one. Every finding that concerns what a user *sees* was confirmed in the browser; every finding that concerns *what the system returns* is quoted from the wire. Each finding says which is which.
@@ -5911,3 +6990,88 @@ authenticate that pull. Nothing was pushed to the registry and no Fly configurat
 **One live-state change to declare.** The probes added roughly 200 rows to the orchestrator's usage counters. `GET /usage` read `{"total_queries":177,"distinct_sessions":3}` at the end of the session. Nothing else in the database was touched: no ingest, no re-crawl, no schema change, and the `?mock=` route makes no network call at all.
 
 **The testing pass changed no code.** Everything above is a description of the deployed system as it stands on 7 September 2026.
+
+
+**Files changed by the 19 September re-crawl session.** `REPORT.md` only: the new section "The
+19 September re-crawl", instrument-table entry 31 plus the two count updates in that section's opening
+paragraph, four new rows in the "Fix status" table, a confirmation note on item 2 of "The injunction,
+and why this is not fixed" and on that section's "measured from the code" line, and this paragraph.
+**Update, later the same day, after the Actions history arrived.** Two workflow files were then
+changed or added, with my explicit approval, and they are the only code this session produced:
+
+- `.github/workflows/recrawl.yml`, option D only. The skip step gains a `::warning::` annotation and
+  a `$GITHUB_STEP_SUMMARY` block; it still `exit 0`s. **No gate was changed, no threshold moved, no
+  step removed, and the live re-crawl path is untouched.**
+- `.github/workflows/fetch-probe.yml`, new, `workflow_dispatch` only, throwaway. Reads no secret,
+  opens no database connection, writes nothing, and is meant to be deleted once it has reported.
+
+**Third change, later still: the temporal test was split.** `services/orchestrator/tests/test_guardrails.py`
+is the only source file this session touched. CI went red on
+`test_temporal_guard_block_path_returns_blocked_unverified_end_to_end`, which is instrument table
+entry 30 arriving in the suite. The test was **split, not pinned, not xfailed, not marked, not
+relaxed**:
+
+- The contract half keeps the original name and now builds its fixture with `_relative_future_date()`
+  instead of the decayed `_FUTURE_DATE` constant. This moves the CHUNK's date, never `today`; the
+  pipeline's clock stays real and has no seam to pin anyway. Green. It preserves the only end-to-end
+  proof that the BLOCK path is wired through `answer_question` (zero citations, zero contexts, prose
+  withheld, real URL in the message), which an xfail would have silently discarded.
+- `test_temporal_guard_blocks_the_real_dhs_fixed_admission_figure_as_of_today` keeps the real
+  2026-09-15 date and **stays red on purpose**, with a docstring naming *Presidents' Alliance v. DHS*
+  No. 1:26-cv-13799 (D. Mass., Saylor, J.), the 14 September order, the exact mechanism, and this
+  report's section, so the next reader knows it is a live finding rather than an abandoned test. It
+  carries no marker and is collected by CI's own `pytest -m "not full_corpus"` selector, verified.
+
+`_departure_period_chunks_with_url` gained an optional `rule_effective_date` keyword defaulting to
+`_FUTURE_DATE`, so all eleven existing pinned callers are byte-for-byte unaffected. **No assertion was
+weakened, no threshold moved, no test skipped or xfailed, and `app/` was not touched**: the guard's
+own code is unchanged, because the guard's logic is not what is broken.
+
+Both were verified rather than assumed: each file was parsed as YAML, the embedded probe script was
+extracted from the parsed document and compiled, the probe was smoke-tested end to end against a
+trimmed two-source manifest (reproducing the known httpx-403/curl-200 split and exercising the verdict
+branch), and the recrawl skip step was executed against a temporary `GITHUB_STEP_SUMMARY` to confirm
+exit 0 and a correctly rendered summary. **Neither has been run in CI, because that needs a push and
+pushes are yours.** Option E is planned only; nothing was built for it. `app/`, `eval/`, the manifest
+and the corpus were not touched at all.
+
+**What could not be verified about the test split, stated rather than glossed.** No postgres is
+reachable from this machine (Docker is not running), and both halves use the `pool` fixture, so
+**neither test was actually executed.** What was verified: the file parses, `ruff` and `black` are
+clean, both tests are collected by CI's `pytest -m "not full_corpus"` selector, and the guard verdict
+each half now drives was measured directly against the real `qualify_future_dated_figures` with the
+real `RetrievedChunk` shape (`_relative_future_date()` gives `blocked=True`, `_FUTURE_DATE` gives
+`blocked=False` at today's date). That establishes the split does what it is meant to do at the level
+of the guard. It does **not** establish that the green half's pipeline assertions still hold, since
+those run through `answer_question` against a database. Expect the contract half to pass and the
+real-rule half to fail; the first of those is a prediction, not a measurement, until CI runs it.
+**No other file on disk was touched.** No source was re-indexed, no snapshot rewritten, no checkpoint
+file created, `data/sources/sources.yaml` was not edited, and no remediation of any kind was written
+for any of the four findings. The source decision, the 403 fix and the `broken_source_count` bug are
+all reported for me to decide on.
+
+**Live-state change from the 19 September session.** Minimal and read-only. 14 HTTP GETs to the
+government sources (the same 14 the scheduled job would make, rate-limited at the project's own
+`CRAWL_DELAY_SECONDS=2.0`), plus 14 failed httpx attempts before the transport was diagnosed, 2
+JavaScript-rendered re-fetches of the two fixed-admission pages, one `GET /v1/sources/status` and one
+`POST /v1/query` against the production gateway. That single query adds one row to the orchestrator's
+usage counters and is the only write of any kind anywhere. **No database connection was opened to
+production**; it could not be, which is caveat 1 of that section. The production orchestrator machine
+was started by me before the session, not by the agent. Scratch files were written to the session
+scratchpad only.
+
+**One thing the 19 September session got wrong and had to correct.** It reported the twelve-day
+staleness and the fetcher's 403 as one finding, with the 403 as the probable cause, and named the
+Actions run history as the thing that would settle it. The history settled it the other way: fourteen
+green runs of 24 to 37 seconds each, none of which attempted a fetch, because `DATABASE_URL` is unset
+and the workflow skips. **The 403 is real but has never run in CI.** Both the section and the Fix
+status rows were rewritten to separate them. The original reasoning was not wrong to flag the
+uncertainty, and it named the right instrument; it was wrong to lead with the more interesting of the
+two candidates while the evidence was still outside the room.
+
+**What the 19 September session could not do.** Reach production's `sources.last_indexed_body`, which
+is the authoritative diff baseline under `docs/adr/0014-stateless-recrawl-diff.md`. `fly ssh console`
+and credential lookup were both refused by the permission classifier, and Fly exposes only secret
+digests, so the run used the local snapshots as a substitute baseline and said so. The two `meaningful`
+verdicts are corroborated against production by a different route; the 12 `unchanged` verdicts are
+not, and are the part of that section to re-run once the real baseline is reachable.

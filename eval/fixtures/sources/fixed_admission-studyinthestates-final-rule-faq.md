@@ -6,6 +6,13 @@ fetched_at: '2026-08-29'
 page_last_updated: '2026-08-27'
 topic: fixed_admission
 rule_effective_date: 2026-09-15
+rule_status: enjoined
+rule_status_source: https://www.federalregister.gov/d/2026-14439
+rule_status_source_evidences_status: false
+rule_status_note: >-
+  Enjoined nationwide, 14 September 2026, Presidents' Alliance v. DHS, No. 1:26-cv-13799
+  (D. Mass., Saylor, J.), one day before its published effective date. Not vacated: the rule
+  could still take effect later if the injunction is lifted or narrowed on appeal.
 federal_register: https://www.federalregister.gov/d/2026-14439
 heading_note: This page inverts the usual nesting. Individual FAQ questions are h2
   while the group labels that contain them (Transition Period, Understanding the Admit

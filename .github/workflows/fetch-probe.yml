@@ -1,0 +1,203 @@
+name: Fetch probe (throwaway diagnostic)
+
+# ONE-OFF DIAGNOSTIC. Delete this file once it has reported.
+#
+# WHAT QUESTION THIS ANSWERS. On a Windows laptop, the project's own fetcher (httpx) gets 403 from
+# all 14 manifest sources while curl, sending the IDENTICAL bot User-Agent over the same HTTP/1.1,
+# gets 200. Four causes were eliminated locally (the UA, the header set, the HTTP version, the
+# client library), leaving the TLS fingerprint: Python links OpenSSL, and the curl that works on
+# Windows links Schannel, a TLS stack that does not exist on Linux.
+#
+# That measurement cannot be extrapolated. CI runs ubuntu-latest and production is a Linux
+# container, where curl links the SAME OpenSSL that Python does. So there are three possible worlds
+# and this run distinguishes them:
+#
+#   httpx 200                  -> there is no bug outside that laptop. The whole thing is a note.
+#   httpx 403, curl 200        -> a real client/TLS problem that reproduces on Linux. Needs a fix,
+#                                 and the honest options are narrow (see REPORT.md).
+#   httpx 403, curl 403        -> not the client at all. Address reputation: GitHub-hosted runners
+#                                 use Azure ranges, which .gov WAFs commonly rate against. A fix
+#                                 aimed at the client would be aimed at the wrong thing.
+#
+# WHY THIS IS SAFE TO RUN. It reads no secret, opens no database connection, writes nothing
+# anywhere, and re-indexes nothing. It fetches, records a status code, and discards the body. It
+# honours the project's crawl policy: the real bot User-Agent complete with its contact address, and
+# the project's own CRAWL_DELAY_SECONDS between requests to the same host. Nothing here disguises
+# the client, which is the whole point -- a probe that lied about what it was would measure a
+# question nobody asked.
+#
+# COST. 14 URLs x 2 clients + 3 robots.txt = 31 requests, rate-limited per host, run once by hand.
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Fetch all 14 sources from a Linux runner, httpx vs curl
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Deliberately NOT `pip install -e ./services/orchestrator[...]`. This probe needs two
+      # libraries, not the orchestrator's dependency graph, and installing the real package would
+      # make the run slower without making the measurement truer: the thing under test is the TLS
+      # handshake, which is a property of the interpreter's OpenSSL and not of anything in this
+      # repository.
+      - name: Install the two libraries the probe needs
+        run: pip install httpx pyyaml
+
+      # The versions ARE the measurement. A 403/200 split is uninterpretable without knowing which
+      # TLS stack each client linked, which is exactly the variable under test.
+      - name: Record the client versions and TLS stacks
+        run: |
+          {
+            echo "### Probe environment"
+            echo ""
+            echo '```'
+            python -c "import sys, ssl, httpx; print('python  ', sys.version.split()[0]); print('httpx   ', httpx.__version__); print('py ssl  ', ssl.OPENSSL_VERSION)"
+            curl -V | head -2
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch every manifest source with both clients
+        run: |
+          python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import subprocess, sys, time
+          from collections import defaultdict
+          from urllib.parse import urlsplit
+
+          import httpx, yaml
+
+          UA = ("OfficeHoursBot/0.1 (+https://github.com/RishabhP1508/Office-Hours; "
+                "contact: patel.rishabh@northeastern.edu)")
+          DELAY = 2.0  # the project's own CRAWL_DELAY_SECONDS
+
+          manifest = yaml.safe_load(open("data/sources/sources.yaml", encoding="utf-8"))["sources"]
+          last_hit = {}
+
+          def wait(host):
+              prev = last_hit.get(host)
+              if prev is not None:
+                  gap = DELAY - (time.monotonic() - prev)
+                  if gap > 0:
+                      time.sleep(gap)
+              last_hit[host] = time.monotonic()
+
+          # Same client configuration app/recrawl.py::run_refresh builds for the real job.
+          client = httpx.Client(follow_redirects=True,
+                                timeout=httpx.Timeout(30.0, connect=10.0),
+                                headers={"User-Agent": UA})
+
+          def via_httpx(url):
+              try:
+                  return str(client.get(url).status_code)
+              except Exception as exc:
+                  return f"ERR:{type(exc).__name__}"
+
+          def via_curl(url):
+              try:
+                  p = subprocess.run(
+                      ["curl", "-s", "-o", "/dev/null", "-L", "-m", "30", "-A", UA,
+                       "-w", "%{http_code}", url],
+                      capture_output=True, text=True, timeout=60, check=False)
+                  return p.stdout.strip() or f"ERR:exit{p.returncode}"
+              except Exception as exc:
+                  return f"ERR:{type(exc).__name__}"
+
+          rows = []
+          hosts = []
+          for entry in manifest:
+              url = entry["url"]
+              host = urlsplit(url).netloc
+              if host not in hosts:
+                  hosts.append(host)
+              wait(host); h = via_httpx(url)
+              wait(host); c = via_curl(url)
+              rows.append((host, entry.get("topic", ""), h, c, url))
+              print(f"{h:>6} {c:>6}  {url}", file=sys.stderr, flush=True)
+
+          robots = []
+          for host in hosts:
+              u = f"https://{host}/robots.txt"
+              wait(host); h = via_httpx(u)
+              wait(host); c = via_curl(u)
+              robots.append((host, h, c))
+
+          def ok(code):
+              return code.startswith("2") or code.startswith("3")
+
+          httpx_ok = sum(ok(r[2]) for r in rows)
+          curl_ok = sum(ok(r[3]) for r in rows)
+          n = len(rows)
+
+          out = []
+          out.append("")
+          out.append("### Per-source result")
+          out.append("")
+          out.append("| Host | Topic | httpx | curl | URL |")
+          out.append("|---|---|---|---|---|")
+          for host, topic, h, c, url in rows:
+              out.append(f"| {host} | {topic} | **{h}** | **{c}** | `{url[:78]}` |")
+          out.append("")
+          out.append("### robots.txt")
+          out.append("")
+          out.append("| Host | httpx | curl |")
+          out.append("|---|---|---|")
+          for host, h, c in robots:
+              out.append(f"| {host} | **{h}** | **{c}** |")
+
+          by_host = defaultdict(lambda: [0, 0, 0])
+          for host, _t, h, c, _u in rows:
+              by_host[host][0] += 1
+              by_host[host][1] += ok(h)
+              by_host[host][2] += ok(c)
+          out.append("")
+          out.append("### By host")
+          out.append("")
+          out.append("| Host | sources | httpx ok | curl ok |")
+          out.append("|---|---|---|---|")
+          for host, (t, hk, ck) in by_host.items():
+              out.append(f"| {host} | {t} | {hk}/{t} | {ck}/{t} |")
+
+          if httpx_ok == n:
+              verdict = ("**NO BUG ON LINUX.** httpx succeeded on all "
+                         f"{n} sources from this runner. The 403s are specific to the Windows "
+                         "laptop they were measured on, nothing in CI or production is affected, "
+                         "and the fetcher needs no fix. Collapse the finding to a note.")
+          elif httpx_ok == 0 and curl_ok == n:
+              verdict = ("**CLIENT PROBLEM, REPRODUCES ON LINUX.** httpx 0/"
+                         f"{n}, curl {curl_ok}/{n}, same UA, same runner, same network. Python and "
+                         "curl link the same OpenSSL here, so the Windows/Schannel explanation is "
+                         "dead and the discriminator is something else about the client. Do not "
+                         "reach for a fingerprint-forging library; re-open the diagnosis first.")
+          elif httpx_ok == 0 and curl_ok == 0:
+              verdict = ("**NOT THE CLIENT. ADDRESS REPUTATION.** Both clients failed on all "
+                         f"{n} sources. GitHub-hosted runners use Azure ranges that .gov WAFs rate "
+                         "against, so this is about where the request came from, not what sent it. "
+                         "A client-side fix would be aimed at the wrong thing. Re-run from the Fly "
+                         "container before concluding.")
+          else:
+              verdict = (f"**MIXED: httpx {httpx_ok}/{n}, curl {curl_ok}/{n}.** Not one of the three "
+                         "clean worlds. Read the per-host table: a split that follows host "
+                         "boundaries points at per-site WAF policy rather than at the client.")
+
+          out.insert(0, f"## VERDICT\n\n{verdict}\n")
+          # stdout is piped through `tee -a "$GITHUB_STEP_SUMMARY"` by the step, so printing here
+          # is what puts the tables in the job summary. Progress lines above go to stderr on
+          # purpose, so they land in the log without duplicating into the summary.
+          print("\n".join(out))
+          print(f"::notice title=Fetch probe result::httpx {httpx_ok}/{n} ok, curl {curl_ok}/{n} ok",
+                file=sys.stderr)
+          PY
+
+      # Exit code is deliberately always 0. This is a MEASUREMENT, not a gate: a red run here would
+      # be ambiguous (blocked? or workflow bug?) and the deliverable is the summary table, not the
+      # check mark. The verdict block at the top of the summary says what the numbers mean.
+      - name: Note that this workflow is throwaway
+        run: echo "Diagnostic complete. Delete .github/workflows/fetch-probe.yml once the result is recorded."

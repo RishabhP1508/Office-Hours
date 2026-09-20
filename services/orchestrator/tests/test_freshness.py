@@ -52,7 +52,9 @@ from app.ingest import (
     FetchedPage,
     _embed_and_store,
     load_snapshot,
+    manifest_annotation,
     mint_snapshot_filename,
+    read_manifest,
     render_snapshot,
 )
 from app.pipeline import answer_question
@@ -62,6 +64,7 @@ from app.recrawl import (
     GoldenImpact,
     RefreshReport,
     SourceResult,
+    _initial_state,
     _short_source_label,
     classify_change,
     golden_impact_for_source,
@@ -243,6 +246,175 @@ def test_importing_app_recrawl_never_imports_langgraph():
         f"importing app.recrawl leaked langgraph/langchain: stdout={result.stdout!r} "
         f"stderr={result.stderr!r}"
     )
+
+
+# =================================================================================================
+# PURE: app/recrawl.py::_initial_state -- the manifest-to-graph-state seed for `rule_effective_date`
+# (no langgraph, no DB). `_initial_state` is plain Python defined above the "no langgraph import
+# above this line" boundary app/recrawl.py's own module docstring draws, so it runs on every
+# machine, including this one, with no Postgres and no `[freshness]` extra installed. Added
+# 19 September 2026 alongside Option B (docs/adr/0022-manifest-authoritative-annotations.md), which
+# moved `rule_effective_date` off a `sources` column production never had and onto the manifest
+# entry itself.
+# =================================================================================================
+
+
+def _manifest_entry_for_initial_state(annotations: dict | None = None) -> dict:
+    entry: dict = {"url": "https://example.gov/initial-state-test", "topic": "fixed_admission"}
+    if annotations is not None:
+        entry["annotations"] = annotations
+    return entry
+
+
+def test_initial_state_puts_the_manifest_rule_effective_date_in_state_as_a_string():
+    """DoD: `_initial_state` reads `rule_effective_date` off the manifest entry it is handed
+    (`manifest_annotation`), not off a `sources` row, and the value lands in `RefreshState` as a
+    STRING, never a `date` object. Asserted with `isinstance`, not only `==`: YAML hands
+    `manifest_annotation` back a real `datetime.date`, and `date(2026, 9, 15) == "2026-09-15"` is
+    False, so an equality check alone would already fail loudly if `.isoformat()` were dropped --
+    the isinstance check is the direct statement of the actual requirement (a JSON/msgpack-
+    serializable value in state), not a roundabout way of re-deriving it from an equality failure.
+    """
+    entry = _manifest_entry_for_initial_state(
+        annotations={"rule_effective_date": date(2026, 9, 15), "rule_status": "in_force"}
+    )
+
+    state = _initial_state(entry, run_id="test-run", max_attempts=3)
+
+    assert state["rule_effective_date"] == "2026-09-15"
+    assert isinstance(state["rule_effective_date"], str)
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [None, {}],
+    ids=["no-annotations-key-at-all", "annotations-block-present-but-empty"],
+)
+def test_initial_state_rule_effective_date_is_none_without_a_manifest_annotation(annotations):
+    """Both "the manifest entry has no `annotations` key" and "it has one but it is empty/omits
+    this key" must give None -- the same None-versus-absent contract `manifest_annotation` itself
+    documents, now exercised through `_initial_state`. `rule_status`/`rule_status_source`
+    (`manifest_annotation_str`) get the identical contract -- see the test right below this one for
+    the case where `rule_status` alone is absent but a date is not.
+    """
+    entry = _manifest_entry_for_initial_state(annotations=annotations)
+
+    state = _initial_state(entry, run_id="test-run", max_attempts=3)
+
+    assert state["rule_effective_date"] is None
+    assert state["rule_status"] is None
+    assert state["rule_status_source"] is None
+    assert state["rule_status_source_evidences_status"] is None
+
+
+def test_initial_state_puts_rule_status_and_its_source_in_state_as_plain_strings():
+    """`rule_status`/`rule_status_source` need no `.isoformat()`-style conversion -- YAML parses
+    both into plain strings already -- but they still have to reach `RefreshState` at all, seeded
+    from the manifest entry the same way `rule_effective_date` is (docs/adr/0023-curator-rule-
+    status.md). `rule_status_source_evidences_status` is a plain `bool`, seeded the same way and
+    required alongside `rule_status_source` (`app/rule_status.py::validate_rule_status`).
+    """
+    entry = _manifest_entry_for_initial_state(
+        annotations={
+            "rule_effective_date": date(2026, 9, 15),
+            "rule_status": "enjoined",
+            "rule_status_source": "https://www.federalregister.gov/d/2026-14439",
+            "rule_status_source_evidences_status": False,
+        }
+    )
+
+    state = _initial_state(entry, run_id="test-run", max_attempts=3)
+
+    assert state["rule_status"] == "enjoined"
+    assert isinstance(state["rule_status"], str)
+    assert state["rule_status_source"] == "https://www.federalregister.gov/d/2026-14439"
+    assert state["rule_status_source_evidences_status"] is False
+
+
+def test_initial_state_raises_on_a_date_with_no_status():
+    """Load-time validation (`app/rule_status.py::validate_rule_status`) runs inside
+    `_initial_state` itself -- the scheduled refresh job must refuse a manifest mistake exactly as
+    loudly as a hand-run ingest does, not silently default a force decision from the date.
+    """
+    entry = _manifest_entry_for_initial_state(
+        annotations={"rule_effective_date": date(2026, 9, 15)}
+    )
+
+    with pytest.raises(ValueError, match="rule_effective_date is set"):
+        _initial_state(entry, run_id="test-run", max_attempts=3)
+
+
+def test_initial_state_is_json_serializable():
+    """This APPROXIMATES the checkpointer boundary; it does not measure it. LangGraph's real
+    checkpointer persists `RefreshState` with ormsgpack, not `json`, and the two libraries do not
+    reject exactly the same set of Python types. `json.dumps` is used here only as a cheap, widely
+    understood stand-in for "every value in this dict is a plain, portable type, not a `date`
+    object" -- the property the module docstring's "no datetime/date objects" rule exists to
+    guarantee. See the control test immediately below for proof this stand-in is capable of failing
+    at all, rather than a check that would pass on any dict handed to it.
+    """
+    entry = _manifest_entry_for_initial_state(
+        annotations={"rule_effective_date": date(2026, 9, 15), "rule_status": "in_force"}
+    )
+
+    state = _initial_state(entry, run_id="test-run", max_attempts=3)
+
+    json.dumps(state)  # must not raise
+
+
+def test_json_dumps_rejects_a_raw_date_the_control_for_the_serializability_check_above():
+    """The control. A serializability assertion that can never fail is worthless, and this project's
+    own instrument table is full of exactly that shape of check. This feeds `json.dumps` a state
+    dict shaped like `_initial_state`'s real output but carrying a raw `datetime.date` -- precisely
+    the bug `.isoformat()` in `_initial_state` exists to prevent -- and confirms it raises
+    `TypeError`, which is what proves the assertion above is actually watching something.
+    """
+    broken_state = {"rule_effective_date": date(2026, 9, 15)}
+    with pytest.raises(TypeError):
+        json.dumps(broken_state)
+
+
+def test_the_real_manifests_fixed_admission_annotations_are_date_objects_not_strings():
+    """Pins the premise `_initial_state`'s `.isoformat()` call exists for: reading the real,
+    tracked `data/sources/sources.yaml` through `read_manifest` hands `manifest_annotation` back a
+    genuine `datetime.date` for the fixed_admission entries, because YAML auto-parses an unquoted
+    `2026-09-15`-shaped scalar into one. If a curator ever quoted that value as a string, or YAML's
+    parsing behavior changed, `manifest_annotation` would return a `str`, `_initial_state`'s
+    `.isoformat()` call would raise `AttributeError`, and this is the test that would have caught
+    the premise silently changing out from under it.
+
+    Locates the manifest the same way other tests in this file do: `SOURCES_MANIFEST_PATH` when set
+    (the convention `app/sync_annotations.py::_load_manifest` also documents), otherwise an upward
+    search from this file for the checked-in `data/sources/sources.yaml` -- and skips cleanly,
+    rather than failing, if neither locates a real manifest.
+    """
+    env_path = os.environ.get("SOURCES_MANIFEST_PATH")
+    if env_path:
+        manifest_path = Path(env_path)
+        if not manifest_path.is_file():
+            pytest.skip(f"SOURCES_MANIFEST_PATH={manifest_path} does not exist")
+    else:
+        root = _find_repo_root_containing_manifest(Path(__file__).resolve())
+        if root is None:
+            pytest.skip("data/sources/sources.yaml not found by searching upward from this file")
+        manifest_path = root / "data" / "sources" / "sources.yaml"
+
+    manifest = read_manifest(manifest_path)
+    fixed_admission_entries = [e for e in manifest if e.get("topic") == "fixed_admission"]
+    assert fixed_admission_entries, "expected at least one fixed_admission entry in the manifest"
+
+    found_a_date_annotation = False
+    for entry in fixed_admission_entries:
+        value = manifest_annotation(entry, "rule_effective_date")
+        if value is not None:
+            assert isinstance(value, date), (
+                f"{entry['url']}: rule_effective_date is a {type(value).__name__}, not a date -- "
+                "_initial_state's .isoformat() call assumes YAML always hands back a date object"
+            )
+            found_a_date_annotation = True
+    assert (
+        found_a_date_annotation
+    ), "expected at least one fixed_admission entry to carry a rule_effective_date annotation"
 
 
 # =================================================================================================
@@ -743,6 +915,31 @@ def _manifest_urls() -> set[str]:
     return {entry["url"] for entry in manifest["sources"]}
 
 
+def refuse_if_manifest_fully_present(present_urls: set[str], database_url: str) -> None:
+    """The DECISION half of the corpus guard, pure and connection-agnostic: given the set of
+    `source_url`s a database already holds, refuse if it holds every manifest URL.
+
+    Split out from the async wrapper below on 19 September 2026 so a SYNCHRONOUS caller can reuse
+    the identical rule and identical message. `app/backfill_source_bodies.py` was converted from
+    async to sync (it had no concurrency to justify async and was therefore unrunnable on Windows,
+    where the only copy of the snapshots lives), and its tests need this guard against a
+    `psycopg.Connection` rather than an `AsyncConnection`. Splitting the decision out is what keeps
+    ONE copy of the rule and the message; only the two-line query around it differs per connection
+    type. Duplicating the rule instead would give two safety checks that can drift, on the check
+    whose whole job is to stop a test writing to the real corpus.
+    """
+    manifest_urls = _manifest_urls()
+    if manifest_urls and manifest_urls <= present_urls:
+        pytest.fail(
+            f"Refusing to run a DB-writing test against DATABASE_URL={database_url!r}: it already "
+            f"holds a row for every one of the {len(manifest_urls)} URLs in "
+            "data/sources/sources.yaml, which is the signature of the real, fully-ingested corpus. "
+            "This test inserts/deletes rows in `documents`. Point DATABASE_URL at a scratch "
+            "database instead (for example officehours_fixtures or officehours_freshness) and "
+            "re-run."
+        )
+
+
 async def _refuse_if_target_is_the_fully_ingested_real_corpus(
     conn: psycopg.AsyncConnection, database_url: str
 ) -> None:
@@ -773,21 +970,11 @@ async def _refuse_if_target_is_the_fully_ingested_real_corpus(
     # a real deadlock/stale-read hazard, reproduced while writing this guard. rollback() (not
     # commit(): this is a read-only check with nothing to persist) ends the transaction cleanly,
     # leaving `conn` exactly as unencumbered as it was before this guard existed.
-    manifest_urls = _manifest_urls()
     async with conn.cursor() as cur:
         await cur.execute("SELECT DISTINCT source_url FROM documents")
         rows = await cur.fetchall()
     await conn.rollback()
-    present_urls = {row[0] for row in rows}
-    if manifest_urls and manifest_urls <= present_urls:
-        pytest.fail(
-            f"Refusing to run a DB-writing test against DATABASE_URL={database_url!r}: it already "
-            f"holds a row for every one of the {len(manifest_urls)} URLs in "
-            "data/sources/sources.yaml, which is the signature of the real, fully-ingested corpus. "
-            "This test inserts/deletes rows in `documents`. Point DATABASE_URL at a scratch "
-            "database instead (for example officehours_fixtures or officehours_freshness) and "
-            "re-run."
-        )
+    refuse_if_manifest_fully_present({row[0] for row in rows}, database_url)
 
 
 @pytest.fixture
@@ -815,7 +1002,6 @@ async def _insert_test_row(
     heading: str = "Old Heading",
     content: str = "old content",
     last_indexed_body: str | None = None,
-    rule_effective_date: date | None = None,
 ) -> int:
     """Phase 7: `resolved_url`/`page_last_updated`/`fetched_at`/`last_verified_at` moved off
     `documents` onto `sources` (the FK requires a `sources` row to exist before any `documents` row
@@ -823,13 +1009,22 @@ async def _insert_test_row(
     shape `_embed_and_store`'s own upsert does: last_success_at/last_changed_at := fetched_at,
     change_count/consecutive_failures := 0, status := 'ok'.
 
-    Stateless-recrawl columns (docs/adr/0014-stateless-recrawl-diff.md): `last_indexed_body`
+    Stateless-recrawl column (docs/adr/0014-stateless-recrawl-diff.md): `last_indexed_body`
     defaults to None -- a `sources` row with real `documents` chunks (which this helper always
     creates) and a NULL `last_indexed_body` is exactly the post-migration, pre-backfill state
     app/recrawl.py::_diff_node refuses to silently treat as a first-time index (see
     test_graph_diff_raises_loudly_when_backfill_has_not_run below). Tests that need `_diff_node` to
     actually diff against a real prior body (every other graph test that reaches the diff at all)
     pass `last_indexed_body=` explicitly.
+
+    NO `rule_effective_date` parameter, and no such column in the `sources` INSERT below. This
+    helper used to accept one and write it onto `sources.rule_effective_date`; that parameter was
+    never actually passed by any call site in this file (every caller relied on the default), and
+    the column itself was removed from `sources` under Option B (see
+    docs/adr/0022-manifest-authoritative-annotations.md) -- keeping a dead parameter that wrote to a
+    column production does not have would have made this helper unusable against the reference
+    schema for no test any of them needed. `documents.rule_effective_date` is untouched by this
+    change: the INSERT below still writes it, always `None` here, exactly as before.
     """
     async with conn.transaction():
         async with conn.cursor() as cur:
@@ -838,8 +1033,8 @@ async def _insert_test_row(
                 INSERT INTO sources
                     (source_url, resolved_url, page_last_updated, fetched_at, last_verified_at,
                      last_changed_at, last_success_at, change_count, consecutive_failures,
-                     last_error, last_http_status, status, last_indexed_body, rule_effective_date)
-                VALUES (%s, NULL, %s, %s, %s, %s, %s, 0, 0, NULL, NULL, 'ok', %s, %s)
+                     last_error, last_http_status, status, last_indexed_body)
+                VALUES (%s, NULL, %s, %s, %s, %s, %s, 0, 0, NULL, NULL, 'ok', %s)
                 ON CONFLICT (source_url) DO UPDATE SET
                     resolved_url = EXCLUDED.resolved_url,
                     page_last_updated = EXCLUDED.page_last_updated,
@@ -852,8 +1047,7 @@ async def _insert_test_row(
                     last_error = NULL,
                     last_http_status = NULL,
                     status = 'ok',
-                    last_indexed_body = EXCLUDED.last_indexed_body,
-                    rule_effective_date = EXCLUDED.rule_effective_date
+                    last_indexed_body = EXCLUDED.last_indexed_body
                 """,
                 (
                     source_url,
@@ -863,7 +1057,6 @@ async def _insert_test_row(
                     fetched_at,
                     fetched_at,
                     last_indexed_body,
-                    rule_effective_date,
                 ),
             )
             await cur.execute("DELETE FROM documents WHERE source_url = %s", (source_url,))
@@ -934,8 +1127,8 @@ async def test_touch_last_verified_moves_last_verified_and_leaves_everything_els
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT fetched_at, last_verified_at, page_last_updated, last_success_at, "
-            "consecutive_failures, last_error, last_http_status, status, last_indexed_body, "
-            "rule_effective_date FROM sources WHERE source_url = %s",
+            "consecutive_failures, last_error, last_http_status, status, last_indexed_body "
+            "FROM sources WHERE source_url = %s",
             (source_url,),
         )
         source_row = await cur.fetchone()
@@ -952,9 +1145,18 @@ async def test_touch_last_verified_moves_last_verified_and_leaves_everything_els
     assert source_row["last_error"] is None
     assert source_row["last_http_status"] is None
     assert source_row["status"] == "ok"
-    # The curator annotation DOES sync onto `sources`, mirroring what already happens on
-    # `documents` (both asserted above) -- see touch_last_verified's own docstring.
-    assert source_row["rule_effective_date"] == new_rule_effective_date
+
+    # INVERTED, 19 September 2026 (Option B; see
+    # docs/adr/0022-manifest-authoritative-annotations.md). This used to also assert, here, that
+    # `sources.rule_effective_date` does not exist on this database. That is a STATEMENT-LEVEL
+    # claim -- what SQL `touch_last_verified` issues, not what a row ends up holding -- and it is
+    # asserted by name by test_touch_last_verified_never_writes_rule_effective_date_to_sources
+    # below, which runs against a fake connection with no database at all. It does not belong here:
+    # an information_schema query against whatever database `conn` happens to be open on cannot
+    # tell a stale developer database's harmless leftover column apart from a restored write
+    # (exactly the EXTRA-column case app/check_schema.py's docstring says must be REPORTED, never
+    # fatal), so it would be red on this scratch database for a condition that breaks nothing --
+    # which is how a check gets muted.
 
     await _delete_test_rows(conn, source_url)
 
@@ -1023,7 +1225,7 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT fetched_at, last_verified_at, page_last_updated, last_changed_at, "
-            "change_count, last_indexed_body, rule_effective_date "
+            "change_count, last_indexed_body "
             "FROM sources WHERE source_url = %s",
             (source_url,),
         )
@@ -1034,10 +1236,14 @@ async def test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_u
     # reindex_source always passes mark_changed=True -- last_changed_at/change_count must move.
     assert source_row["last_changed_at"] == new_now
     assert source_row["change_count"] == 1
-    # DoD 4: the freshly indexed body and curator annotation land on `sources` too, not just on
-    # `documents` -- this is what the NEXT recrawl's stateless _diff_node reads.
+    # DoD 4: the freshly indexed body lands on `sources` too -- this is what the NEXT recrawl's
+    # stateless _diff_node reads. `rule_effective_date` does NOT land on `sources` (Option B; see
+    # docs/adr/0022-manifest-authoritative-annotations.md) -- that column was removed from
+    # `sources`'s declaration, `documents` (asserted above) is the one retrieval and the guards
+    # actually read, and `SELECT rule_effective_date FROM sources` above would itself now raise
+    # UndefinedColumn against the reference schema, which is why it was dropped from that SELECT's
+    # column list entirely rather than kept and asserted None.
     assert source_row["last_indexed_body"] == new_body
-    assert source_row["rule_effective_date"] == new_rule_effective_date
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute("SELECT id FROM documents WHERE source_url = %s", (other_source_url,))
@@ -1233,13 +1439,30 @@ async def test_reindex_source_insert_failure_mid_transaction_rolls_back_delete_a
     await _delete_test_rows(conn, source_url)
 
 
-async def test_embed_and_store_first_index_writes_last_indexed_body_and_rule_effective_date(conn):
+async def test_embed_and_store_first_index_writes_last_indexed_body_and_the_documents_annotation(
+    conn,
+):
     """DoD 4's other half: `app/ingest.py::_embed_and_store` (the function BOTH a first-time
     `python -m app.ingest` and app/recrawl.py::reindex_source's meaningful-change path funnel
-    through) must write `sources.last_indexed_body`/`rule_effective_date` on a genuinely first-time
-    index -- a brand-new source_url with no prior `sources` row at all -- not just on a re-index of
-    an already-known source (already proven by
-    test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_updated above).
+    through) must write `sources.last_indexed_body` on a genuinely first-time index -- a brand-new
+    source_url with no prior `sources` row at all -- not just on a re-index of an already-known
+    source (already proven by
+    test_reindex_source_replaces_rows_and_moves_fetched_at_and_page_last_updated above). It also
+    proves `documents.rule_effective_date` carries the exact curator value on that same first-time
+    index.
+
+    RENAMED, 19 September 2026 (Option B; see
+    docs/adr/0022-manifest-authoritative-annotations.md). It was
+    `..._first_index_never_writes_rule_effective_date_to_sources` and, alongside the
+    `last_indexed_body` assertion kept here, also asserted that `sources` did NOT receive
+    `rule_effective_date`. That `sources` half was REMOVED under Option B: the column no longer
+    exists on `sources`'s declaration at all, so the old SELECT would itself now raise
+    UndefinedColumn against the reference schema. The claim it made -- that `_embed_and_store`
+    never writes `rule_effective_date` onto `sources` -- is now carried by
+    test_embed_and_store_never_writes_rule_effective_date_to_sources (fake-connection, no
+    database), which asserts it at the statement level instead of by querying a schema that cannot
+    distinguish a harmless leftover column from a restored write. This test's name no longer
+    promises that half, so it was renamed to describe only what it still proves.
     """
     source_url = "https://example.gov/freshness-test-first-index-body"
     body = "# Test Page\n\n## Section\n\nSome first-time content.\n"
@@ -1267,12 +1490,20 @@ async def test_embed_and_store_first_index_writes_last_indexed_body_and_rule_eff
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            "SELECT last_indexed_body, rule_effective_date FROM sources WHERE source_url = %s",
+            "SELECT last_indexed_body FROM sources WHERE source_url = %s",
             (source_url,),
         )
         source_row = await cur.fetchone()
     assert source_row["last_indexed_body"] == body
-    assert source_row["rule_effective_date"] == rule_effective_date
+
+    # The claim that `_embed_and_store` never writes `rule_effective_date` onto `sources` is a
+    # STATEMENT-LEVEL claim -- what SQL it issues, not what a row ends up holding -- and is
+    # asserted by name by test_embed_and_store_never_writes_rule_effective_date_to_sources below,
+    # which runs against a fake connection with no database at all. It does not belong here: an
+    # information_schema query against whatever database `conn` happens to be open on cannot tell
+    # a stale developer database's harmless leftover column apart from a restored write (the
+    # EXTRA-column case app/check_schema.py's docstring says must be REPORTED, never fatal), so it
+    # would be red on this scratch database for a condition that breaks nothing.
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
@@ -1282,6 +1513,204 @@ async def test_embed_and_store_first_index_writes_last_indexed_body_and_rule_eff
     assert doc_row["rule_effective_date"] == rule_effective_date
 
     await _delete_test_rows(conn, source_url)
+
+
+# =================================================================================================
+# FAKE CONNECTION: no DB needed. Drives the real touch_last_verified/_embed_and_store through a fake
+# async connection that records every statement, in the established style of
+# tests/test_sync_annotations.py and tests/test_backfill_source_bodies.py's own statement-level
+# regression (read those files' module docstrings for what a fake connection can and cannot
+# establish). The DB-backed tests above already prove the same property against a real row, but they
+# cannot run on Windows at all (no Postgres, and psycopg refuses async mode on the
+# ProactorEventLoop) -- this makes the property checkable on any machine, including this one.
+# =================================================================================================
+
+
+class _AsyncFakeCursor:
+    """Records every statement issued through it. `rowcount` mimics psycopg closely enough for
+    touch_last_verified's `return cur.rowcount`: it is set by the most recent UPDATE/INSERT this
+    fake modeled, exactly the way a real cursor's rowcount reflects the most recent execute.
+    """
+
+    def __init__(self, log: list[str]):
+        self.log = log
+        self.rowcount = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, sql, params=None):
+        flat = " ".join(sql.split())
+        self.log.append(flat)
+        if flat.startswith("UPDATE documents") or flat.startswith("INSERT INTO documents"):
+            self.rowcount = 1
+        elif flat.startswith("UPDATE sources") or flat.startswith("INSERT INTO sources"):
+            self.rowcount = 1
+        elif flat.startswith("DELETE FROM documents"):
+            self.rowcount = 0
+
+
+class _AsyncFakeTxn:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _AsyncFakeConn:
+    """The minimal async surface `touch_last_verified`/`_embed_and_store` actually call:
+    `conn.transaction()` and `conn.cursor()`, both used as async context managers, plus
+    `cur.execute()`. Nothing here executes real SQL or talks to a socket.
+    """
+
+    def __init__(self):
+        self.log: list[str] = []
+
+    def transaction(self):
+        return _AsyncFakeTxn()
+
+    def cursor(self):
+        return _AsyncFakeCursor(self.log)
+
+    @property
+    def statements_touching_sources(self) -> list[str]:
+        return [s for s in self.log if re.search(r"\bsources\b", s)]
+
+
+def _statements_writing_sources_rule_effective_date(statements: list[str]) -> list[str]:
+    """The single predicate BOTH the regression tests below and their controls use: returns every
+    statement in `statements` that targets `sources` and names `rule_effective_date`. Deliberate --
+    a control that re-implements this predicate inline, against a hand-typed copy of it, can drift
+    from what the regression test actually evaluates and stay green even after the real predicate
+    stops tripping. This project has already found that exact shape once, one layer over: the
+    decorative `_SYNCED_ANNOTATIONS` list app/sync_annotations.py used to carry, which nothing
+    read while the real column list lived elsewhere -- see that module's comment at the site the
+    list used to occupy (search "Deliberately NOT a list of synced annotation names").
+    """
+    return [s for s in statements if re.search(r"\bsources\b", s) and "rule_effective_date" in s]
+
+
+async def test_touch_last_verified_never_writes_rule_effective_date_to_sources():
+    """REGRESSION, no database required. `touch_last_verified` used to write
+    `rule_effective_date = %s` into its `UPDATE sources` statement (docs/adr/0014-stateless-recrawl-
+    diff.md); that clause was removed under Option B
+    (docs/adr/0022-manifest-authoritative-annotations.md). Written BROADLY on purpose: it checks
+    every statement this call issues that targets `sources` at all, not only the one `UPDATE
+    sources` statement this fix touched, so a future write to `sources` naming the column anywhere
+    (a second UPDATE, an INSERT, anything) would also be caught.
+    """
+    conn = _AsyncFakeConn()
+
+    rowcount = await touch_last_verified(
+        conn,
+        "https://example.gov/fake-conn-touch-last-verified",
+        now=datetime(2026, 9, 5, 12, 0, tzinfo=UTC),
+        rule_effective_date=date(2026, 9, 15),
+    )
+
+    assert rowcount == 1  # the documents UPDATE's rowcount, per touch_last_verified's docstring
+
+    sources_statements = conn.statements_touching_sources
+    assert sources_statements, "expected touch_last_verified to still write sources bookkeeping"
+    violations = _statements_writing_sources_rule_effective_date(conn.log)
+    assert not violations, f"sources statement carries it: {violations}"
+
+    # The documents write is untouched by this fix and still present.
+    documents_writes = [s for s in conn.log if s.startswith("UPDATE documents")]
+    assert len(documents_writes) == 1
+    assert "rule_effective_date = %s" in documents_writes[0]
+
+
+def test_touch_last_verified_sources_check_would_actually_catch_a_violation():
+    """The control. Calls the SAME helper the regression test above uses --
+    `_statements_writing_sources_rule_effective_date`, not a reimplementation of it -- on the real
+    pre-19-September `UPDATE sources` statement and confirms it trips, then on the current statement
+    and confirms it does not. A control that re-implements the predicate it is meant to be proving
+    can drift from the real predicate and stay green; calling the shared helper cannot."""
+    old_statement = (
+        "UPDATE sources SET last_verified_at = %s, last_success_at = %s, "
+        "consecutive_failures = 0, last_error = NULL, last_http_status = NULL, status = 'ok', "
+        "rule_effective_date = %s WHERE source_url = %s"
+    )
+    assert _statements_writing_sources_rule_effective_date([old_statement]) == [old_statement]
+
+    current_statement = (
+        "UPDATE sources SET last_verified_at = %s, last_success_at = %s, "
+        "consecutive_failures = 0, last_error = NULL, last_http_status = NULL, status = 'ok' "
+        "WHERE source_url = %s"
+    )
+    assert _statements_writing_sources_rule_effective_date([current_statement]) == []
+
+
+async def test_embed_and_store_never_writes_rule_effective_date_to_sources():
+    """REGRESSION, no database required. `_embed_and_store`'s `INSERT INTO sources ... ON CONFLICT
+    DO UPDATE` used to name `rule_effective_date` in both its column list and its `DO UPDATE SET`
+    clause; both were removed under Option B. Checks every statement targeting `sources`, not only
+    the one INSERT this fix touched, for the same broad-check reason
+    test_touch_last_verified_never_writes_rule_effective_date_to_sources above gives.
+    """
+    conn = _AsyncFakeConn()
+    chunks = [
+        {
+            "heading": "Section",
+            "level": 2,
+            "parent": None,
+            "breadcrumb": "Test Page > Section",
+            "text": "Test Page > Section\n\nSome content.",
+        }
+    ]
+
+    await _embed_and_store(
+        conn,
+        StubEmbedder(dim=768),
+        source_url="https://example.gov/fake-conn-embed-and-store",
+        resolved_url=None,
+        page_last_updated=date(2026, 1, 1),
+        body="# Test Page\n\n## Section\n\nSome content.\n",
+        rule_effective_date=date(2026, 9, 15),
+        chunks=chunks,
+    )
+
+    sources_statements = conn.statements_touching_sources
+    assert sources_statements, "expected _embed_and_store to still upsert sources bookkeeping"
+    violations = _statements_writing_sources_rule_effective_date(conn.log)
+    assert not violations, f"sources statement carries it: {violations}"
+
+    # documents still receives the annotation, per chunk -- unaffected by this fix.
+    documents_writes = [s for s in conn.log if s.startswith("INSERT INTO documents")]
+    assert len(documents_writes) == 1
+    assert "rule_effective_date" in documents_writes[0]
+
+
+def test_embed_and_store_sources_check_would_actually_catch_a_violation():
+    """The control. Calls the SAME helper the regression test above uses --
+    `_statements_writing_sources_rule_effective_date`, not a reimplementation of it -- on the real
+    pre-19-September `INSERT INTO sources` statement and confirms it trips, then on the current
+    statement and confirms it does not. A control that re-implements the predicate it is meant to be
+    proving can drift from the real predicate and stay green; calling the shared helper cannot."""
+    old_statement = (
+        "INSERT INTO sources (source_url, resolved_url, page_last_updated, fetched_at, "
+        "last_verified_at, last_changed_at, last_success_at, change_count, consecutive_failures, "
+        "last_error, last_http_status, status, last_indexed_body, rule_effective_date) "
+        "VALUES (%(source_url)s, %(resolved_url)s, %(page_last_updated)s, %(now)s, %(now)s, "
+        "%(now)s, %(now)s, 0, 0, NULL, NULL, 'ok', %(body)s, %(rule_effective_date)s) "
+        "ON CONFLICT (source_url) DO UPDATE SET rule_effective_date = EXCLUDED.rule_effective_date"
+    )
+    assert _statements_writing_sources_rule_effective_date([old_statement]) == [old_statement]
+
+    current_statement = (
+        "INSERT INTO sources (source_url, resolved_url, page_last_updated, fetched_at, "
+        "last_verified_at, last_changed_at, last_success_at, change_count, consecutive_failures, "
+        "last_error, last_http_status, status, last_indexed_body) "
+        "VALUES (%(source_url)s, %(resolved_url)s, %(page_last_updated)s, %(now)s, %(now)s, "
+        "%(now)s, %(now)s, 0, 0, NULL, NULL, 'ok', %(body)s) "
+        "ON CONFLICT (source_url) DO UPDATE SET last_indexed_body = EXCLUDED.last_indexed_body"
+    )
+    assert _statements_writing_sources_rule_effective_date([current_statement]) == []
 
 
 async def test_no_foreign_key_touching_documents_is_on_delete_cascade(conn):
@@ -1525,6 +1954,9 @@ def _make_chunk(**overrides) -> RetrievedChunk:
         heading_level=2,
         page_last_updated=None,
         rule_effective_date=None,
+        rule_status=None,
+        rule_status_source=None,
+        rule_status_source_evidences_status=None,
         fetched_at=datetime(2026, 8, 1, tzinfo=UTC),
         last_verified_at=datetime(2026, 8, 1, tzinfo=UTC),
         distance=0.1,
@@ -1544,6 +1976,7 @@ def test_build_freshness_top_ranked_uncited_dated_source_produces_a_notice_with_
     chunk = _make_chunk(
         source_url="https://studyinthestates.dhs.gov/quick-facts",
         rule_effective_date=date(2026, 9, 15),
+        rule_status="scheduled",
     )
 
     freshness = build_freshness([chunk], today=date(2026, 9, 5), cited_indices=set())
@@ -1555,7 +1988,7 @@ def test_build_freshness_top_ranked_uncited_dated_source_produces_a_notice_with_
     assert notice.in_effect is False
     assert notice.reason == "top_ranked"
 
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
     assert text is not None
     assert "September 15, 2026" in text
     assert "https://studyinthestates.dhs.gov/quick-facts" in text
@@ -1572,6 +2005,7 @@ def test_build_freshness_cited_but_not_top_ranked_dated_source_produces_a_notice
         _make_chunk(
             source_url="https://studyinthestates.dhs.gov/quick-facts",
             rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
         ),
     ]
 
@@ -1582,7 +2016,7 @@ def test_build_freshness_cited_but_not_top_ranked_dated_source_produces_a_notice
     assert notice.source_url == "https://studyinthestates.dhs.gov/quick-facts"
     assert notice.reason == "cited"
 
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
     assert text is not None
     assert "September 15, 2026" in text
 
@@ -1600,7 +2034,12 @@ def test_build_freshness_dated_source_at_rank_five_uncited_still_produces_a_noti
         _make_chunk(id=2, source_url="https://example.gov/unrelated-2", rule_effective_date=None),
         _make_chunk(id=3, source_url="https://example.gov/unrelated-3", rule_effective_date=None),
         _make_chunk(id=4, source_url="https://example.gov/unrelated-4", rule_effective_date=None),
-        _make_chunk(id=5, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            id=5,
+            source_url=dated_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices=set())
@@ -1615,7 +2054,7 @@ def test_build_freshness_dated_source_at_rank_five_uncited_still_produces_a_noti
     # case this replaces.
     assert notice.reason == "retrieved"
 
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
     assert text is not None
     assert "September 15, 2026" in text
     assert dated_url in text
@@ -1636,7 +2075,12 @@ def test_build_freshness_reason_is_not_falsely_cited_when_other_chunks_are_cited
         _make_chunk(id=2, source_url="https://example.gov/unrelated-2", rule_effective_date=None),
         _make_chunk(id=3, source_url="https://example.gov/unrelated-3", rule_effective_date=None),
         _make_chunk(id=4, source_url="https://example.gov/unrelated-4", rule_effective_date=None),
-        _make_chunk(id=5, source_url=dated_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            id=5,
+            source_url=dated_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={1, 2})
@@ -1655,10 +2099,25 @@ def test_build_freshness_reason_covers_all_three_values_for_the_three_retrieval_
     cited_url = "https://example.gov/cited-dated"
     retrieved_only_url = "https://example.gov/retrieved-only-dated"
     chunks = [
-        _make_chunk(id=1, source_url=top_ranked_url, rule_effective_date=date(2026, 9, 15)),
-        _make_chunk(id=2, source_url=cited_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            id=1,
+            source_url=top_ranked_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
+        _make_chunk(
+            id=2,
+            source_url=cited_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
         _make_chunk(id=3, source_url="https://example.gov/unrelated", rule_effective_date=None),
-        _make_chunk(id=4, source_url=retrieved_only_url, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            id=4,
+            source_url=retrieved_only_url,
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
     ]
 
     # cited_indices={2}: position 2 (cited_url) is cited; position 1 (top_ranked_url) is not cited
@@ -1687,30 +2146,45 @@ def test_build_freshness_without_any_dated_source_produces_no_notice():
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices=set())
 
     assert freshness.notices == []
-    assert freshness_notice_text(freshness.notices) is None
+    assert freshness_notice_text(freshness.notices, today=date(2026, 9, 5)) is None
 
 
-def test_build_freshness_date_rollover_flips_in_effect_and_wording_to_took_effect():
-    """With `today` frozen to a date after the rule's effective date, `in_effect` must flip to
-    True and `freshness_notice_text`'s wording must switch from "takes effect on" (future) to
-    "took effect on" (already in effect) -- the real DHS fixed-admission rule is eight days away
-    from this rollover as of this fix, so it ships whether or not this is tested.
+def test_build_freshness_status_change_flips_in_effect_and_wording_not_the_calendar():
+    """RENAMED and REDESIGNED 2026-09-19 (docs/adr/0023-curator-rule-status.md): this used to be
+    `..._date_rollover_flips_in_effect_and_wording_to_took_effect`, proving that advancing `today`
+    past the rule's own date flipped `in_effect` and the rendered wording. That mechanism is
+    EXACTLY the bug REPORT.md's "The injunction, and why this is not fixed" records: the real DHS
+    rule's date passed on 2026-09-15 and a federal court had enjoined it the day before, so the old
+    version of this test enshrined the very defect the fix closes. `in_effect` and the wording now
+    flip on a CURATOR STATUS change, `today` held fixed throughout -- proving the replacement
+    mechanism does what the old one used to, without the calendar as an input.
     """
-    chunk = _make_chunk(
+    scheduled_chunk = _make_chunk(
         source_url="https://studyinthestates.dhs.gov/quick-facts",
         rule_effective_date=date(2026, 9, 15),
+        rule_status="scheduled",
     )
+    in_force_chunk = _make_chunk(
+        source_url="https://studyinthestates.dhs.gov/quick-facts",
+        rule_effective_date=date(2026, 9, 15),
+        rule_status="in_force",
+    )
+    frozen_today = date(2026, 9, 16)
 
-    freshness = build_freshness([chunk], today=date(2026, 9, 16), cited_indices=set())
+    scheduled_freshness = build_freshness(
+        [scheduled_chunk], today=frozen_today, cited_indices=set()
+    )
+    in_force_freshness = build_freshness([in_force_chunk], today=frozen_today, cited_indices=set())
 
-    assert len(freshness.notices) == 1
-    notice = freshness.notices[0]
-    assert notice.in_effect is True
+    assert scheduled_freshness.notices[0].in_effect is False
+    assert in_force_freshness.notices[0].in_effect is True
 
-    text = freshness_notice_text(freshness.notices)
-    assert text is not None
-    assert "took effect on September 15, 2026" in text
-    assert "takes effect on" not in text
+    scheduled_text = freshness_notice_text(scheduled_freshness.notices, today=frozen_today)
+    in_force_text = freshness_notice_text(in_force_freshness.notices, today=frozen_today)
+    assert "takes effect on September 15, 2026" in scheduled_text
+    assert "took effect on" not in scheduled_text
+    assert "took effect on September 15, 2026" in in_force_text
+    assert "takes effect on" not in in_force_text
 
 
 def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_sentence():
@@ -1723,8 +2197,12 @@ def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_s
     url_a = "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-procedure-faq"
     url_b = "https://studyinthestates.dhs.gov/final-rule-establishing-a-fixed-time-period-of-admission-and-an-extension-of-stay-quick-facts"
     chunks = [
-        _make_chunk(source_url=url_a, rule_effective_date=date(2026, 9, 15)),
-        _make_chunk(source_url=url_b, rule_effective_date=date(2026, 9, 15)),
+        _make_chunk(
+            source_url=url_a, rule_effective_date=date(2026, 9, 15), rule_status="scheduled"
+        ),
+        _make_chunk(
+            source_url=url_b, rule_effective_date=date(2026, 9, 15), rule_status="scheduled"
+        ),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={2})
@@ -1736,7 +2214,7 @@ def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_s
     assert by_url[url_a].reason == "top_ranked"
     assert by_url[url_b].reason == "cited"
 
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
     assert text is not None
     assert (
         text.count("September 15, 2026") == 1
@@ -1747,12 +2225,20 @@ def test_freshness_notice_text_collapses_two_sources_sharing_one_date_into_one_s
 
 def test_freshness_notice_text_keeps_separate_sentences_for_different_dates():
     chunks = [
-        _make_chunk(source_url="https://example.gov/a", rule_effective_date=date(2026, 9, 15)),
-        _make_chunk(source_url="https://example.gov/b", rule_effective_date=date(2027, 1, 1)),
+        _make_chunk(
+            source_url="https://example.gov/a",
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
+        _make_chunk(
+            source_url="https://example.gov/b",
+            rule_effective_date=date(2027, 1, 1),
+            rule_status="scheduled",
+        ),
     ]
 
     freshness = build_freshness(chunks, today=date(2026, 9, 5), cited_indices={2})
-    text = freshness_notice_text(freshness.notices)
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
 
     assert text is not None
     assert "September 15, 2026" in text
@@ -1761,13 +2247,193 @@ def test_freshness_notice_text_keeps_separate_sentences_for_different_dates():
     assert text.count("https://example.gov/b") == 1
 
 
+def test_freshness_notice_text_keeps_scheduled_and_enjoined_separate_when_dates_match():
+    """Grouping is keyed on `(rule_effective_date, rule_status)`, not `(rule_effective_date,
+    in_effect)` (docs/adr/0023-curator-rule-status.md): two sources that happen to share a date but
+    NOT a status must render two separate sentences, never one collapsed sentence that would be
+    only half-true of either source. Keying on `in_effect` alone would have merged these two,
+    since both `scheduled` and `enjoined` read `in_effect=False`.
+    """
+    chunks = [
+        _make_chunk(
+            source_url="https://example.gov/a",
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="scheduled",
+        ),
+        _make_chunk(
+            source_url="https://example.gov/b",
+            rule_effective_date=date(2026, 9, 15),
+            rule_status="enjoined",
+            rule_status_source="https://www.federalregister.gov/d/2026-14439",
+            rule_status_source_evidences_status=False,
+        ),
+    ]
+
+    freshness = build_freshness(chunks, today=date(2026, 9, 19), cited_indices={2})
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+
+    assert text is not None
+    assert "takes effect on September 15, 2026" in text
+    assert "blocked by a court order" in text
+    assert "https://example.gov/a" in text
+    assert "https://www.federalregister.gov/d/2026-14439" in text
+    assert (
+        "https://example.gov/b" not in text
+    ), "the enjoined sentence must link rule_status_source, not the retrieved page itself"
+
+
 def test_build_freshness_without_rule_effective_date_produces_no_notice_and_no_text():
     chunk = _make_chunk(rule_effective_date=None)
 
     freshness = build_freshness([chunk], today=date(2026, 9, 5), cited_indices=set())
 
     assert freshness.notices == []
-    assert freshness_notice_text(freshness.notices) is None
+    assert freshness_notice_text(freshness.notices, today=date(2026, 9, 5)) is None
+
+
+def test_build_freshness_enjoined_status_with_no_date_still_produces_a_notice():
+    """`enjoined` (like `not_in_force`) may carry no `rule_effective_date` at all
+    (app/rule_status.py's own vocabulary table). The skip condition build_freshness uses is "no
+    status AND no date" (2026-09-19; it used to be "no date" alone), so a status-only chunk must
+    still get a notice -- the old, date-only skip would have silently dropped this exact case.
+
+    `rule_status_source_evidences_status=False` here: the real curated source for this project's own
+    fixed_admission entries points at the Federal Register notice, not the court's order (docs/adr/
+    0023-curator-rule-status.md), so this is the live shape, not merely one of two possibilities --
+    see test_build_freshness_enjoined_status_with_no_date_and_evidences_true_names_the_court below
+    for the other one.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/enjoined-no-date",
+        rule_effective_date=None,
+        rule_status="enjoined",
+        rule_status_source="https://www.federalregister.gov/d/2026-14439",
+        rule_status_source_evidences_status=False,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+
+    assert len(freshness.notices) == 1
+    notice = freshness.notices[0]
+    assert notice.rule_effective_date is None
+    assert notice.rule_status == "enjoined"
+    assert notice.rule_status_source_evidences_status is False
+    assert notice.in_effect is False
+
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+    assert text is not None
+    assert (
+        "One of the sources above describes a rule that has been blocked by a court order " in text
+    )
+    assert "That is recorded by this site's maintainer; the page above does not say it." in text
+    assert "[the rule as published](https://www.federalregister.gov/d/2026-14439)" in text
+    assert "the court's order" not in text
+    # 2026-09-19: enjoined/not_in_force no longer state "today, <date>" at all -- see
+    # freshness_notice_text's own docstring, "HONEST NOTICE WORDING".
+    assert "today, September 19, 2026" not in text
+
+
+def test_build_freshness_enjoined_status_with_no_date_and_evidences_true_names_the_court():
+    """The other evidences value for the same no-date shape as the test above: when
+    `rule_status_source` actually documents the court's order, the wording drops the maintainer
+    attribution and links it as such.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/enjoined-no-date-evidenced",
+        rule_effective_date=None,
+        rule_status="enjoined",
+        rule_status_source="https://www.courtlistener.com/order",
+        rule_status_source_evidences_status=True,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+    assert freshness.notices[0].rule_status_source_evidences_status is True
+
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+    assert text is not None
+    assert (
+        "One of the sources above describes a rule that has been blocked by a court order and "
+        "is not in force. See [the court's order](https://www.courtlistener.com/order)."
+    ) == text
+    assert "maintainer" not in text
+
+
+def test_build_freshness_enjoined_with_date_and_evidences_true_names_the_court():
+    """The evidences=True wording for an `enjoined` chunk that DOES carry a `rule_effective_date`
+    (the with-date companion to the two no-date tests above): the scheduled-date clause is kept, the
+    maintainer attribution is dropped, and the link is captioned as the court's order.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/enjoined-with-date-evidenced",
+        rule_effective_date=date(2026, 9, 15),
+        rule_status="enjoined",
+        rule_status_source="https://www.courtlistener.com/order",
+        rule_status_source_evidences_status=True,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+
+    assert text is not None
+    assert (
+        "One of the sources above describes a rule that was scheduled to take effect on "
+        "September 15, 2026. A court has blocked it and it is not in force. "
+        "See [the court's order](https://www.courtlistener.com/order)."
+    ) == text
+    assert "maintainer" not in text
+    assert "It has since been blocked" not in text
+
+
+def test_build_freshness_not_in_force_status_produces_a_notice_linking_its_source():
+    """`rule_status_source_evidences_status=False`: the source names the rule that was withdrawn,
+    not evidence of the withdrawal itself -- see test_build_freshness_not_in_force_evidences_true
+    below for the other value.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/withdrawn-rule",
+        rule_effective_date=None,
+        rule_status="not_in_force",
+        rule_status_source="https://www.federalregister.gov/withdrawal-notice",
+        rule_status_source_evidences_status=False,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+
+    assert freshness.notices[0].in_effect is False
+    assert text is not None
+    assert (
+        "One of the sources above describes a rule that is not in force. "
+        "That is recorded by this site's maintainer; the page above does not say it. "
+        "See [the rule as published](https://www.federalregister.gov/withdrawal-notice)."
+    ) == text
+    assert "blocked by a court order" not in text
+    assert "the source for that" not in text
+    assert "today, September 19, 2026" not in text
+
+
+def test_build_freshness_not_in_force_evidences_true():
+    """`not_in_force` deliberately never names a mechanism (vacated vs. withdrawn), so its
+    evidences=True label is the neutral "the source for that", never "the court's order" -- see
+    app/rule_status.py's own vocabulary table for why `not_in_force` carries no mechanism at all.
+    """
+    chunk = _make_chunk(
+        source_url="https://example.gov/withdrawn-rule-evidenced",
+        rule_effective_date=None,
+        rule_status="not_in_force",
+        rule_status_source="https://www.federalregister.gov/withdrawal-order",
+        rule_status_source_evidences_status=True,
+    )
+
+    freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
+    text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
+
+    assert (
+        "One of the sources above describes a rule that is not in force. "
+        "See [the source for that](https://www.federalregister.gov/withdrawal-order)."
+    ) == text
+    assert "maintainer" not in text
+    assert "the court's order" not in text
 
 
 # =================================================================================================

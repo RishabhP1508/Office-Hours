@@ -1,0 +1,183 @@
+name: Drift checks
+
+# Checks that compare what is actually true against what the system assumes. Both of the checks this
+# file is meant to hold share that idea and share this home, and are deliberately SEPARATE JOBS with
+# separate vocabularies, so a red run never leaves anyone asking which one fired -- the same
+# failed-versus-unchanged ambiguity this project keeps finding elsewhere, avoided here by
+# construction.
+#
+#   schema-drift   (BUILT)     does production's schema match what infra/sql/init.sql declares?
+#   corpus-staleness (NOT YET) is the corpus older than it should be? Reads the public
+#                              /v1/sources/status, needs no credentials. Deliberately deferred:
+#                              its alert threshold is still an open decision and it would be RED
+#                              from the moment it lands (age_hours was 283.9 when it was designed),
+#                              and landing one green check is worth more than two where one is red
+#                              by design and therefore ignored from birth.
+#
+# ---------------------------------------------------------------------------------------------
+# WHY THE EXPECTED SCHEMA IS NOT PARSED OUT OF init.sql
+# ---------------------------------------------------------------------------------------------
+# The obvious implementation reads infra/sql/init.sql and extracts the column names. Do not. That
+# file's NET column set is not a simple read:
+#
+#   - CREATE TABLE IF NOT EXISTS for the original shape of each table, and
+#   - ALTER TABLE ... ADD COLUMN IF NOT EXISTS for every later addition, several columns per
+#     statement, with SQL comments interleaved BETWEEN the columns, and
+#   - an ALTER TABLE ... DROP COLUMN inside a conditional DO $$ block, guarded on whether the
+#     legacy columns are present at all.
+#
+# A naive parser that applies that DROP unconditionally still produces the right answer for
+# `documents`, but ONLY because those columns are absent from its CREATE TABLE anyway. It is
+# **correct by luck, not by design**, and the luck is invisible to whoever wrote it. A parser that
+# is quietly wrong about the schema is worse than no check, because this check's entire job is to be
+# authoritative about exactly that.
+#
+# So: apply init.sql to a THROWAWAY reference database and read its information_schema. Postgres is
+# a complete, correct SQL parser that is already present, already used this way by
+# .github/workflows/eval.yml, and cannot disagree with itself. app/check_schema.py then only ever
+# compares two information_schema queries. Adding a column to init.sql requires NO change here and
+# nothing to remember: the reference picks it up on the next run and the check immediately starts
+# asserting the target should have it too. It also verifies something nothing else does -- that
+# init.sql is APPLICABLE AT ALL, a syntax error in it being currently discoverable only by a human
+# initialising a fresh database by hand.
+#
+# ---------------------------------------------------------------------------------------------
+# WHAT THIS CHECK DOES NOT DO -- read this before concluding the schema is "covered"
+# ---------------------------------------------------------------------------------------------
+# It compares a schema against a DECLARATION. It does not compare a schema against the CODE, which
+# is a different and larger question. Concretely, it would NOT have caught either of the two things
+# that actually went wrong in this project:
+#
+#   - The curator-annotation problem. rule_effective_date/heading_note/federal_register living in
+#     gitignored snapshot frontmatter is not a schema fact at all; every column involved existed.
+#   - The 7 September mystery. sources.last_verified_at holding a date no code path could have
+#     written was a code-versus-data disagreement, and both databases' schemas were internally
+#     consistent throughout.
+#
+# **A check whose scope is misread is how people stop looking at what it does not cover.** This one
+# covers missing tables and columns. That is all it covers.
+#
+# ---------------------------------------------------------------------------------------------
+# CONDITION: if a real migration runner ever lands, THIS CHECK MUST BE REPOINTED AT IT
+# ---------------------------------------------------------------------------------------------
+# The whole design rests on one assumption: that infra/sql/init.sql, applied to an empty database,
+# produces the schema production is supposed to have. That is true today because it is the only
+# schema definition in the repository and there is no migration runner. If anyone introduces one
+# (Alembic, sqitch, plain numbered .sql files, anything), init.sql stops being the declaration and
+# this job silently starts measuring a fiction: it will compare production against a stale reference
+# and report "schema ok" while the real declared schema has moved. **Whoever adds a migration runner
+# owns repointing the "Build the reference schema" step at it**, and this paragraph is here rather
+# than only in REPORT.md because that person will be reading code, not the report.
+#
+# ---------------------------------------------------------------------------------------------
+# CONSIDERED AND DEFERRED: running this on pull_request
+# ---------------------------------------------------------------------------------------------
+# A `pull_request` trigger would catch "you added a column to init.sql but production does not have
+# it" at the exact moment it is introduced, which is the most useful possible signal and strictly
+# earlier than a daily schedule. It is deferred, not forgotten, for one reason: it would hand every
+# PR production database credentials, and it would sit red from the moment anyone adds a column
+# until the production migration happens. That makes an unrelated PR the place where a production
+# migration decision surfaces, and catching this a day later is better than that. Revisit once this
+# check has a track record.
+
+"on":
+  schedule:
+    # 09:23 UTC daily. Not on the hour, and offset from recrawl.yml's 08:17, so the two never
+    # contend. Schema changes only on a deploy or a hand-applied DDL, so most runs are a cheap
+    # heartbeat; unlike the staleness check this one goes GREEN immediately, which is why it can
+    # land with no threshold decision attached to it.
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  schema-drift:
+    name: Does production's schema match what init.sql declares?
+    runs-on: ubuntu-latest
+
+    # The reference database. pgvector rather than plain postgres because init.sql creates a vector
+    # column and an HNSW index, and would fail to apply without the extension available.
+    services:
+      reference:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: officehours
+          POSTGRES_PASSWORD: officehours
+          POSTGRES_DB: officehours
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U officehours -d officehours"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/orchestrator/pyproject.toml
+
+      - name: Install the orchestrator package
+        run: pip install -e ./services/orchestrator
+
+      - name: Decide whether a target database is configured
+        id: db
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=live" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Option D from REPORT.md's "Making a skip visible", applied here from the start rather than
+      # retrofitted: a run that checked nothing must not look like a run that checked everything and
+      # found it correct. Still exits 0, because having no target configured is a legitimate state.
+      - name: No target database configured -- this check is inert
+        if: steps.db.outputs.mode == 'skip'
+        run: |
+          echo "::warning title=Schema check did NOT run::No DATABASE_URL secret is configured, so no schema was compared. This run is green because there was nothing to check, not because the schema is correct."
+          {
+            echo "## Schema drift check SKIPPED"
+            echo ""
+            echo "**No \`DATABASE_URL\` secret is configured**, so no target schema was read."
+            echo "This run is green because there was nothing to compare, **not** because"
+            echo "production's schema matches \`infra/sql/init.sql\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Build the reference schema by applying infra/sql/init.sql
+        if: steps.db.outputs.mode == 'live'
+        run: |
+          python - <<'PY'
+          import psycopg
+          dsn = "postgresql://officehours:officehours@localhost:5432/officehours"
+          with psycopg.connect(dsn, autocommit=True) as conn:
+              conn.execute(open("infra/sql/init.sql", encoding="utf-8").read())
+              with conn.cursor() as cur:
+                  cur.execute(
+                      "SELECT count(DISTINCT table_name), count(*) "
+                      "FROM information_schema.columns WHERE table_schema='public'"
+                  )
+                  tables, columns = cur.fetchone()
+          print(f"applied infra/sql/init.sql -> {tables} tables, {columns} columns")
+          if tables == 0:
+              raise SystemExit("init.sql applied but produced no tables")
+          PY
+
+      - name: Compare production against the reference
+        if: steps.db.outputs.mode == 'live'
+        working-directory: services/orchestrator
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          set -o pipefail
+          python -m app.check_schema \
+            --reference-url "postgresql://officehours:officehours@localhost:5432/officehours" \
+            | tee -a "$GITHUB_STEP_SUMMARY"

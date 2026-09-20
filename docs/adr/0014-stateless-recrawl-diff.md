@@ -128,3 +128,32 @@ honestly rather than glossing over.
   all.** Investigated and rejected -- see "Reconstruction from `documents` was investigated and
   ruled out" above. The 12,574-vs-12,321-character measurement is the reason this was not simply
   assumed to be fine.
+
+## Amendment, 19 September 2026: `sources.rule_effective_date` is superseded by ADR 0022
+
+`data/sources/sources.yaml` (line 7, in its own header comment) points at this section for why
+curator annotations moved out of snapshot frontmatter and into the tracked manifest. That decision
+is recorded in full in
+[ADR 0022](0022-manifest-authoritative-annotations.md), not here; this amendment exists only to
+mark, at the point a future reader would look for it, that this ADR's own `rule_effective_date`
+column is no longer part of the design.
+
+This ADR originally added TWO columns to `sources`: `last_indexed_body` and `rule_effective_date`,
+both for the same reason -- the stateless refresh job needed a database-resident baseline in place
+of a snapshot file that does not survive between runs on a stateless runner. Production was migrated
+for neither at first, and when it was, only `last_indexed_body` was ever added
+(`app/backfill_source_bodies.py`'s backfill ran against it on 19 September 2026).
+`sources.rule_effective_date` was never added to production; every statement against it there raised
+`UndefinedColumn`, which is the defect ADR 0022 describes and fixes.
+
+**`last_indexed_body` is untouched by ADR 0022 and remains exactly the decision this ADR made.** It
+is in production, the backfill has run against it, and `app/recrawl.py::_diff_node` reads it on
+every run. Nothing here changes.
+
+**`rule_effective_date` is superseded.** `sources.rule_effective_date` is removed from
+`infra/sql/init.sql`'s declaration. `data/sources/sources.yaml` is now the authoritative source for
+the annotation; `app/recrawl.py::_initial_state` reads it from the manifest entry directly, and
+`_diff_node` no longer reads or carries forward a `sources`-column copy of it at all. See ADR 0022
+for the full reasoning, including why the column is deleted rather than finally added to production.
+`documents.rule_effective_date` -- the per-chunk value this ADR never touched, and the one citations
+and answers actually read -- is unaffected.
