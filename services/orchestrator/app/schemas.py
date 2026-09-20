@@ -144,13 +144,17 @@ class FreshnessNotice(BaseModel):
     this field so a link is never captioned as evidence of a status the linked page does not
     actually state.
 
-    `in_effect` is RETAINED FOR COMPATIBILITY (services/frontend/components/Freshness.tsx and
-    lib/api.ts both read it) and is now DERIVED FROM `rule_status` via
-    `app/rule_status.py::is_in_force`, never from a date comparison -- see that function's own
-    docstring for why `None`/`in_force` both read True. Before 2026-09-19 this field WAS the force
-    decision (`rule_effective_date <= as_of`); it is now a projection of `rule_status`, kept so
-    nothing reading only this one bit breaks, computed by the same predicate every other consumer
-    uses so it cannot itself drift into a second, independent force decision.
+    `in_effect` was REMOVED on 2026-09-19 (docs/adr/0023-curator-rule-status.md). It used to be
+    retained here "for compatibility" -- a single boolean, derived from `rule_status` via
+    `app/rule_status.py::is_in_force`, that services/frontend/components/Freshness.tsx and
+    lib/api.ts both read instead of `rule_status` itself. That retention is exactly what carried
+    the defect this removal closes: `is_in_force` reads `enjoined`, `scheduled`, and `not_in_force`
+    as the identical `False`, so a frontend branching on this one bit cannot say WHY a rule is not
+    in force, only THAT it is not -- and on 2026-09-19 that collapsed distinction rendered "A rule
+    affecting this answer takes effect on September 15, 2026" for a rule a federal court had
+    enjoined five days earlier, one paragraph below the correct sentence saying it is not in force.
+    Do not re-add this field: every consumer, backend and frontend alike, now reads `rule_status`
+    directly (see services/frontend/lib/freshness.ts).
 
     `reason` is exactly one of:
       `"top_ranked"` -- this source's chunk was the single highest-ranked retrieved chunk.
@@ -170,7 +174,6 @@ class FreshnessNotice(BaseModel):
     rule_status: str | None = None
     rule_status_source: str | None = None
     rule_status_source_evidences_status: bool | None = None
-    in_effect: bool
     reason: Literal["top_ranked", "cited", "retrieved"]
 
 

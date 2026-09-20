@@ -76,6 +76,7 @@ from app.recrawl import (
     run_refresh,
     touch_last_verified,
 )
+from app.rule_status import is_in_force
 from app.schemas import ResponseType
 
 
@@ -1985,7 +1986,7 @@ def test_build_freshness_top_ranked_uncited_dated_source_produces_a_notice_with_
     notice = freshness.notices[0]
     assert notice.source_url == "https://studyinthestates.dhs.gov/quick-facts"
     assert notice.rule_effective_date == date(2026, 9, 15)
-    assert notice.in_effect is False
+    assert notice.rule_status == "scheduled"
     assert notice.reason == "top_ranked"
 
     text = freshness_notice_text(freshness.notices, today=date(2026, 9, 5))
@@ -2048,7 +2049,7 @@ def test_build_freshness_dated_source_at_rank_five_uncited_still_produces_a_noti
     notice = freshness.notices[0]
     assert notice.source_url == dated_url
     assert notice.rule_effective_date == date(2026, 9, 15)
-    assert notice.in_effect is False
+    assert notice.rule_status == "scheduled"
     # Round 2 (2026-09-08): a genuinely neither-top-ranked-nor-cited source reports "retrieved",
     # not "cited" -- see the regression test right below this one for the exact false-positive
     # case this replaces.
@@ -2149,15 +2150,19 @@ def test_build_freshness_without_any_dated_source_produces_no_notice():
     assert freshness_notice_text(freshness.notices, today=date(2026, 9, 5)) is None
 
 
-def test_build_freshness_status_change_flips_in_effect_and_wording_not_the_calendar():
+def test_build_freshness_status_change_flips_rule_status_and_wording_not_the_calendar():
     """RENAMED and REDESIGNED 2026-09-19 (docs/adr/0023-curator-rule-status.md): this used to be
-    `..._date_rollover_flips_in_effect_and_wording_to_took_effect`, proving that advancing `today`
-    past the rule's own date flipped `in_effect` and the rendered wording. That mechanism is
-    EXACTLY the bug REPORT.md's "The injunction, and why this is not fixed" records: the real DHS
-    rule's date passed on 2026-09-15 and a federal court had enjoined it the day before, so the old
-    version of this test enshrined the very defect the fix closes. `in_effect` and the wording now
-    flip on a CURATOR STATUS change, `today` held fixed throughout -- proving the replacement
-    mechanism does what the old one used to, without the calendar as an input.
+    `..._date_rollover_flips_in_effect_and_wording_to_took_effect`, then briefly
+    `..._flips_in_effect_and_wording_not_the_calendar`, proving that advancing `today` past the
+    rule's own date flipped `in_effect` and the rendered wording. That mechanism is EXACTLY the bug
+    REPORT.md's "The injunction, and why this is not fixed" records: the real DHS rule's date
+    passed on 2026-09-15 and a federal court had enjoined it the day before, so the old version of
+    this test enshrined the very defect the fix closes. `FreshnessNotice.in_effect` was itself
+    removed on 2026-09-19 (see that class's own docstring) after the same collapsed force-bit shape
+    carried the identical defect onto the frontend, so this test and its name now read
+    `rule_status` directly. `rule_status` and the wording flip on a CURATOR STATUS change, `today`
+    held fixed throughout -- proving the replacement mechanism does what the old one used to,
+    without the calendar as an input.
     """
     scheduled_chunk = _make_chunk(
         source_url="https://studyinthestates.dhs.gov/quick-facts",
@@ -2176,8 +2181,8 @@ def test_build_freshness_status_change_flips_in_effect_and_wording_not_the_calen
     )
     in_force_freshness = build_freshness([in_force_chunk], today=frozen_today, cited_indices=set())
 
-    assert scheduled_freshness.notices[0].in_effect is False
-    assert in_force_freshness.notices[0].in_effect is True
+    assert scheduled_freshness.notices[0].rule_status == "scheduled"
+    assert in_force_freshness.notices[0].rule_status == "in_force"
 
     scheduled_text = freshness_notice_text(scheduled_freshness.notices, today=frozen_today)
     in_force_text = freshness_notice_text(in_force_freshness.notices, today=frozen_today)
@@ -2318,7 +2323,10 @@ def test_build_freshness_enjoined_status_with_no_date_still_produces_a_notice():
     assert notice.rule_effective_date is None
     assert notice.rule_status == "enjoined"
     assert notice.rule_status_source_evidences_status is False
-    assert notice.in_effect is False
+    # `FreshnessNotice.in_effect` was removed 2026-09-19 (see that class's own docstring); the
+    # force verdict this used to check is `is_in_force`, the same predicate every consumer calls,
+    # not a second, independent read of `rule_status` (already pinned two lines up).
+    assert is_in_force(notice.rule_status) is False
 
     text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
     assert text is not None
@@ -2400,7 +2408,9 @@ def test_build_freshness_not_in_force_status_produces_a_notice_linking_its_sourc
     freshness = build_freshness([chunk], today=date(2026, 9, 19), cited_indices=set())
     text = freshness_notice_text(freshness.notices, today=date(2026, 9, 19))
 
-    assert freshness.notices[0].in_effect is False
+    # `FreshnessNotice.in_effect` was removed 2026-09-19 (see that class's own docstring); the
+    # status the notice actually carries is `rule_status`, not asserted elsewhere in this test.
+    assert freshness.notices[0].rule_status == "not_in_force"
     assert text is not None
     assert (
         "One of the sources above describes a rule that is not in force. "
