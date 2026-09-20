@@ -24,7 +24,24 @@ LangGraph dependency at all, and is fully testable without the `[freshness]` ext
 Every value that ends up inside the graph's own State (the TypedDict below) must be
 JSON/msgpack-serializable, since LangGraph's checkpointer persists it to disk between steps: no
 dataclass instances, no `datetime`/`date` objects. Dates and the serialized ChangeVerdict travel as
-ISO strings and plain dicts instead.
+ISO strings and plain dicts instead. Embedding vectors are the sharpest instance of this and are
+never allowed in at all: 45 chunks x 768 floats is roughly 276KB per source, and writing that into
+every checkpoint of a state machine designed to resume from disk would be pure waste. `_embed_node`
+stays a pure pass-through for exactly this reason -- see its own docstring.
+
+WHY `_reindex_node` ACQUIRES ITS CONNECTION LATE (September 2026). The first live re-index against
+Neon (this job's production database) died on both sources it tried to re-embed, with
+`OperationalError: consuming input failed: SSL connection has been closed unexpectedly`. A
+controlled two-arm probe -- one connection held open across a real embed, one held idle for the
+same duration doing nothing -- showed BOTH die, proving idle DURATION is the cause, not anything
+about embedding itself. Measured on production hardware (shared-cpu-1x, nproc=1,
+EMBED_GGUF_THREADS=1): 45 chunks take 104.77s to embed, 2328ms/chunk -- easily long enough for
+Neon's own idle-connection timeout to close the socket out from under a connection that is just
+sitting there. `_reindex_node` now computes a source's vectors (`app.ingest._embed_chunks`) BEFORE
+calling `deps.conn_factory()` at all, so the connection exists only for the write that follows
+(`reindex_source` / `app.ingest._embed_and_store`), never across the embed. `app/ingest.py`'s own
+`_ingest_from_manifest`/`_ingest_from_snapshots` follow the identical order, for the same reason:
+both call the same split `_embed_chunks`/`_embed_and_store` pair this module does.
 """
 
 from __future__ import annotations
@@ -55,6 +72,7 @@ from app.ingest import (
     HostRateLimiter,
     RobotsCache,
     _embed_and_store,
+    _embed_chunks,
     _parse_iso_date,
     build_frontmatter,
     chunk_markdown,
@@ -514,7 +532,7 @@ async def record_source_failure(
 
 async def reindex_source(
     conn: psycopg.AsyncConnection,
-    embedder: Embedder,
+    vectors: list[list[float]],
     *,
     source_url: str,
     resolved_url: str | None,
@@ -535,6 +553,12 @@ async def reindex_source(
     the four is written onto `sources` -- none of these columns exists in production (Option B; see
     docs/adr/0022-manifest-authoritative-annotations.md and docs/adr/0023-curator-rule-status.md).
 
+    `vectors` is `chunks` already embedded -- computed by the CALLER (`_reindex_node`, via
+    `app.ingest._embed_chunks`) BEFORE `conn` was ever acquired. This function takes no embedder
+    and never calls one: it only writes. See `_reindex_node` and `_embed_chunks`'s own docstring
+    for why the order matters (a 45-chunk embed measured at 104.77s on production hardware, held
+    across an open idle connection, is what killed the first live re-index against Neon).
+
     `body` is the freshly fetched raw markdown this call is indexing -- the SAME text
     `_chunk_node` just wrote to the snapshot file and chunked (`state["body"]`, never
     reconstructed from `chunks`) -- so `sources.last_indexed_body` ends this call holding exactly
@@ -550,7 +574,7 @@ async def reindex_source(
     """
     await _embed_and_store(
         conn,
-        embedder,
+        vectors,
         source_url=source_url,
         resolved_url=resolved_url,
         page_last_updated=page_last_updated,
@@ -905,11 +929,13 @@ async def _chunk_node(deps: RefreshDeps, state: RefreshState) -> dict:
 
 async def _embed_node(deps: RefreshDeps, state: RefreshState) -> dict:
     """A pass-through, kept as its own graph node purely for state-machine/observability clarity.
-    The real embedding call happens exactly once, inside reindex_source's call to
-    app.ingest._embed_and_store, which computes vectors and writes rows together in one
-    transaction -- reusing the INSERT shape rather than forking a second copy of it (see the
-    module's WHY THE SPLIT comment). Embedding here too would mean embedding every chunk twice for
-    no benefit.
+    The real embedding call happens inside `_reindex_node`, BEFORE it acquires a connection (see
+    that node and `app.ingest._embed_chunks`'s own docstring for why the order matters) -- never
+    here. This node must stay a pure pass-through: computing vectors here and returning them would
+    put them in the dict LangGraph merges into `RefreshState`, and `RefreshState` is checkpointed
+    to sqlite on every step (45 chunks x 768 floats is roughly 276KB per source, written into every
+    checkpoint for no reason) -- see this module's own docstring. Embedding here would also mean
+    embedding every chunk twice for no benefit.
     """
     del deps
     return {"node_trail": [*state["node_trail"], "embed"]}
@@ -932,10 +958,16 @@ async def _reindex_node(deps: RefreshDeps, state: RefreshState) -> dict:
     page_last_updated = _parse_iso_date(state.get("page_last_updated"))
     rule_effective_date = _parse_iso_date(state.get("rule_effective_date"))
 
+    # Compute vectors BEFORE acquiring a connection -- `vectors` lives only as this local
+    # variable, never returned into the state dict LangGraph checkpoints (see _embed_node's and
+    # this module's own docstring). See _embed_chunks's docstring for the measured 104.77s embed
+    # this ordering keeps off an open connection.
+    vectors = await _embed_chunks(deps.embedder, chunks)
+
     async with deps.conn_factory() as conn:
         count = await reindex_source(
             conn,
-            deps.embedder,
+            vectors,
             source_url=state["source_url"],
             resolved_url=state.get("resolved_url"),
             page_last_updated=page_last_updated,

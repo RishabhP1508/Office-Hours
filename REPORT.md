@@ -63,6 +63,10 @@ Thirty-four times in this build, an instrument was the thing worth writing down 
 | 38 | `RobotsCache.can_fetch`, as the enforcement of this project's crawl policy | **It returns True when it read no policy at all, so "we checked robots.txt" and "robots.txt permitted this" are the same value.** `app/ingest.py::RobotsCache._get_parser` treats ANY status of 400 or above as `parser.parse([])`, and an empty ruleset permits everything; the `except httpx.HTTPError` branch does the same on a timeout or a connection failure. So a WAF that refuses to serve robots.txt, a site that is down, and a site that genuinely publishes no restrictions all produce the identical verdict: allowed. **The code also overrides a SAFER default in the library it uses.** Measured: `urllib.robotparser.RobotFileParser.read()` sets `disallow_all = True` on 401/403 and `allow_all = True` only on other 4xx. This class bypasses `.read()` to fetch through httpx, and in doing so converts the stdlib's block into a permit. | **Sideways, from the fetch probe, and only because the probe happened to request robots.txt too.** Nobody was looking at the robots path; the probe fetched all three `robots.txt` files to establish whether the crawl was permitted, got 403 on all three, and the question "what does the crawler DO when that happens" was asked afterwards. **It is harmless today by coincidence, not by design: the page fetch fails too, so the permit is never acted on.** If the page fetch ever succeeds from a host where the robots fetch does not, the crawler proceeds on an assumption it never checked. **The general form, which this report has now recorded in four components: a check whose failure mode is indistinguishable from its success mode is not a check.** Here the collapse is sharper than usual because the two states are not merely encoded alike, they are the same line of code. |
 | 39 | The project's own documented crawl policy, as the account of what the crawler actually sends | **Four literals, three of them descriptions, and the one that is CODE is the one that runs and the only one missing a contact address.** `.env.example` and the gitignored `.env` both carry the full form with the real repository and `patel.rishabh@northeastern.edu`; `docker-compose.yml` carries a `set-a-real-contact-here` placeholder; `app/config.py`'s default carries neither a contact nor a URL that resolves. **Production runs the default**, because Fly's `[env]` does not set the key, no secret sets it, and `.env` is not in the image, so the only environment where the documented value applies is a developer's laptop. `docs/reports/phase-0.md` still carries the UNCHECKED human-review item "Set a real contact in `USER_AGENT`": it was satisfied in the two files a human reads and in neither of the two that reach a government web server. | **By a probe built to answer a different question, which happened to print the UA it was about to send.** The UA line was diagnostic garnish, added so the run could be shown to honour the crawl policy rather than assert it; it is what exposed that the policy was not being honoured. Nobody would have checked otherwise, because four documents agreed and they agreed with each other rather than with the code. **The general form: a value that is documented in several places and defaulted in one is not configured, it is described. Only the default is load-bearing, and the more places restate it correctly the less likely anyone is to read the one that runs.** The sharper local form: this project refused a fingerprint-forging library on the grounds that it identifies itself honestly and reachably, and argued that the sites' own robots.txt permits it. **Both arguments rest on a contact address that was never sent.** |
 | 40 | `env_ignore_empty=True` on `Settings.model_config`, as a one-field fix for a blank `USER_AGENT` | **A CLASS-wide setting used to solve a ONE-field problem, introduced while fixing a fail-open, and itself a fail-open across 21 fields.** `docker-compose.yml` passes `"${USER_AGENT:-}"`, which is an empty string when nothing overrides it, and an empty UA would have beaten the new complete default. `env_ignore_empty` makes an explicitly-blanked environment variable fall through to the field's default. It does that for EVERY field, and 21 of them have a non-empty default. **Two of those are not cosmetic.** A blanked `SESSION_HASH_SALT` would have silently restored `office-hours-dev-salt-change-in-production`, a value this repository publishes, so a secret that failed to populate and arrived empty would become a known constant rather than an obvious blank. A blanked `ALLOWED_ORIGINS` would have restored `http://localhost:3000`, breaking CORS in a way that presents to a user as a network fault rather than as a configuration error. **The change shipped with a comment asserting it had no blast radius**, on the reasoning that every other field already defaults to `""` wherever `""` is meaningful. That reasoning is true only of fields whose default IS `""`, which is precisely the set the setting does not affect. | **Caught in review, before deploy, and only because the blast radius was checked rather than the reasoning read.** Enumerating `Settings.model_fields` for non-empty string defaults returned 21; the comment predicted 0. Nothing failed, no test went red, and the stated justification was plausible enough to pass a careful reading. **This is entry 35's shape for the second time in one session: a fix whose side effect re-creates, somewhere else, the class of defect it was removing.** Entry 35 reached production and was found by a user reading the deployed site; this one was caught before deploy. The difference was not process, it was that somebody happened to ask what else the change touched. **The general form: the blast radius of a fix is a separate question from whether the fix works, and a comment asserting there is none is a claim to be measured, not a reassurance to be read.** Replaced by a validator scoped to the one field. The guard is parametrised over five settings rather than the two that prompted it, and ships with a control that builds a class-wide-ignore model to prove the guard trips on it. |
+| 41 | The `sources` table, as the record of why a refresh failed | **When the database is what failed, the failure handler cannot run, so the row records nothing and keeps asserting the last thing that worked.** `app/recrawl.py::_record_failure_node` opens its own connection through `deps.conn_factory()` before calling `record_source_failure`; if the database is unreachable that call raises first, `run_refresh`'s per-source `except` appends an in-memory `SourceResult`, and `sources` is never touched. Measured on the first live re-index against Neon, 19 September 2026: twelve sources updated at 03:30 roughly two seconds apart, and both `fixed_admission` rows still read `status='ok'`, `consecutive_failures=0`, empty `last_error`, `last_verified_at` 7 September. **Each field is individually defensible and the set is useless.** `status` is the last COMPLETED crawl's outcome and no crawl completed; `consecutive_failures` is 0 precisely because nothing recorded a failure; `last_error` is empty for the same reason. **Correction, and it matters: the record is NOT silent that something is wrong.** `source_health_state` returns `broken` through its staleness clause, because `last_success_at` is older than `SOURCE_BROKEN_NO_SUCCESS_DAYS`. It is silent only about WHAT and WHEN. | **By querying the table after a run that had already gone red in the terminal, and only because somebody thought to compare the twelve against the two.** The terminal output was the sole record, and it is scrollback. **This is NOT entry 33 and is deliberately filed apart from it.** Entry 33 is a failure handler that WORKED and lied, reporting a schema fault in its own vocabulary, which is fetching; it survived because `record_source_failure` touches only original-shape columns, which was deliberate. This is a handler that COULD NOT RUN AT ALL. **The general form: a failure handler must depend on strictly less than the success path it reports on. For a schema fault it does, and that is why entry 33's wrong answer was at least an answer. For a connectivity fault it cannot, because you cannot record in a resource whose unavailability is the thing being recorded.** Where that holds, no better handler exists and the record has to live outside the system: the report written to a file rather than only printed, and the staleness watchdog, which stops being optional here because its own failure to read is itself the signal. |
+| 42 | `16.2 ms per embed`, carried in this report as the cost of embedding a corpus chunk | **It was never a chunk measurement. It is the median cost of embedding a QUERY, and the unit changed silently between the ADR that measured it and the estimate that used it.** `docs/adr/0013-in-process-gguf-embeddings.md` says, accurately and on its own terms, `16.2ms median query embed`. REPORT.md's A3 CI costing reused it as `the measured 16.2 ms per embed` and applied it to `ingesting 221 chunks`, concluding `on the order of 10 seconds of embedding`. **Measured on the real hardware, 19 September 2026: 104.77s for the 45 chunks of one fixed_admission source, 2328 ms/chunk, on `nproc=1` `shared-cpu-1x` at `EMBED_GGUF_THREADS=1`. 144x the carried figure.** It decomposes into two factors, not one. A golden question averages 63 characters and a chunk of that source averages 788, so roughly 12.5x is WORKLOAD, the thing the unit change concealed; the remaining ~11.5x is hardware and configuration. 221 chunks is therefore about 8.6 minutes, not 10 seconds, and the A3 estimate that informed a CI design decision is wrong by roughly 50x. | **By a probe run for an unrelated reason: diagnosing why a connection died during a re-index.** Nobody was auditing the figure. It had been quoted, re-quoted and built on, and every quotation was faithful to the one before it. **The general form: a number changes meaning when it changes units, and 'per embed' reads as 'per chunk' in a paragraph about chunks while remaining literally what the source said.** The ADR is not wrong and the report did not misquote it; the defect lives entirely in the word `query` being dropped on the way across. **The defensive form: a performance figure should carry its workload in its name**, because the next reader will apply it to whatever the surrounding paragraph is about. |
+| 43 | A single post-hoc liveness check, read as the time a connection was killed | **It establishes a CEILING, not a measurement, and the difference was the whole diagnosis.** The two-arm probe held each connection for the embed's duration and then called `SELECT 1` ONCE. Both raised, so both were dead by 104.77s. That was read as "killed at 104 seconds", which set up an apparent contradiction with `pg_settings` reporting 5min and drove a search for a hidden pooler limit. **There was no hidden limit.** A follow-up probe that watched `pg_stat_activity` from a separate connection, rather than touching the held one, measured the kill at exactly 300s, identically on the pooled and direct endpoints, with the same `pg_settings` source and value. The backend enforces precisely what it reports. | **Caught before it was acted on, by the caveat being written down at the time the number was produced rather than reconstructed afterwards.** The probe's own analysis said "dead within 104.77 seconds, not killed at 104 seconds; the real limit is unbounded below". That sentence is the only reason the 5min reading was tested instead of explained away. **The general form: an observation taken once, after the fact, bounds a quantity from one side only, and a bound reads exactly like a measurement when it is quoted without its inequality.** The instrument fix is also general: to time something that dies from inactivity you must watch it from outside, because polling it resets the clock you are trying to read. **And the correction cuts deeper than the number.** With 300s established, the timeline no longer reaches the timeout at all, so the idle-timeout explanation for the original failure is retired too, and a finding that felt closed was reopened by fixing the instrument rather than by new evidence. |
+| 44 | The two-arm probe, as evidence that idle duration kills a connection | **It produced a result a properly-measured version could not reproduce, and it was believed because it agreed with the theory that motivated building it.** The probe held one connection across the embed and one idle for the same length, checked each ONCE at the end, found both raised, and was read as "both die, therefore idle duration is the cause". A later probe ran the same condition correctly, with an external watcher on `pg_stat_activity` and a 150s cap: the connection held across repeated 105-second embeds **survived**, as did a CPU-saturation arm and a quiet control, all with 0.00s event-loop stall. **Same condition, measured properly, opposite answer.** | **By building the better instrument the first one's own caveat called for.** The two-arm design was mine and so was the defect: one post-hoc liveness check, no external watcher, which is precisely entry 43's shape. **The general form, and it is the one that makes this different from 43: a single-observation probe can produce a FALSE POSITIVE, and a false positive that confirms the hypothesis you built the probe to test does not feel like a defect. It feels like success.** Entry 43 is about a number being a bound rather than a measurement; this is about the verdict built on it being unreproducible. **What survives and what does not:** the OBSERVATION stands, two connections raised at roughly 105s, and it corroborates the 03:30 production failure at roughly the same mark; the INFERENCE is retracted and must not be cited as support for anything. Both sightings are now unexplained anomalies rather than evidence for a mechanism. |
 
 
 **A second layer on entry 18, found 12 September.** Entry 18 ends by naming the remedy: read the
@@ -7068,6 +7072,190 @@ system reporting health it does not have, which is the failure mode this report 
 The order that follows from the evidence rather than from preference: measure Fly first, because A
 and C both rest on it and D is only worth its cost if A and C are ruled out. E is independent of all
 of them and is the only one that helps if Fly turns out to be blocked too.
+
+---
+
+## The re-index failure: idle duration, and two numbers that contradict what this project believed
+
+The first live re-index against Neon, 19 September 2026. Twelve sources that only bumped a timestamp
+succeeded at 03:30, roughly two seconds apart. Both `fixed_admission` sources, the only two that
+re-embed, died with:
+
+    unhandled_error: OperationalError: consuming input failed: SSL connection has been closed unexpectedly
+
+`sources` recorded none of it, because the handler that records failures needs the connection that
+failed. That is instrument entry 41 and it is filed apart from entry 33 deliberately: 33 is a handler
+that worked and lied, this is one that could not run.
+
+### RETRACTED: the controlled pair, and why its result cannot be cited
+
+> **RETRACTED 19 September 2026. The conclusion below is withdrawn. The probe was measuring badly,
+> not finding something.** It held two connections, checked each ONCE at the end, found both raised,
+> and concluded idle duration was the cause. A later probe ran the same condition correctly, with an
+> external watcher on `pg_stat_activity`: a connection held across repeated 105-second embeds
+> **survived 150s**, alongside a CPU-saturation arm and a quiet control, all three at 0.00s
+> event-loop stall. **Same condition, measured properly, opposite answer.** The design defect was
+> entry 43's, and the false positive it produced is entry 44.
+>
+> **What survives:** the raw observation, that two connections raised at roughly 105s, which
+> corroborates the 03:30 production failure at roughly the same mark. Two unexplained sightings, not
+> evidence for a mechanism. **What does not survive:** every inference below, and it must not be
+> cited as support for the idle-duration story, the load story, or fix 1. The original text is kept
+> because a retraction that deletes what it retracts cannot be checked.
+
+Two connections were opened the way `make_conn_factory` opens one, held for the same wall clock,
+concurrently, with one variable different: arm A across the embed, arm B across an `asyncio.sleep` of
+equal length. **Both died, identically.** Idle duration is the cause. The embed is only what takes
+the time, which means the fix is about when the connection is acquired and not about the embedding.
+
+A one-armed probe could not have established that, and the distinction decides the fix: if only arm A
+had died, acquiring the connection later would not have been sufficient.
+
+### Where this actually stands: the 03:30 failure is unexplained
+
+Three hypotheses were raised and all three are dead. **The event loop being blocked** was killed by
+reading `GGUFEmbedder.embed`, which offloads via `asyncio.to_thread`, and confirmed at 0.00 to 0.05s
+stall in two separate probes. **Idle duration** was killed by the external-watcher probe measuring
+the backend's timeout at exactly 300s, pooled and direct alike, against a connection that was only
+ever held for about 105. **CPU saturation** was killed by the three-phase probe, where an embed arm,
+a non-llama.cpp busy arm and a quiet control all survived 150s.
+
+What remains is two sightings at roughly the same mark, the 03:30 production failure with
+`consuming input failed: SSL connection has been closed unexpectedly` and the retracted probe's
+arms, neither well measured, with no mechanism connecting them and nothing that reproduces on
+demand. **This report does not have a diagnosis for it and should not be read as having one.**
+
+### A hypothesis killed by reading the source, before the probe could confirm it
+
+The leading explanation going in was that the embed blocks the asyncio event loop, so nothing
+services the socket. It was wrong, and it was discarded by reading
+`app/providers/embeddings.py::GGUFEmbedder.embed`, which is
+`return await asyncio.to_thread(self._embed_sync, texts)`. The loop is not blocked.
+
+The probe carried a control for it anyway, a ticker measuring the worst event-loop stall, and
+measured 0.05s, exactly what `to_thread` working as documented looks like. **Recording this because
+the usual direction in this table is an instrument that was wrong and survived.** Here the cheap
+check came first and cost one grep, and the control was kept rather than dropped once the source had
+settled it, because "the code says it offloads" and "it offloads" are different claims.
+
+### FINDING: the embed is 144x the figure this project has been carrying, and the unit is half of it
+
+    45 real chunks, one fixed_admission source
+    104.77s total, 2328 ms/chunk
+    nproc=1, shared-cpu-1x, EMBED_GGUF_THREADS=1
+
+Against `16.2 ms per embed`, carried in this report's A3 CI costing. The provenance is
+`docs/adr/0013-in-process-gguf-embeddings.md`, which says `16.2ms median query embed` and is
+accurate. **It was never a chunk measurement.** A golden question averages 63 characters; a chunk of
+that source averages 788. So roughly 12.5x of the gap is workload and the remaining 11.5x is hardware
+and configuration. Full detail in instrument entry 42.
+
+The consequence beyond this incident: A3 estimated 221 chunks at "on the order of 10 seconds of
+embedding". It is about 8.6 minutes. That estimate informed a decision about whether to build the
+real corpus inside the CI invariant gate.
+
+### RETIRED: the idle-timeout explanation, killed by fixing the instrument
+
+> **RETIRED 19 September 2026, same day, by measurement. Read the section below as the reasoning
+> that produced a wrong diagnosis, kept because the correction is the useful part.** A follow-up
+> probe that watched `pg_stat_activity` from a SEPARATE connection, instead of touching the held
+> one, measured the kill at exactly **300s, identically on the pooled and direct endpoints**, same
+> `pg_settings` source, same value. There is no hidden pooler limit and the backend enforces what it
+> reports. The `104.77s` below was never a kill time; it was the ceiling this section's own caveat
+> named, and it was then read as a measurement. Instrument entry 43.
+>
+> **The timeline, established from the code rather than inferred.** Every node opens its own
+> connection: `make_conn_factory` creates a fresh `psycopg.AsyncConnection` per call and closes it
+> on exit, and the four call sites are `_diff_node`, `_reindex_node`, `_verify_only_node` and
+> `_record_failure_node`. **No connection is held across sources**, so the twelve unchanged sources
+> that ran first contributed nothing to the age of the connection that died. Pre-fix, the
+> `_reindex_node` connection was open for the embed plus the write: about 105 seconds. **It never
+> approached 300.**
+>
+> **So the cause of the 03:30 failure is unknown again**, and three observations do not reconcile:
+> production died at about 105s with `consuming input failed: SSL connection has been closed
+> unexpectedly`, which is a socket teardown and not SQLSTATE 25P03; the two-arm probe's connections
+> were dead within 104.77s; and an idle connection with nothing else running survives to exactly
+> 300s. The variable that differs between the second and the third is not idleness, it is that a
+> CPU-saturating embed was running on a single core throughout the second. **That is the next thing
+> to measure**, and the measurement is the two probes combined: hold the arms while a concurrent
+> embed runs, and watch from outside to get the real kill time rather than a ceiling.
+>
+> **WRITTEN BEFORE THE BRANCH TEST RUNS, DELIBERATELY, so that a pass cannot later be read as
+> closure.** The next step is to run the fixed `app.recrawl` against a Neon branch. That test
+> measures an OUTCOME, not a mechanism: does a re-index complete. **A pass means the fix is
+> sufficient at a one-second window. It does NOT mean anyone knows what kills a connection at 105
+> seconds under load.** Those are different claims and the first will be tempting to quote as the
+> second, because a green run is the kind of evidence that closes things. The open question survives
+> any result the branch test can produce, and it comes back the moment anything in this system holds
+> a connection across slow work again. If the branch test passes, this paragraph is the record that
+> it was not the question being asked.
+>
+> **Fix 1 survives this, for a weaker but sufficient reason.** It is no longer justified by "the
+> embed pushed the connection past 300s", which is false. It is justified by not holding a
+> connection across slow work at all, and by the empirical record: two holds of about 105 seconds
+> died, and every short hold in the same run survived. It reduces the window from 105 seconds to
+> roughly one, and it does so without needing the mechanism to be understood.
+
+### The reasoning that produced the retired diagnosis, kept for the record
+
+`SHOW idle_in_transaction_session_timeout` returned `5min`. Both arms were dead when checked, with
+`IdleInTransactionSessionTimeout`, which is SQLSTATE 25P03 and is raised by Postgres rather than by a
+pooler.
+
+**One correction to how this reads, and it matters for the fix.** The probe checked liveness exactly
+once, after the hold. So what was established is "dead within 104.77 seconds", not "killed at 104
+seconds". The real limit is unbounded below: it could be 30 seconds. The contradiction with `5min`
+stands either way, because 104.77 is already well under 300, but the margin any fix has to clear is
+not yet known.
+
+Two explanations fit, and they imply different fixes:
+
+1. **The pooler enforces something shorter than the backend reports.** Then a connection held for
+   more than that dies regardless of what `SHOW` says, and the budget is whatever the pooler allows.
+2. **`SHOW` through a pooled endpoint describes a different session than the one being killed.** In
+   transaction pooling a `SHOW` runs as its own transaction on whichever server connection is free,
+   so the value returned need not belong to the connection that later dies holding a transaction.
+
+**What separates them**, and none of it writes anything: on the connection that is about to be held,
+select `pg_backend_pid()` and `current_setting('idle_in_transaction_session_timeout')` rather than
+running a bare `SHOW` on a different connection; read `source` from `pg_settings` for that name to
+see where the value comes from; poll liveness every few seconds instead of once, to bound the real
+kill time; and run the whole thing against the direct endpoint as well as the pooled one. If direct
+survives to 300s while pooled dies early, it is the pooler. If both die early, the backend's setting
+is not what `SHOW` reported and `current_setting` on the held connection will say so.
+
+### The fix, in order of how much of the window each removes
+
+**1. Acquire the connection after the vectors exist.** The embed is already outside the transaction,
+at `app/ingest.py::_embed_and_store` line 67 against the transaction at line 69. What is wrong is one
+level up: `_reindex_node` opens the connection before calling `reindex_source`, so it is held idle
+across the whole embed. Splitting `_embed_and_store` into an embed step and a write step, with the
+connection acquired between them, removes 104.77 seconds from a window that is currently 105 seconds
+long. **The atomicity cost is zero**: the transaction still wraps the upsert, the delete and the
+inserts as one unit, and vectors computed beforehand are just data.
+
+One shape to avoid, because it is the obvious-looking version: do not move embedding into
+`_embed_node`, the existing pass-through graph node. That would put vectors into `RefreshState`,
+which LangGraph checkpoints to sqlite, and 45 x 768 floats is roughly 276KB per source written into
+every checkpoint. The vectors must stay local.
+
+**2. Collapse the 45 serial inserts.** Once the embed is out, this is the largest remaining term:
+45 round trips to a remote database inside the transaction. `executemany` or `COPY` reduces it to
+one or two. Small in absolute terms today, and it is the part that scales with corpus size.
+
+**3. Bound the real timeout**, per the section above, so the margin is measured rather than assumed.
+
+**4. Give the refresh connection the protections the serving pool already has.** `app/db.py::make_pool`
+carries `check=AsyncConnectionPool.check_connection` and a `max_idle` tuned below the pooler's
+timeout, with a comment saying Neon drops idle connections. `make_conn_factory` is a bare
+`psycopg.AsyncConnection.connect()` with none of it. Listed fourth deliberately: after fix 1 the
+exposure is largely gone, and doing this first would have treated the symptom.
+
+**5. Size the refresh for the work it does, which is not the work the serving machine does.** 2328
+ms/chunk is a CPU-bound job pinned to one thread on one shared core. The refresh does not have to run
+on the serving machine's shape, and a separate scheduled machine can pick its own. This is
+configuration rather than code, and it is a point in favour of option A over option C.
 
 ---
 

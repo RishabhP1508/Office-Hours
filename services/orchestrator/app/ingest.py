@@ -17,6 +17,8 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -510,6 +512,33 @@ def mint_snapshot_filename(topic: str, url: str, raw_dir: Path) -> Path:
 # The ingest run
 # ---------------------------------------------------------------------------------------------
 
+ConnFactory = Callable[[], AbstractAsyncContextManager[psycopg.AsyncConnection]]
+
+
+def _make_conn_factory(database_url: str) -> ConnFactory:
+    """A zero-arg callable returning a fresh connection (pgvector types registered) as an async
+    context manager that closes the connection on exit -- one connection per source, opened by
+    `_ingest_from_manifest`/`_ingest_from_snapshots` only after that source's chunks are already
+    embedded, never before (see `_embed_chunks`'s docstring for why: 45 chunks measured at 104.77s
+    to embed, and a connection held idle across that is what killed the first live re-index
+    against Neon).
+
+    Same shape as `app/recrawl.py::make_conn_factory` -- kept as a separate definition here rather
+    than a shared import, since `app/recrawl.py` already imports from `app/ingest.py` at module
+    scope and the reverse would be circular.
+    """
+
+    @asynccontextmanager
+    async def _factory():
+        conn = await psycopg.AsyncConnection.connect(database_url)
+        await register_vector_async(conn)
+        try:
+            yield conn
+        finally:
+            await conn.close()
+
+    return _factory
+
 
 def _parse_iso_date(value) -> date | None:
     if value is None:
@@ -622,9 +651,25 @@ async def _fetch_and_snapshot(
     return snapshot_path
 
 
+async def _embed_chunks(embedder, chunks: list[dict]) -> list[list[float]]:
+    """Compute one embedding vector per chunk. Pure computation -- no connection parameter at all,
+    on purpose: split out of `_embed_and_store` (September 2026) so a caller can compute every
+    vector BEFORE ever acquiring a database connection, instead of holding one open, idle, across
+    the whole embed. Measured directly on production hardware (shared-cpu-1x, nproc=1,
+    EMBED_GGUF_THREADS=1): 45 chunks take 104.77s to embed, 2328ms/chunk -- long enough that an
+    idle connection held across it is what killed the first live re-index against Neon
+    (`OperationalError: consuming input failed: SSL connection has been closed unexpectedly`),
+    confirmed by a controlled probe showing idle duration, not embedding itself, is the cause. See
+    app/recrawl.py's module docstring for the full measurement and app/recrawl.py::_reindex_node
+    for the caller this split exists for.
+    """
+    texts = [chunk["text"] for chunk in chunks]
+    return await embedder.embed(texts)
+
+
 async def _embed_and_store(
     conn: psycopg.AsyncConnection,
-    embedder,
+    vectors: list[list[float]],
     source_url: str,
     resolved_url: str | None,
     page_last_updated: date | None,
@@ -637,7 +682,12 @@ async def _embed_and_store(
     now: datetime | None = None,
     mark_changed: bool = False,
 ) -> None:
-    """`rule_effective_date`/`rule_status`/`rule_status_source`/
+    """Writes `chunks` and their already-computed `vectors` (see `_embed_chunks` above -- this
+    function no longer embeds anything itself, and takes no embedder). Every caller is expected to
+    have called `_embed_chunks` BEFORE opening the connection it passes in here as `conn`, so the
+    connection exists only for the write below, never across the embed.
+
+    `rule_effective_date`/`rule_status`/`rule_status_source`/
     `rule_status_source_evidences_status` are the curator annotations -- read out of the manifest
     entry's `annotations` block by the caller (`_ingest_from_manifest` via
     `manifest_annotation`/`manifest_annotation_str`/`manifest_annotation_bool`, or
@@ -687,9 +737,12 @@ async def _embed_and_store(
     """
     if now is None:
         now = datetime.now(UTC)
-    texts = [chunk["text"] for chunk in chunks]
-    vectors = await embedder.embed(texts)
 
+    # FIX 3 (Sept 2026): the connection is acquired right before this call now (see
+    # _embed_chunks's docstring and app/recrawl.py::_reindex_node), so the transaction below is
+    # the entire remaining window a connection sits open for this source. Timed and logged so the
+    # next failure is diagnosable from a log line instead of a fresh probe.
+    write_started = time.monotonic()
     async with conn.transaction():
         async with conn.cursor() as cur:
             # ONE upsert statement, not two near-identical copies differing only in the
@@ -733,15 +786,23 @@ async def _embed_and_store(
             )
 
             await cur.execute("DELETE FROM documents WHERE source_url = %s", (source_url,))
-            for chunk, vector in zip(chunks, vectors, strict=True):
-                await cur.execute(
-                    """
-                    INSERT INTO documents
-                        (content, source_url, section_heading, heading_level,
-                         rule_effective_date, rule_status, rule_status_source,
-                         rule_status_source_evidences_status, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
+
+            # executemany(), not copy(): this batch is at most a few dozen rows (45 for the
+            # largest source in this corpus today), so there is nothing to gain from managing
+            # copy()'s own wire-protocol row encoding for the pgvector column by hand instead of
+            # reusing the parameterized INSERT unchanged. psycopg3's executemany() rides libpq's
+            # pipeline mode when available (Cursor.executemany), sending every row's Parse/Bind/
+            # Execute without waiting on each one's reply in turn -- effectively one round trip
+            # instead of N sequential ones, which is the whole point of this change.
+            await cur.executemany(
+                """
+                INSERT INTO documents
+                    (content, source_url, section_heading, heading_level,
+                     rule_effective_date, rule_status, rule_status_source,
+                     rule_status_source_evidences_status, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
                     (
                         chunk["text"],
                         source_url,
@@ -752,12 +813,22 @@ async def _embed_and_store(
                         rule_status_source,
                         rule_status_source_evidences_status,
                         Vector(vector),
-                    ),
-                )
+                    )
+                    for chunk, vector in zip(chunks, vectors, strict=True)
+                ],
+            )
+
+    held_seconds = time.monotonic() - write_started
+    logger.info(
+        "embed_and_store.committed source_url=%s rows=%d held_seconds=%.3f",
+        source_url,
+        len(chunks),
+        held_seconds,
+    )
 
 
 async def _ingest_from_manifest(
-    conn: psycopg.AsyncConnection, embedder, settings: Settings, raw_dir: Path
+    conn: ConnFactory | None, embedder, settings: Settings, raw_dir: Path
 ) -> tuple[int, int]:
     """Phase 0's path: fetch every URL in SOURCES_MANIFEST_PATH, snapshot, chunk, embed, store.
 
@@ -769,6 +840,14 @@ async def _ingest_from_manifest(
     value on disk can never disagree with what actually gets written to the database. All four are
     validated together (`app/rule_status.py::validate_rule_status`, docs/adr/0023-curator-rule-
     status.md) before anything is fetched-and-stored for this entry.
+
+    `conn` (kept under its original parameter name for `tests/test_user_agent.py`'s two early-exit
+    tests, which pass `conn=None`) is now a zero-arg CONNECTION FACTORY, not an already-open
+    connection: per source, this loop computes that source's vectors first and only calls
+    `conn()` afterward, right before the write -- see `app/recrawl.py`'s module docstring and
+    `_embed_chunks`'s own docstring for why a connection must not exist yet during an embed.
+    `run_ingest` builds the real factory; tests pass their own or `None` (never called on the
+    early-exit paths those tests check).
 
     Returns (total_chunks, total_sources).
     """
@@ -821,19 +900,24 @@ async def _ingest_from_manifest(
                 today=date.today(),
             )
 
-            await _embed_and_store(
-                conn,
-                embedder,
-                source_url=frontmatter["source_url"],
-                resolved_url=frontmatter.get("resolved_url"),
-                page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
-                body=body,
-                rule_effective_date=rule_effective_date,
-                rule_status=rule_status,
-                rule_status_source=rule_status_source,
-                rule_status_source_evidences_status=rule_status_source_evidences_status,
-                chunks=chunks,
-            )
+            # Compute this source's vectors BEFORE acquiring a connection -- the connection below
+            # exists only for the write that follows, never across the embed (see
+            # _embed_chunks's docstring).
+            vectors = await _embed_chunks(embedder, chunks)
+            async with conn() as db_conn:
+                await _embed_and_store(
+                    db_conn,
+                    vectors,
+                    source_url=frontmatter["source_url"],
+                    resolved_url=frontmatter.get("resolved_url"),
+                    page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
+                    body=body,
+                    rule_effective_date=rule_effective_date,
+                    rule_status=rule_status,
+                    rule_status_source=rule_status_source,
+                    rule_status_source_evidences_status=rule_status_source_evidences_status,
+                    chunks=chunks,
+                )
 
             print(f"{url} -> {len(chunks)} chunks")
             total_chunks += len(chunks)
@@ -842,9 +926,12 @@ async def _ingest_from_manifest(
 
 
 async def _ingest_from_snapshots(
-    conn: psycopg.AsyncConnection, embedder, raw_dir: Path
+    conn: ConnFactory | None, embedder, raw_dir: Path
 ) -> tuple[int, int]:
     """Chunk and embed every snapshot already present in raw_dir, skipping fetch entirely.
+
+    `conn` is a zero-arg connection factory, exactly as `_ingest_from_manifest` documents -- see
+    that function's docstring for why, and for the `conn=None` test-compat note.
 
     Used for INGEST_MODE=snapshot (the CI fixture corpus, eval/fixtures/sources -- see
     docs/adr/0004-ci-baselines-vs-aspirational-thresholds.md). The fixture files are themselves
@@ -891,19 +978,21 @@ async def _ingest_from_snapshots(
             today=date.today(),
         )
 
-        await _embed_and_store(
-            conn,
-            embedder,
-            source_url=source_url,
-            resolved_url=frontmatter.get("resolved_url"),
-            page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
-            body=body,
-            rule_effective_date=rule_effective_date,
-            rule_status=rule_status,
-            rule_status_source=rule_status_source,
-            rule_status_source_evidences_status=rule_status_source_evidences_status,
-            chunks=chunks,
-        )
+        vectors = await _embed_chunks(embedder, chunks)
+        async with conn() as db_conn:
+            await _embed_and_store(
+                db_conn,
+                vectors,
+                source_url=source_url,
+                resolved_url=frontmatter.get("resolved_url"),
+                page_last_updated=_parse_iso_date(frontmatter.get("page_last_updated")),
+                body=body,
+                rule_effective_date=rule_effective_date,
+                rule_status=rule_status,
+                rule_status_source=rule_status_source,
+                rule_status_source_evidences_status=rule_status_source_evidences_status,
+                chunks=chunks,
+            )
 
         print(f"{source_url} -> {len(chunks)} chunks (from snapshot {path.name})")
         total_chunks += len(chunks)
@@ -916,19 +1005,19 @@ async def run_ingest() -> None:
     raw_dir = Path(settings.RAW_SNAPSHOT_DIR)
     embedder = get_embedder(settings)
 
-    conn = await psycopg.AsyncConnection.connect(settings.DATABASE_URL)
-    await register_vector_async(conn)
-    try:
-        if settings.INGEST_MODE == "snapshot":
-            total_chunks, total_sources = await _ingest_from_snapshots(conn, embedder, raw_dir)
-        elif settings.INGEST_MODE == "fetch":
-            total_chunks, total_sources = await _ingest_from_manifest(
-                conn, embedder, settings, raw_dir
-            )
-        else:
-            raise ValueError(f"Unknown INGEST_MODE: {settings.INGEST_MODE!r}")
-    finally:
-        await conn.close()
+    # One connection per source (opened inside _ingest_from_manifest/_ingest_from_snapshots'
+    # loops, after that source's embed), not one connection held for the whole run -- see
+    # _make_conn_factory's own docstring.
+    conn_factory = _make_conn_factory(settings.DATABASE_URL)
+
+    if settings.INGEST_MODE == "snapshot":
+        total_chunks, total_sources = await _ingest_from_snapshots(conn_factory, embedder, raw_dir)
+    elif settings.INGEST_MODE == "fetch":
+        total_chunks, total_sources = await _ingest_from_manifest(
+            conn_factory, embedder, settings, raw_dir
+        )
+    else:
+        raise ValueError(f"Unknown INGEST_MODE: {settings.INGEST_MODE!r}")
 
     print(f"TOTAL: {total_chunks} chunks across {total_sources} sources")
 
