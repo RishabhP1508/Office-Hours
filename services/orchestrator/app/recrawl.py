@@ -49,7 +49,7 @@ import httpx
 import psycopg
 from pgvector.psycopg import register_vector_async
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, require_contactable_user_agent
 from app.ingest import (
     FetchedPage,
     HostRateLimiter,
@@ -1473,6 +1473,11 @@ async def run_refresh(
     if fetcher is not None:
         await _drive(functools.partial(_counting_fetcher, fetcher))
     else:
+        # A real network client, about to reach a government web server -- see the identical
+        # call and comment in app/ingest.py::_ingest_from_manifest. NOT on the injected-fetcher
+        # branch above: a test driving this with a fake fetcher makes no real request, so there
+        # is nothing here for the check to protect.
+        require_contactable_user_agent(settings.USER_AGENT)
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(30.0, connect=10.0),
